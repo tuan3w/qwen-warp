@@ -26,8 +26,8 @@ def build(D, C, X):
         })
     for b in D["builds"]:
         t = ctime(b["commit"])
-        cards.append({"kind": "build", "id": b["id"], "anchor": "b-" + b["id"], "title": b["title"], "lane": b["lane"], "outcome": b["outcome"], "label": b["pkg"],
-                      "t": t, "when": iso(t), "result": b["result"], "lease_h": X["gpu_tag_h"].get(b["tag"], 0.0) if b["tag"] else None, "commit": b["commit"]})
+        cards.append({"kind": "build", "id": b["id"], "anchor": "b-" + b["id"], "title": b["title"], "lane": b["lane"], "outcome": b["outcome"], "label": (b["result"][:150] + ("..." if len(b["result"]) > 150 else "")),
+                      "t": t, "when": iso(t), "pkg": b["pkg"], "result": b["result"], "lease_h": X["gpu_tag_h"].get(b["tag"], 0.0) if b["tag"] else None, "commit": b["commit"]})
     notes = C.get("lineage_notes", {})
     tree = {n["id"]: n for n in C["tree"]}
     for r in C["rounds"]:
@@ -35,8 +35,8 @@ def build(D, C, X):
         merge = name[0] == "m" and name[1:].isdigit()
         gate_min = next((g["gpu_s"] for g in C["gates"] if g["lineage"] == name), 0) / 60
         cards.append({"kind": "campaign", "id": r["id"], "anchor": "c-" + r["id"].replace(":", "-"), "title": D["tree_labels"][r["id"]], "lane": "Campaign", "outcome": "win",
-                      "label": f"{'merge' if merge else 'lineage'} {name}: x{r['speedup_vs_baseline']:.3f} vs pristine", "t": r["t"], "when": iso(r["t"]),
-                      "headline": r["headline"], "hypothesis": r["hypothesis"], "change": r["change"], "files": r["files_changed"],
+                      "label": f"{'merge' if merge else 'campaign agent'} ({D['lineage_names'][name]}): x{r['speedup_vs_baseline']:.3f} vs the unmodified engine", "t": r["t"], "when": iso(r["t"]),
+                      "pkg": "", "headline": r["headline"], "hypothesis": r["hypothesis"], "change": r["change"], "files": r["files_changed"],
                       "speedup": r["speedup_vs_baseline"], "step": r["step_vs_previous_kept"], "parent": tree[r["id"]]["parent"], "parents2": tree[r["id"]]["parents2"],
                       "held": r["held_out_ratio"], "plain": r["plain_guard_ratio"], "pred": 1 + r["pred_gain_pct"] / 100, "session_min": r["session_s"] / 60,
                       "tries": C["tries_by_lineage"].get(name, 0), "gate_min": gate_min, "notes": notes.get(name, ""), "merge": merge, "check": r["check_ok"]})
@@ -172,19 +172,19 @@ function body(c){let h='';const sec=(t,x,scroll)=>x?'<h4>'+t+'</h4><div class="t
  if(c.kind==='experiment'){
   h+=sec('Question',c.question)+sec('Pre-registered prediction (committed before the data, commit '+c.pre_commit+')',c.prediction,true)+sec('Result',c.answer)+sec('Conclusion',c.conclusion,true)+sec('Dead ends',c.dead,true);
   if(c.preds.length){h+='<h4>Numbers it was held to</h4><table><thead><tr><th>Claim</th><th>Predicted</th><th>Measured</th><th></th></tr></thead><tbody>'+c.preds.map(p=>'<tr><td>'+esc(p.claim)+'</td><td>'+esc(p.predicted)+'</td><td>'+esc(p.measured)+'</td><td class="v '+p.verdict+'">'+esc(p.verdict_text)+'</td></tr>').join('')+'</tbody></table>'}
-  h+='<div class="facts"><span>confidence <b>'+esc(c.confidence||'n/a')+'</b></span><span>pre-registration to result <b>'+c.wall_h.toFixed(1)+' h</b> wall-clock</span><span>GPU lease held <b>'+c.lease_h.toFixed(2)+' h</b></span><span>folder <b class="mono">'+esc(c.path)+'</b></span>'+(c.reproduce?'<span>reproduce <b class="mono">'+esc(c.reproduce.slice(0,110))+'</b></span>':'')+'</div>';
+  h+='<div class="facts"><span>reference <b class="mono">'+esc(c.id)+'</b></span><span>confidence <b>'+esc(c.confidence||'n/a')+'</b></span><span>pre-registration to result <b>'+c.wall_h.toFixed(1)+' h</b> wall-clock</span><span>GPU lease held <b>'+c.lease_h.toFixed(2)+' h</b></span><span>folder <b class="mono">'+esc(c.path)+'</b></span>'+(c.reproduce?'<span>reproduce <b class="mono">'+esc(c.reproduce.slice(0,110))+'</b></span>':'')+'</div>';
  }else if(c.kind==='build'){
-  h+=sec('What was built',c.title)+sec('Outcome',c.result)+'<div class="facts"><span>work package <b class="mono">'+esc(c.label)+'</b></span><span>commit <b class="mono">'+esc(c.commit)+'</b></span>'+(c.lease_h!=null?'<span>GPU lease held <b>'+c.lease_h.toFixed(2)+' h</b></span>':'')+'</div>';
+  h+=sec('What was built',c.title)+sec('Outcome',c.result)+'<div class="facts"><span>reference <b class="mono">'+esc(c.id)+'</b></span><span>work package <b class="mono">'+esc(c.pkg)+'</b></span><span>commit <b class="mono">'+esc(c.commit)+'</b></span>'+(c.lease_h!=null?'<span>GPU lease held <b>'+c.lease_h.toFixed(2)+' h</b></span>':'')+'</div>';
  }else{
   h+=sec('Agent hypothesis (measured by the agent before the gate)',c.hypothesis)+sec('What it changed',c.change)+
-   '<div class="facts"><span>vs pristine <b>x'+fmtP(c.speedup)+'</b></span><span>step over '+esc(c.parent)+(c.parents2.length?' + '+esc(c.parents2.join(', ')):'')+' <b>x'+fmtP(c.step)+'</b></span>'+(c.merge?'<span>predicted before the gate <b>x'+fmtP(c.pred)+'</b></span>':'<span>agent predicted <b>+'+((c.pred-1)*100).toFixed(1)+'%</b></span>')+
+   '<div class="facts"><span>reference <b class="mono">'+esc(c.id)+'</b></span><span>vs unmodified engine <b>x'+fmtP(c.speedup)+'</b></span><span>step over previous kept build '+esc(c.parent)+(c.parents2.length?' + '+esc(c.parents2.join(', ')):'')+' <b>x'+fmtP(c.step)+'</b></span>'+(c.merge?'<span>predicted before the gate <b>x'+fmtP(c.pred)+'</b></span>':'<span>agent predicted <b>+'+((c.pred-1)*100).toFixed(1)+'%</b></span>')+
    '<span>held-out <b>x'+(c.held?fmtP(c.held):'n/a')+'</b></span><span>plain guard <b>x'+fmtP(c.plain)+'</b></span><span>correctness check <b>'+(c.check?'passed':'failed')+'</b></span>'+(c.merge?'':'<span>agent session <b>'+c.session_min.toFixed(0)+' min</b>, '+c.tries+' quick tries</span>')+'<span>gate <b>'+c.gate_min.toFixed(1)+' GPU-min</b></span><span>diff <b>'+esc(c.files)+'</b></span></div>'+
    (c.notes?'<h4>Agent lab notebook (excerpt)</h4><div class="txt scroll mono" style="font-size:12px">'+esc(c.notes)+'</div>':'')+'<p class="note" style="margin-top:10px">Numbers on this card: campaign harness (paired pristine controls). The m3 port itself was measured separately in BENCH.md K12.</p>';
  }return h}
 let cardEls=[];
 function buildCards(){const host=$('#cards');let lastDay='';D.cards.forEach(c=>{const day=c.when.slice(0,10);if(day!==lastDay){lastDay=day;host.append(el('div','day',day))}
  const d=el('details','card '+c.outcome);d.id=c.anchor;d._c=c;
- d.innerHTML='<summary><span class="tag">'+esc(KIND[c.kind])+' '+esc(c.id)+'</span><div><h3>'+esc(c.title)+'</h3></div><span class="when">'+esc(c.when)+'</span><div class="sub"><span class="verd '+c.outcome+'">'+c.outcome+'</span> &middot; '+esc(c.label)+'</div></summary><div class="body"></div>';
+ d.innerHTML='<summary><span class="tag">'+esc(KIND[c.kind])+'</span><div><h3>'+esc(c.title)+'</h3></div><span class="when">'+esc(c.when)+'</span><div class="sub"><span class="verd '+c.outcome+'">'+c.outcome+'</span> &middot; '+esc(c.label)+'</div></summary><div class="body"></div>';
  d.addEventListener('toggle',()=>{const b=d.querySelector('.body');if(d.open&&!b.dataset.f){b.innerHTML=body(c);b.dataset.f=1}});host.append(d);cardEls.push(d)})}
 function render(){let n=0;cardEls.forEach(d=>{const m=match(d._c);d.classList.toggle('hide',!m);if(m)n++});$('#count').textContent=n+' of '+D.cards.length+' cards';drawTl()}
 $('#expand').onclick=()=>cardEls.forEach(d=>{if(!d.classList.contains('hide'))d.open=true});$('#collapse').onclick=()=>cardEls.forEach(d=>d.open=false);

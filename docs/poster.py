@@ -29,27 +29,25 @@ def title_block(s, y, D, C, X):
     gy = y + 262
     srv = D["server"]
     v0, v2 = srv["greedy"]["vllm"][0], srv["greedy"]["ours"][0]
-    v1 = D["comparison"]["rows"][0]["vals"][0]
     sv = cp.get("server_verified") or {}
     gx, gw = M + 4, 560
-    s.text(gx, gy, "SERVER DECODE SPEED, CODE PROMPT, GREEDY, k=3 (tok/s, same client)", 12.5, DIM, weight=700, ls=1.4)
+    s.text(gx, gy, "SERVER DECODE SPEED, CODE PROMPT (tokens/s)", 12.5, DIM, weight=700, ls=1.4)
     scale = gw / 200.0
     rows = [("stock vLLM 0.30", v0, DIM, False, f"{v0:g}"),
-            ("qwen-warp before the campaign", v1, GPU, False, f"{v1:g}  {fx(v1 / v0)}"),
-            ("qwen-warp + campaign m3 port", v2, AGENT, not sv, f"{v2:g}  {fx(v2 / v0)}")]
+            ("qwen-warp", v2, AGENT, not sv, f"{v2:g}  {fx(v2 / v0)}")]
     for i, (lab, v, col, dashed, val) in enumerate(rows):
-        yy = gy + 22 + i * 44
-        s.text(gx, yy + 4, lab, 13.5, MUTED, weight=600)
-        bx = gx + 210
-        bw = v * scale * (gw - 210) / gw
-        s.rect(bx, yy - 14, bw, 24, col if not dashed else "none", stroke=col, rx=4, sw=2 if dashed else 0, dash="5 4" if dashed else None, opacity=0.9)
-        s.text(bx + bw + 10, yy + 4, val, 15, INK, weight=800)
-    s.text(gx, gy + 22 + 3 * 44 + 2, "server-verified (BENCH K12, 2 visits x 3 reps); middle bar: E11 table, earlier session.", 12.5, DIM, italic=True)
+        yy = gy + 26 + i * 50
+        s.text(gx, yy + 4, lab, 14, MUTED, weight=600)
+        bx = gx + 130
+        bw = v * scale * (gw - 130) / gw
+        s.rect(bx, yy - 15, bw, 28, col if not dashed else "none", stroke=col, rx=4, sw=2 if dashed else 0, dash="5 4" if dashed else None, opacity=0.9)
+        s.text(bx + bw + 10, yy + 5, val, 16, INK, weight=800)
+    s.text(gx, gy + 26 + 2 * 50 + 4, "Greedy, k=3, same client, server-verified (2 visits x 3 reps).", 12.5, DIM, italic=True)
     # ---- tiles
     tx, ty = 690, gy - 14
     tiles = [(fx(X["x_srv_greedy"][0]), "vs stock vLLM", "server, code, greedy k=3", GPU),
              (fx(X["x_plain"]), "plain decode", f"{hd['plain_k9_ms']['v']} vs {hd['vllm_plain_ms']['v']} ms/step", GPU),
-             (f"+{min((a / b - 1) * 100 for a, b in zip(cp['port_ab']['m3'], cp['port_ab']['base'])):.1f}\u2013{max((a / b - 1) * 100 for a, b in zip(cp['port_ab']['m3'], cp['port_ab']['base'])):.1f}%", "campaign port, engine A/B", f"gate said {fx(cp['gate_verdict'], 3)}; 6 agents, 3.6 h", AGENT),
+             (f"+{min((a / b - 1) * 100 for a, b in zip(cp['port_ab']['m3'], cp['port_ab']['base'])):.1f}\u2013{max((a / b - 1) * 100 for a, b in zip(cp['port_ab']['m3'], cp['port_ab']['base'])):.1f}%", "campaign gain on the engine A/B", f"harness: {fx(cp['gate_verdict'], 3)}; 6 agents, 3.6 h", AGENT),
              (f"{X['pred_miss']}/{X['pred_n']}", "bets missed", "predictions frozen first", PART)]
     for i, (big, l1, l2, col) in enumerate(tiles):
         x = tx + (i % 2) * 238
@@ -57,12 +55,12 @@ def title_block(s, y, D, C, X):
         s.rect(x, yy, 226, 116, PANEL, stroke=LINE, rx=12)
         s.rect(x, yy, 6, 116, col, rx=3)
         s.text(x + 22, yy + 54, big, 40 if len(big) < 8 else 30, col, weight=900)
-        s.text(x + 22, yy + 82, l1, 15, INK, weight=700)
+        s.text(x + 22, yy + 82, l1, 15 if len(l1) <= 22 else 13, INK, weight=700)
         s.text(x + 22, yy + 102, l2, 12.5, MUTED)
     # ---- caveat
     cy = max(gy + 22 + 3 * 44 + 26, ty + 2 * 128 + 12)
     cav = ("Honest caveats: one card, one model, one machine; stock vLLM was run with one configuration (max-model-len 16384, 4 seqs). The campaign gate's \u00d71.107 is a harness number; "
-           "the port measured +8.5\u201310.9% on the engine and \u00d71.9\u20132.0 vs vLLM at the server. HyperQwen's DFlash2 is still ahead on code and math (E11). 18 of 33 pre-registered bets were wrong.")
+           "the winner, ported into the engine, measured +8.5\u201310.9% on the engine and \u00d71.9\u20132.0 vs vLLM at the server. HyperQwen's DFlash2 is still ahead on code and math in the head-to-head test. 18 of 33 pre-registered bets were wrong.")
     cav = cav.replace("18 of 33", f"{X['pred_miss']} of {X['pred_n']}")
     ln = wrap(cav, 1090, 14)
     h = 24 + len(ln) * 19
@@ -144,7 +142,7 @@ def loop_and_setup(s, y, D, C, X):
     # workers
     s.rect(rx, ry + 200, rw, 104, PANEL, stroke=AGENT, rx=12, sw=1.6)
     s.text(rx + 20, ry + 224, f"{X['n_packages']} work packages + {X['camp_sessions']} campaign lineage sessions, in parallel", 14, INK, weight=800)
-    chips = [("study", "8 repos"), ("kernels", "K1\u2013K11"), ("experiments", "pre-registered"), ("campaign", f"{X['camp_sessions']} lineages")]
+    chips = [("study", "8 repos"), ("kernels", "11 builds"), ("experiments", "pre-registered"), ("campaign", f"{X['camp_sessions']} lineages")]
     cw = (rw - 40 - 3 * 10) / 4
     for i, (a, b) in enumerate(chips):
         x = rx + 20 + i * (cw + 10)
@@ -250,7 +248,7 @@ def campaign_section(s, y, D, C, X):
            "m1:1": (col_x["m1"], (rowA + rowB) / 2),
            "gemv2:1": (col_x["w2"], rowA), "dnet2:1": (col_x["w2"], rowB), "cycle2:1": (col_x["w2"], rowC),
            "m2:1": (col_x["m2"], (rowA + rowB) / 2), "m3:1": (col_x["m3"], rowB + 40)}
-    for t, x in (("BASELINE", col_x["base"]), ("WAVE 1: three lineages from stock", col_x["w1"]), ("MERGE", col_x["m1"]), ("WAVE 2: three lineages from m1", col_x["w2"]), ("MERGE", col_x["m2"]), ("MERGE", col_x["m3"])):
+    for t, x in (("BASELINE", col_x["base"]), ("WAVE 1: three agents, from stock", col_x["w1"]), ("MERGE", col_x["m1"]), ("WAVE 2: three agents, from merge 1", col_x["w2"]), ("MERGE", col_x["m2"]), ("MERGE", col_x["m3"])):
         s.text(x, top + 12, t, 11.5, DIM, "middle", 700, ls=1.2)
     s.text(M, top + 30, "node size and colour = speedup vs the pristine control; edge text = what the agent changed", 12.5, MUTED, italic=True)
 
@@ -285,9 +283,9 @@ def campaign_section(s, y, D, C, X):
     s.rect(col_x["m1"] - 100, (rowA + rowB) / 2 - 62, 200, 18, "none")
     # nodes
     s.circle(pos["stock"][0], pos["stock"][1], 15, PANEL2, stroke=DIM, sw=2)
-    s.text(pos["stock"][0], pos["stock"][1] + 38, "stock engine", 13, INK, "middle", 700)
-    s.text(pos["stock"][0], pos["stock"][1] + 55, f"K11 {C['baseline']['dev']:.1f} tok/s", 11.5, MUTED, "middle")
-    s.text(pos["stock"][0], pos["stock"][1] + 70, "dev geomean", 11.5, MUTED, "middle")
+    s.text(pos["stock"][0], pos["stock"][1] + 38, "engine before campaign", 13, INK, "middle", 700)
+    s.text(pos["stock"][0], pos["stock"][1] + 55, f"{C['baseline']['dev']:.1f} tok/s", 11.5, MUTED, "middle")
+    s.text(pos["stock"][0], pos["stock"][1] + 70, "6-prompt mix", 11.5, MUTED, "middle")
     gate_gpu = {g["lineage"]: g["gpu_s"] / 60 for g in C["gates"]}
     for nid, (px, py) in pos.items():
         if nid == "stock":
@@ -301,14 +299,14 @@ def campaign_section(s, y, D, C, X):
         icon_gate(s, px + rr * 0.75, py - rr * 0.75, 8, HARN, BG)
         name = nid.split(":")[0]
         merge = name.startswith("m") and name[1:].isdigit()
-        s.text(px, py + rr + 18, f"{name}  {fx(sp, 3)}", 14.5, INK, "middle", 800)
+        s.text(px, py + rr + 18, f"{D['lineage_names'][name]}  {fx(sp, 3)}", 14.5, INK, "middle", 800)
         if merge:
             pred = 1 + r["pred_gain_pct"] / 100
             s.text(px, py + rr + 34, labels[nid], 12, HARN, "middle", 700)
             s.text(px, py + rr + 49, f"predicted {fx(pred, 3)}", 11.8, MUTED, "middle")
         else:
             par = tree[nid]["parent"]
-            stp = f"step {fx(r['step_vs_previous_kept'], 3)} over {par.split(':')[0]} \u00b7 " if par != "stock" else ""
+            stp = f"step {fx(r['step_vs_previous_kept'], 3)} over {D['lineage_names'][par.split(':')[0]]} \u00b7 " if par != "stock" else ""
             s.text(px, py + rr + 34, f"{stp}{r['session_s'] / 60:.0f} min \u00b7 {C['tries_by_lineage'].get(name, 0)} tries", 11.8, MUTED, "middle")
     # legend
     ly = rowC + 86
@@ -323,12 +321,12 @@ def campaign_section(s, y, D, C, X):
     y += 46 + 12
     ab, sv = cp["port_ab"], D["server"]
     s.rect(M, y, W - 2 * M, 112, PANEL, stroke=WIN, rx=10, sw=1.4)
-    s.text(M + 16, y + 24, "THEN THE WINNER WAS PORTED INTO THE REAL ENGINE AND RUN THROUGH THE SERVER (K12)", 12, WIN, weight=800, ls=1.2)
+    s.text(M + 16, y + 24, "THEN THE WINNER WAS PORTED INTO THE REAL ENGINE AND MEASURED THROUGH THE SERVER", 12, WIN, weight=800, ls=1.2)
     cw = (W - 2 * M - 32) / 4
     for i, lab in enumerate(ab["labels"]):
         x = M + 16 + i * cw
         s.text(x, y + 52, f"{ab['base'][i]:g} \u2192 {ab['m3'][i]:g}", 17, INK, weight=800)
-        s.text(x, y + 69, f"{lab}: engine A/B {fx(ab['m3'][i] / ab['base'][i], 3)}", 11.8, MUTED)
+        s.text(x, y + 69, f"{lab}: engine {fx(ab['m3'][i] / ab['base'][i], 3)}", 11.8, MUTED)
         s.text(x, y + 88, f"server: {sv['greedy']['ours'][i]:g} vs vLLM {sv['greedy']['vllm'][i]:g}", 12.5, WIN, weight=800)
         s.text(x, y + 104, f"{fx(X['x_srv_greedy'][i], 2)} (sampled {fx(X['x_srv_t1'][i], 2)})", 11.8, MUTED)
     return y + 112 + 36
@@ -590,21 +588,20 @@ def progression(s, y, D, C, X):
         s.rect(bx, top + 20 + ph - bh, bw, bh, col_for[st["id"]], rx=3)
         s.text(bx + bw / 2, top + 20 + ph - bh - 7, f"{v:g}", 15, INK, "middle", 900)
         if i > 0:
-            s.text(bx + bw / 2, top + 20 + ph - bh - 24, f"{(v / vals[i - 1] - 1) * 100:+.1f}%" if st["id"] != "k12" else f"{fx(v / vals[i - 1], 2)} vs K11 build", 11.5, WIN if v > vals[i - 1] else MUTED, "middle", 700)
+            s.text(bx + bw / 2, top + 20 + ph - bh - 24, f"{(v / vals[i - 1] - 1) * 100:+.1f}%" if st["id"] != "k12" else f"{fx(v / vals[i - 1], 2)} vs previous build", 11.5, WIN if v > vals[i - 1] else MUTED, "middle", 700)
         s.text(bx + bw / 2, top + 20 + ph + 17, st["short"], 12, INK, "middle", 700)
-        s.text(bx + bw / 2, top + 20 + ph + 31, st["exp"], 11.5, MUTED, "middle")
+        s.text(bx + bw / 2, top + 20 + ph + 31, "ref " + st["exp"], 12, DIM, "middle")
     s.line(x0, top + 20 + ph, x0 + w0, top + 20 + ph, LINE, 1.5)
     yy = top + 20 + ph + 52
-    yy = s.para(x0, yy, "First end-to-end engine: 46.9 tok/s plain, a tie with vLLM's 46.8 (BENCH K3). Speculation, a leaner GEMV, a quantised head and a lookup tail took it from there.", w0, 12.5, MUTED)
+    yy = s.para(x0, yy, "First end-to-end engine: 46.9 tok/s plain, a tie with vLLM's 46.8. Speculation, a leaner GEMV, a quantised head and a lookup tail took it from there.", w0, 12.5, MUTED)
     # sampling + copy-heavy cards under the chart
     sc = sr["sampling_code"]
     yy += 8
-    s.rect(x0, yy, w0, 76, PANEL, stroke=LINE, rx=10)
+    s.rect(x0, yy, w0, 96, PANEL, stroke=LINE, rx=10)
     s.text(x0 + 16, yy + 24, "EXACT SAMPLING (T=1, top-p .95, top-k 20), code prompt", 11.5, DIM, weight=700, ls=1.2)
-    s.text(x0 + 16, yy + 56, f"vLLM {sc['vllm_t1']:g}  \u2192  {sc['k7']:g} (K7)  \u2192  {sc['k9']:g} (K9) tok/s", 18, INK, weight=800)
-    s.text(x0 + w0 - 16, yy + 40, f"server, same client, m3: {D['server']['t1']['ours'][0]:g} vs {D['server']['t1']['vllm'][0]:g}", 12, MUTED, "end")
-    s.text(x0 + w0 - 16, yy + 58, f"{fx(D['server']['t1']['ours'][0] / D['server']['t1']['vllm'][0], 2)}", 16, WIN, "end", 800)
-    yy += 88
+    s.text(x0 + 16, yy + 56, f"vLLM {sc['vllm_t1']:g}  \u2192  {sc['k7']:g} (exact sampling)  \u2192  {sc['k9']:g} (int4 head) tok/s", 15.5, INK, weight=800)
+    s.text(x0 + 16, yy + 78, f"Through the server, final build: {D['server']['t1']['ours'][0]:g} vs vLLM {D['server']['t1']['vllm'][0]:g} tok/s = {fx(D['server']['t1']['ours'][0] / D['server']['t1']['vllm'][0], 2)}", 13, WIN, weight=700)
+    yy += 108
     s.rect(x0, yy, w0, 76, PANEL, stroke=LINE, rx=10)
     s.text(x0 + 16, yy + 24, "COPY-HEAVY WORK (MTP chain + lookup tail, T\u22648), tok/s before \u2192 after", 11.5, DIM, weight=700, ls=1.2)
     for i, c in enumerate(sr["copy_heavy"]):
@@ -625,7 +622,7 @@ def progression(s, y, D, C, X):
                    "tok/s", f"{cname.capitalize()} prompt, tok/s", fmt="{:g}", small=True)
         ys += 178
     yb = max(yend, ys - 18)
-    s.text(M, yb + 24, "Sources: E0 README; BENCH.md K3, K4, K5/K7, K9, K11, K12. Last bar: m3 port, engine-direct (K12; same-session base 168.3). Bars are from different sessions.", 12, DIM, italic=True)
+    s.text(M, yb + 24, "Last bar: campaign winner measured directly on the engine (its own before/after base was 168.3). Bars come from different runs. Refs: BENCH.md sections named under each bar.", 12, DIM, italic=True)
     return yb + 24 + 40
 
 
@@ -641,8 +638,8 @@ def waterfall(s, y, D, C, X):
     Y = lambda v: top + (hi - v) / (hi - lo) * ph
     s.text(x0, y + 14, "PLAIN DECODE, ms PER STEP", 12.5, DIM, weight=700, ls=1.4)
     ms = [p["ms"] for p in pl]
-    seq = [("stock vLLM", ms[0], None, "E0"), ("engine e2e + a|b branch", ms[2], ms[2] - ms[0], "K3"), ("GEMV rewrite", ms[3], ms[3] - ms[2], "K5"),
-           ("int4 head + rescoring", ms[4], ms[4] - ms[3], "K9"), ("campaign m3 port", ms[5], ms[5] - ms[4], "K12")]
+    seq = [("stock vLLM", ms[0], None, "baseline"), ("first engine + parallel branch", ms[2], ms[2] - ms[0], "K3"), ("GEMV rewrite", ms[3], ms[3] - ms[2], "K5"),
+           ("int4 head + rescoring", ms[4], ms[4] - ms[3], "K9"), ("campaign winner", ms[5], ms[5] - ms[4], "K12")]
     n = len(seq)
     gap = 12
     bw = (w0 - gap * (n - 1)) / n
@@ -671,15 +668,15 @@ def waterfall(s, y, D, C, X):
     s.text(x0 + w0 + 14, Y(hd["read_only_ms"]["v"]) + 12, f"{hd['read_only_ms']['v']} ms, 891 GB/s", 11.5, PART)
     s.text(x0 + w0 + 14, Y(16.13) + 12, "copy roofline", 11.8, NEG, "start", 700)
     s.text(x0 + w0 + 14, Y(16.13) + 26, f"16.13 ms = {hd['roofline_toks']['v']} tok/s", 11.5, NEG)
-    s.text(x0, Y(lo) + 68, "axis starts at 15.5 ms. K9 18.105 and K12 17.227 are different sessions (the K12 A/B base was 18.133: -0.91 ms).", 11.5, DIM, italic=True)
+    s.text(x0, Y(lo) + 68, "axis starts at 15.5 ms. The last two bars come from different runs (in its own run the winner went 18.133 \u2192 17.227 ms).", 11.5, DIM, italic=True)
     rx, rw = 730, W - M - 730
     s.text(rx, y + 14, "SPECULATION MULTIPLIES THE PLAIN RATE (tok/s)", 12.5, DIM, weight=700, ls=1.2)
     k9 = D["series"]["steps"][5]["vals"][0]
     plain = hd["plain_k9_toks"]["v"]
     hy = D["campaign"]["port_ab"]["hybrid"]
-    ladder = [("plain decode, m3 port", plain, "K12", GPU, None),
+    ladder = [("plain decode, final build", plain, "K12", GPU, None),
               ("+ MTP chain k=3 with int4 draft head", k9, "K12", GPU, f"{fx(k9 / plain, 2)}  (3.50 tokens per cycle)"),
-              ("code-edit work: + lookup tail", hy["a"][0], "K12 / E6", AGENT, f"{fx(hy['a'][0] / hy['a'][1], 2)} over {hy['a'][1]:g} without the tail"),
+              ("code-edit work: + lookup tail", hy["a"][0], "K12", AGENT, f"{fx(hy['a'][0] / hy['a'][1], 2)} over {hy['a'][1]:g} without the tail"),
               ("stock vLLM server, MTP k=3 (code prompt)", hd["vllm_k3_code"]["v"], "K12", "#6c7a93", f"the qwen-warp server ({hd['engine_k3_code']['v']:g}) is {fx(hd['engine_k3_code']['v'] / hd['vllm_k3_code']['v'], 2)} faster")]
     ly = y + 38
     maxv = 300.0
@@ -691,7 +688,7 @@ def waterfall(s, y, D, C, X):
         s.text(rx + v / maxv * (rw - 50) + 8, yy + 37, f"{v:g}", 14, INK, weight=900)
         if note:
             s.text(rx, yy + 58, note, 12, WIN, weight=800)
-    s.para(rx, ly + 4 * 70 + 4, "Verifying 4 rows costs only ~7% more than 1 row (the weights are read once), so a chain that lands 3.5 tokens per cycle multiplies the plain rate by ~3. The int4 draft head costs 1.0% acceptance (E4); the 32k-vocab shortcut would have cost 6%.", rw, 12.3, MUTED)
+    s.para(rx, ly + 4 * 70 + 4, "Verifying 4 rows costs only ~7% more than 1 row (the weights are read once), so a chain that lands 3.5 tokens per cycle multiplies the plain rate by ~3. The int4 draft head costs 1.0% acceptance; the 32k-vocab shortcut would have cost 6%.", rw, 12.3, MUTED)
     return y + 36 + ph + 96
 
 
@@ -786,9 +783,9 @@ def failures(s, y, D, C, X):
 def comparison(s, y, D, C, X):
     cmpd = D["comparison"]
     y = s.section_title(y, "THE HONEST COMPARISON", "HyperQwen: same weights, same HTTP client, same card",
-                        "E11 pre-registered that we would win 3 of 4 prompts; with the K11 build we won one. The strongest open competitor is ahead where speculation has the most to copy.", color=HUMAN) + 14
+                        "Before the head-to-head test we predicted we would win 3 of 4 prompts; the build before the campaign won one. The strongest open competitor is ahead where speculation has the most to copy.", color=HUMAN) + 14
     x0, w0 = M, 700
-    top, ph = y + 28, 240
+    top, ph = y + 62, 240
     cats = cmpd["labels"]
     sysc = [GPU, "#8d99ae", HUMAN, AGENT]
     gw = w0 / len(cats)
@@ -806,17 +803,21 @@ def comparison(s, y, D, C, X):
             s.text(bx + bw / 2, top + ph - bh - 6, f"{v:.0f}", 12.3, INK, "middle", 800)
         s.text(x0 + ci * gw + gw / 2, top + ph + 20, cat, 13.5, INK, "middle", 700)
     s.line(x0, top + ph, x0 + w0, top + ph, LINE, 1.5)
-    xx = x0
     for si, row in enumerate(cmpd["rows"]):
-        s.rect(xx, top - 22, 12, 12, sysc[si], rx=3)
-        s.text(xx + 18, top - 11, row["label"], 12.5, MUTED)
-        xx += tw(row["label"], 12.5) + 44
-    s.text(x0, top + ph + 42, "decode tok/s, greedy, HTTP, 385 tokens, n=2 interleaved rounds (E11); first three series from E11 (K11 build, 350 W). Dashed: m3 port from its own K12 session, not re-run against HyperQwen.", 11.8, DIM, italic=True)
+        lx = x0 + (si % 2) * 350
+        ly2 = top - 40 + (si // 2) * 20
+        if row.get("dashed"):
+            s.rect(lx, ly2 - 11, 12, 12, "none", stroke=sysc[si], sw=2, dash="3 2", rx=2)
+        else:
+            s.rect(lx, ly2 - 11, 12, 12, sysc[si], rx=2)
+        s.text(lx + 18, ly2, row["label"], 12.5, MUTED)
+    s.text(x0, top - 2, "decode tokens/s", 12, DIM)
+    s.para(x0, top + ph + 42, "Greedy decoding through the HTTP server, 385 tokens, two interleaved rounds per system. The dashed bar was measured on another day, not interleaved with HyperQwen.", w0, 12, DIM)
     # right side
     us, hq, df, usm3 = cmpd["rows"]
     pct = lambda a, b: (a / b - 1) * 100
     ahead = [f"DFlash2 on code {fx(df['vals'][0] / us['vals'][0])} and math {fx(df['vals'][2] / us['vals'][2])} over us ({df['tokens_per_step'][0]:g} / {df['tokens_per_step'][2]:g} tokens per step vs our {us['tokens_per_step'][0]:g} / {us['tokens_per_step'][2]:g})",
-             f"HyperQwen MTP over our K11 build on code, math and 8K by {min(pct(hq['vals'][i], us['vals'][i]) for i in (0, 2, 3)):.0f}-{max(pct(hq['vals'][i], us['vals'][i]) for i in (0, 2, 3)):.0f}%; the m3 port is above it (own session, not re-run)"]
+             f"HyperQwen MTP over our pre-campaign build on code, math and 8K by {min(pct(hq['vals'][i], us['vals'][i]) for i in (0, 2, 3)):.0f}-{max(pct(hq['vals'][i], us['vals'][i]) for i in (0, 2, 3)):.0f}%; the final build is above it (measured in a separate run)"]
     tt = cmpd["ttft"]
     behind = [f"prose decode: +{pct(us['vals'][1], hq['vals'][1]):.0f}% over HyperQwen MTP, +{pct(us['vals'][1], df['vals'][1]):.0f}% over DFlash2",
               f"TTFT: {tt['us_20tok_ms']} ms vs {tt['hq_20tok_ms']} ms (20 tokens), {tt['us_8k_s']} s vs {tt['hq_8k_s']} s (8K)",
@@ -841,7 +842,7 @@ def comparison(s, y, D, C, X):
     td = cmpd["rows"][2]["tokens_per_step"]
     tu = cmpd["rows"][0]["tokens_per_step"]
     s.para(rx, ty2 + 168, f"Same ~22 ms step; DFlash2 lands {td[0]:g} tokens per step on code vs our {tu[0]:g}. We have not ported a block drafter.", rw, 12.3, MUTED)
-    return top + ph + 74
+    return top + ph + 84
 
 
 # =============================================================================================== 10. code along
@@ -878,7 +879,7 @@ def footer(s, y, D, C, X):
     verified = "server-verified (BENCH.md K12: server vs stock vllm serve, same client, median of 2 visits x 3 reps)" if X["camp_verified"] else "campaign harness only (port + server-level verification pending)"
     s.text(M + 20, y + 30, f"STATUS AS OF commit {X['head']}  \u00b7  {fmt_dt(ts_of(X['head_iso']), '%Y-%m-%d %H:%M')} (UTC+7)  \u00b7  poster generated {X['generated'][:16].replace('T', ' ')}", 13, AGENT, weight=800, ls=0.6)
     lines = [
-        f"Campaign-winner (m3) port: {verified}; the gate's x1.107 is the harness number. Everything else is from committed READMEs, BENCH.md and git history; every number has a pointer in data.json 'sources'.",
+        f"Campaign winner (ported): {verified}; the gate's x1.107 is the harness number. Everything else is from committed READMEs, BENCH.md and git history; every number has a pointer in data.json 'sources'.",
         "One RTX 3090 (24 GB), Swift-1.5-Qwen3.8-27B-INT4 + MTP head, vLLM 0.30 as the stock baseline. Run-to-run noise \u00b10.1% on paired A/B, \u00b13% on single-task greedy streams. Known open test: test_headq e2e parity fails on the base build too (BENCH K12).",
         "HyperQwen DFlash2 is ahead on code and math; we have not ported a block drafter. 8K-context and concurrency comparisons were not completed.",
         "Reproduce: python3 gen.py  \u00b7  Update numbers: edit data.json, re-run gen.py  \u00b7  Code: MIT.  github.com/tuan3w/qwen-warp",

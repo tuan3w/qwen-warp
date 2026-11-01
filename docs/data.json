@@ -137,7 +137,7 @@
     "id": "vllm",
     "label": "stock vLLM 0.30, MTP k=3",
     "short": "stock vLLM",
-    "exp": "E0",
+    "exp": "baseline",
     "vals": [
      96.4,
      63.0,
@@ -150,7 +150,7 @@
     "id": "k4",
     "label": "MTP chain, int4 draft head (K4)",
     "short": "MTP chain",
-    "exp": "K4 / E4",
+    "exp": "K4 · E4",
     "vals": [
      145.0,
      94.7,
@@ -163,7 +163,7 @@
     "id": "k5",
     "label": "+ GEMV rewrite (K5)",
     "short": "GEMV rewrite",
-    "exp": "K5 / E3",
+    "exp": "K5 · E3",
     "vals": [
      151.6,
      95.3,
@@ -176,7 +176,7 @@
     "id": "k9",
     "label": "+ int4 lm_head + exact rescoring (K9)",
     "short": "int4 head",
-    "exp": "K9 / E5",
+    "exp": "K9 · E5",
     "vals": [
      167.8,
      107.4,
@@ -189,7 +189,7 @@
     "id": "k11",
     "label": "+ prompt-lookup tail (K11)",
     "short": "lookup tail",
-    "exp": "K11 / E6",
+    "exp": "K11 · E6",
     "vals": [
      167.9,
      107.5,
@@ -200,9 +200,9 @@
    },
    {
     "id": "k12",
-    "label": "+ campaign m3 port (K12, engine-direct)",
-    "short": "m3 port",
-    "exp": "K12 / campaign",
+    "label": "+ campaign winner, ported into the engine",
+    "short": "campaign winner",
+    "exp": "K12",
     "vals": [
      183.4,
      119.3,
@@ -214,19 +214,19 @@
   ],
   "copy_heavy": [
    {
-    "label": "code edit (E6 a)",
+    "label": "code edit",
     "base": 172.8,
     "tail": 240.1,
     "src": "bench_k11"
    },
    {
-    "label": "log -> table (E6 b)",
+    "label": "log -> table",
     "base": 173.4,
     "tail": 230.5,
     "src": "bench_k11"
    },
    {
-    "label": "agent turn (E6 c)",
+    "label": "agent turn",
     "base": 185.8,
     "tail": 271.5,
     "src": "bench_k11"
@@ -249,7 +249,7 @@
    },
    {
     "id": "k3a",
-    "label": "first e2e engine",
+    "label": "first engine",
     "ms": 21.33,
     "toks": 46.9,
     "exp": "K3",
@@ -257,7 +257,7 @@
    },
    {
     "id": "k3b",
-    "label": "a|b on a parallel branch",
+    "label": "parallel branch",
     "ms": 20.93,
     "toks": 47.8,
     "exp": "K3",
@@ -281,7 +281,7 @@
    },
    {
     "id": "k12",
-    "label": "m3 port",
+    "label": "campaign winner",
     "ms": 17.227,
     "toks": 58.0,
     "exp": "K12",
@@ -328,12 +328,12 @@
    "code",
    "prose",
    "math",
-   "8K ctx"
+   "8K-token context"
   ],
   "rows": [
    {
     "id": "us",
-    "label": "qwen-warp (K11, server)",
+    "label": "qwen-warp (before campaign)",
     "vals": [
      165.6,
      107.2,
@@ -361,7 +361,7 @@
    },
    {
     "id": "hqdf",
-    "label": "HyperQwen DFlash2",
+    "label": "HyperQwen DFlash2 (extra trained drafter)",
     "vals": [
      253.6,
      102.9,
@@ -378,7 +378,7 @@
    },
    {
     "id": "us_m3",
-    "label": "qwen-warp + m3 (own session)",
+    "label": "qwen-warp (final, measured in a separate run)",
     "vals": [
      184.1,
      116.8,
@@ -411,7 +411,7 @@
  "predictions": [
   {
    "id": "p01",
-   "claim": "E0 vLLM plain decode tok/s",
+   "claim": "Baseline: vLLM plain decode tok/s",
    "predicted": "34 (28-42)",
    "measured": "46.8",
    "verdict_text": "MISS",
@@ -422,7 +422,7 @@
   },
   {
    "id": "p02",
-   "claim": "E0 vLLM MTP k=3 code tok/s",
+   "claim": "Baseline: vLLM MTP k=3 code tok/s",
    "predicted": "58",
    "measured": "96.4",
    "verdict_text": "MISS",
@@ -433,7 +433,7 @@
   },
   {
    "id": "p03",
-   "claim": "E1 persistent+prefetch / graph",
+   "claim": "Persistent kernel: persistent+prefetch / graph",
    "predicted": "1.07x (1.00-1.15)",
    "measured": "1.025x",
    "verdict_text": "MISS (kill criterion hit)",
@@ -444,7 +444,7 @@
   },
   {
    "id": "p04",
-   "claim": "E1 PDL baseline exists on sm_86",
+   "claim": "Persistent kernel: PDL baseline exists on sm_86",
    "predicted": "assumed yes",
    "measured": "impossible (ptxas: griddepcontrol needs sm_90)",
    "verdict_text": "MISS",
@@ -455,7 +455,7 @@
   },
   {
    "id": "p05",
-   "claim": "E3 verify flat to T=8",
+   "claim": "mma verify: verify flat to T=8",
    "predicted": "<=1.03x",
    "measured": "1.12-1.15x at T=8",
    "verdict_text": "MISS",
@@ -466,7 +466,7 @@
   },
   {
    "id": "p06",
-   "claim": "E3 cheaper dequant raises GB/s",
+   "claim": "mma verify: cheaper dequant raises GB/s",
    "predicted": "'power is a lever'",
    "measured": "+0.4-1.2% only",
    "verdict_text": "MISS",
@@ -477,7 +477,7 @@
   },
   {
    "id": "p07",
-   "claim": "E4 restricted vocab 32k loses",
+   "claim": "Draft path: restricted vocab 32k loses",
    "predicted": "<=3%",
    "measured": "6.2%",
    "verdict_text": "MISS",
@@ -488,7 +488,7 @@
   },
   {
    "id": "p08",
-   "claim": "E4 MTP int4 loses",
+   "claim": "Draft path: MTP int4 loses",
    "predicted": "3-8%",
    "measured": "1.0%",
    "verdict_text": "MISS (better)",
@@ -499,7 +499,7 @@
   },
   {
    "id": "p09",
-   "claim": "E4 64k vocab / head int4",
+   "claim": "Draft path: 64k vocab / head int4",
    "predicted": "<=3% / <=3%",
    "measured": "0.6% / 0.0%",
    "verdict_text": "HIT",
@@ -510,7 +510,7 @@
   },
   {
    "id": "p10",
-   "claim": "E5 int8 lm_head passes top-1>=99.5%",
+   "claim": "lm_head quantisation: int8 lm_head passes top-1>=99.5%",
    "predicted": "adopt int8",
    "measured": "99.19%",
    "verdict_text": "MISS",
@@ -521,7 +521,7 @@
   },
   {
    "id": "p11",
-   "claim": "K7 spec-sampling speedup vs vLLM T=1",
+   "claim": "Exact sampling: spec-sampling speedup vs vLLM T=1",
    "predicted": "1.38-1.43x",
    "measured": "1.59-1.71x",
    "verdict_text": "MISS (better)",
@@ -532,7 +532,7 @@
   },
   {
    "id": "p12",
-   "claim": "N1 PLD+MTP switch hybrid H0 / MTP-only, code edits (modelled)",
+   "claim": "Lookup hybrid (modelled): PLD+MTP switch hybrid H0 / MTP-only, code edits (modelled)",
    "predicted": "1.20x (1.08-1.35)",
    "measured": "1.168x [1.01, 1.40]",
    "verdict_text": "HIT",
@@ -543,7 +543,7 @@
   },
   {
    "id": "p13",
-   "claim": "N1 H0 no loss on prose / math",
+   "claim": "Lookup hybrid (modelled): H0 no loss on prose / math",
    "predicted": ">=0.995x / >=0.995x",
    "measured": "0.971x / 0.880x",
    "verdict_text": "MISS",
@@ -554,7 +554,7 @@
   },
   {
    "id": "p14",
-   "claim": "N1 MTP-only tokens/cycle on log extraction",
+   "claim": "Lookup hybrid (modelled): MTP-only tokens/cycle on log extraction",
    "predicted": "3.1",
    "measured": "3.69",
    "verdict_text": "MISS (better)",
@@ -565,7 +565,7 @@
   },
   {
    "id": "p15",
-   "claim": "K9 plain step int8 / int4 head + rescore (ms)",
+   "claim": "int4 head: plain step int8 / int4 head + rescore (ms)",
    "predicted": "18.85 / 18.25",
    "measured": "18.80 / 18.105",
    "verdict_text": "HIT / HIT (better)",
@@ -576,7 +576,7 @@
   },
   {
    "id": "p16",
-   "claim": "K9 greedy k=3 code tok/s int8 / int4",
+   "claim": "int4 head: greedy k=3 code tok/s int8 / int4",
    "predicted": "~160 / ~165 (x1.055-1.065 / x1.085-1.10)",
    "measured": "162.0 / 167.8 (x1.065 / x1.104)",
    "verdict_text": "HIT / HIT (int4 slightly above the band)",
@@ -587,7 +587,7 @@
   },
   {
    "id": "p17",
-   "claim": "K9 greedy argmax == BF16 head on >= 4000 positions",
+   "claim": "int4 head: greedy argmax == BF16 head on >= 4000 positions",
    "predicted": "0 mismatches",
    "measured": "0 real over 19,976 (1 exact fp32 tie)",
    "verdict_text": "HIT",
@@ -598,7 +598,7 @@
   },
   {
    "id": "p18",
-   "claim": "K11 verify step V(5..8) at ctx 64 (ms)",
+   "claim": "Lookup tail: verify step V(5..8) at ctx 64 (ms)",
    "predicted": "19.9 / 20.5 / 21.1 / 21.7",
    "measured": "20.07 / 20.62 / 21.17 / 21.61",
    "verdict_text": "HIT",
@@ -609,7 +609,7 @@
   },
   {
    "id": "p19",
-   "claim": "K11 host round trip per hybrid cycle (device-side lookup needed?)",
+   "claim": "Lookup tail: host round trip per hybrid cycle (device-side lookup needed?)",
    "predicted": "0.05-0.15 ms, no",
    "measured": "< 0.01 ms (notail == base to 0.1%), no",
    "verdict_text": "HIT (better)",
@@ -620,7 +620,7 @@
   },
   {
    "id": "p20",
-   "claim": "K11 hybrid / MTP-only tok/s on E6 code edits / logs / agent turns (greedy)",
+   "claim": "Lookup tail: hybrid / MTP-only tok/s on E6 code edits / logs / agent turns (greedy)",
    "predicted": "x1.25 / 1.20 / 1.30",
    "measured": "x1.389 / 1.329 / 1.461 (pooled a-c 1.381)",
    "verdict_text": "MISS (better)",
@@ -631,7 +631,7 @@
   },
   {
    "id": "p21",
-   "claim": "K11 no loss on prose / math (E6 d / e), E0 code +5..15%",
+   "claim": "Lookup tail: no loss on prose / math (E6 d / e), E0 code +5..15%",
    "predicted": ">= 0.985 / >= 1.00, code +5..15%",
    "measured": "x1.014 / 1.072, E0 code +0.7%",
    "verdict_text": "HIT / MISS",
@@ -642,7 +642,7 @@
   },
   {
    "id": "p22",
-   "claim": "K11 max-model-len with the 9-slot ring (bf16 / fp8)",
+   "claim": "Lookup tail: max-model-len with the 9-slot ring (bf16 / fp8)",
    "predicted": "~28000 / ~49000",
    "measured": "28672 / 53248 (from 36864 / 65536)",
    "verdict_text": "HIT",
@@ -653,7 +653,7 @@
   },
   {
    "id": "p23",
-   "claim": "K9 int4 sampled-distribution TV vs BF16 head",
+   "claim": "int4 head: int4 sampled-distribution TV vs BF16 head",
    "predicted": "< 0.003",
    "measured": "<= 0.00001 (5 positions), mean 0.0015 at top_k 64 (4,994 positions)",
    "verdict_text": "HIT",
@@ -741,7 +741,7 @@
   },
   {
    "id": "p31",
-   "claim": "E6 classes a-c pooled greedy tok/s, swift-mk / HQ MTP / HQ DFlash2 (256 tokens, HTTP)",
+   "claim": "Copy-heavy classes a-c pooled greedy tok/s, swift-mk / HQ MTP / HQ DFlash2 (256 tokens, HTTP)",
    "predicted": "240 / 140 / (DFLASH_TOKENS=15) 200",
    "measured": "197 / 182 / 225 (DFlash2 x1.14; dflash15 did not serve); class c alone 240 / 185 / 229",
    "verdict_text": "MISS",
@@ -835,7 +835,7 @@
    "pred": 1.25,
    "meas": 1.389,
    "better": "for",
-   "note": "E6's model was 1.25x"
+   "note": "the pre-registered model said 1.25x"
   },
   {
    "pid": "p25",
@@ -848,7 +848,7 @@
   },
   {
    "pid": "p30",
-   "label": "HyperQwen DFlash2, E0 code",
+   "label": "HyperQwen DFlash2, code prompt",
    "unit": "tok/s",
    "pred": 130,
    "meas": 254,
@@ -859,7 +859,7 @@
  "failures": [
   {
    "id": "f1",
-   "exp": "E1",
+   "exp": "kernel experiment",
    "title": "Persistent megakernel",
    "number": "+2.5%",
    "text": "predicted +7%; kill criterion hit. PDL does not exist on sm_86 (ptxas: griddepcontrol needs sm_90).",
@@ -867,7 +867,7 @@
   },
   {
    "id": "f2",
-   "exp": "E7",
+   "exp": "drafting experiment",
    "title": "Attention-pointer / kNN drafting",
    "number": "×1.000",
    "text": "the model's own state predicts the copy source, but exact n-gram lookup already has that information. [0.998, 1.003]",
@@ -875,7 +875,7 @@
   },
   {
    "id": "f3",
-   "exp": "K3",
+   "exp": "engine build",
    "title": "Fused RMSNorm prologue",
    "number": "21.47 ms",
    "text": "removing 129 norm launches cost +5.3 us per GEMV: slower than the 20.93 ms it replaced.",
@@ -883,7 +883,7 @@
   },
   {
    "id": "f4",
-   "exp": "E5",
+   "exp": "quantisation experiment",
    "title": "int8 lm_head, no rescoring",
    "number": "99.19%",
    "text": "top-1 agreement below the pre-registered 99.5% bar; int4 alone 93.8%. Only exact rescoring of the top-16 made it safe.",
@@ -891,7 +891,7 @@
   },
   {
    "id": "f5",
-   "exp": "K5",
+   "exp": "engine build",
    "title": "'Bit-identical' GEMV claim",
    "number": "retracted",
    "text": "a later agent measured rounding-level differences; the claim was corrected in the repo (be8661e).",
@@ -899,7 +899,7 @@
   },
   {
    "id": "f6",
-   "exp": "lease",
+   "exp": "operations",
    "title": "GPU lease contention",
    "number": "50 min",
    "text": "a peer re-acquiring in the same second it released starved a 30 s poller. One card, many agents: hand-off protocol needed.",
@@ -907,23 +907,23 @@
   },
   {
    "id": "f7",
-   "exp": "E2",
+   "exp": "kernel experiment",
    "title": "Fused-phase dataflow kernel",
    "number": "abandoned",
-   "text": "the human cancelled it mid-implementation; E3 then showed the GEMV chain is already within ~10% of copy peak, so it stays parked.",
+   "text": "the human cancelled it mid-implementation; a later experiment showed the GEMV chain is already within ~10% of copy peak, so it stays parked.",
    "src": "e2"
   },
   {
    "id": "f8",
-   "exp": "E6",
+   "exp": "drafting experiment",
    "title": "Switch-to-lookup hybrid",
    "number": "×0.88 math",
-   "text": "pre-registered rule failed on prose and math; only a lookup TAIL behind the MTP chain survived (post-hoc, then built and measured as K11).",
+   "text": "pre-registered rule failed on prose and math; only a lookup TAIL behind the MTP chain survived (post-hoc, then built and measured in the engine).",
    "src": "e6"
   },
   {
    "id": "f9",
-   "exp": "single seed",
+   "exp": "method",
    "title": "Single-prompt claims",
    "number": "±3% per task",
    "text": "per-task greedy streams diverge at rounding near-ties; every headline is a pooled class or an interleaved A/B, never one run.",
@@ -933,7 +933,7 @@
  "found": [
   {
    "id": "cycle2",
-   "who": "cycle2",
+   "who": "CAMPAIGN AGENT · LAUNCH STRUCTURE",
    "title": "The side GEMV could never overlap",
    "text": "in_proj_a|b used 184 registers x 128 threads = 23.5k per CTA; two resident W4 CTAs leave 16k per SM, so the forked branch serialised. Cap to 64 registers: overlap.",
    "result": "x1.011 step, a 3-line diff",
@@ -941,7 +941,7 @@
   },
   {
    "id": "dnet2",
-   "who": "dnet2",
+   "who": "CAMPAIGN AGENT · DELTANET KERNEL",
    "title": "60% of the DeltaNet kernel was a prologue",
    "text": "clock64 probes inside the kernel showed three dependent conv load/store phases, not the recurrence, were the biggest block.",
    "result": "DeltaNet 1.106 -> 0.835 ms/cycle",
@@ -949,17 +949,17 @@
   },
   {
    "id": "gemv",
-   "who": "gemv",
+   "who": "CAMPAIGN AGENT · WEIGHT LAYOUT",
    "title": "A repack the earlier log had bounded at -0.21 ms",
-   "text": "GEMV_LOG #10 measured -3% in the lab. The campaign agent made it the real layout in every kernel (decode, MTP, head, prefill).",
+   "text": "an earlier hand-written log measured -3% in the lab. The campaign agent made it the real layout in every kernel (decode, MTP, head, prefill).",
    "result": "x1.032 end-to-end",
    "src": "gemv_log"
   },
   {
    "id": "verify",
-   "who": "verify vs smallk",
+   "who": "TWO CAMPAIGN AGENTS",
    "title": "Two agents, one idea, a winner",
-   "text": "both stopped writing unused DeltaNet snapshots. smallk replayed accepted rows (15 min); verify stored rank-1 deltas and replayed them bit-exactly (48 min).",
+   "text": "both stopped writing unused DeltaNet snapshots. one agent replayed accepted rows (15 min); the other stored rank-1 deltas and replayed them bit-exactly (48 min).",
    "result": "x1.021 beat x1.011; merged",
    "src": "camp_snapshot"
   }
@@ -992,7 +992,7 @@
   {
    "id": "k5",
    "title": "An agent's claim, corrected by a peer",
-   "text": "K5's 'bit-identical' GEMV claim was shown false by the next agent's K7 follow-up and retracted in the repo.",
+   "text": "An early GEMV kernel was claimed 'bit-identical'. The next agent's follow-up showed it was not, and the claim was retracted in the repo.",
    "src": "retract"
   },
   {
@@ -1024,12 +1024,12 @@
   "smallk:1": "stop writing unused DeltaNet snapshots",
   "gemv:1": "repack W4 weights tile-contiguous",
   "verify:1": "lazy rank-1 DeltaNet replay",
-  "m1:1": "merge gemv + verify",
+  "m1:1": "merge weight layout + lazy replay",
   "cycle2:1": "cap side GEMV to 64 registers",
   "gemv2:1": "lop3 nibble unpack, 32-bit offsets",
   "dnet2:1": "DeltaNet prologue rewrite",
-  "m2:1": "merge gemv2 + dnet2",
-  "m3:1": "merge m2 + cycle2"
+  "m2:1": "merge GEMV loop + DeltaNet kernel",
+  "m3:1": "merge 2 + side GEMV = winner"
  },
  "gate_gpu_min": {
   "v": 12.6,
@@ -1235,7 +1235,7 @@
   {
    "lane": "Kernels",
    "commit": "7b32133",
-   "label": "mma verify x1.12 @T=8",
+   "label": "mma verify x1.12 at 8 rows",
    "v": "partial",
    "src": "e3"
   },
@@ -1264,7 +1264,7 @@
   {
    "lane": "Kernels",
    "commit": "be8661e",
-   "label": "K5 claim retracted",
+   "label": "'bit-identical' claim retracted",
    "v": "partial",
    "src": "retract",
    "dy": 1
@@ -1338,7 +1338,7 @@
   {
    "lane": "Campaign",
    "commit": "6ab4cc1",
-   "label": "re-synced to K11",
+   "label": "harness re-synced",
    "v": "win",
    "src": "camp_readme",
    "dy": 1
@@ -1366,7 +1366,7 @@
    "campaign": "m1:1",
    "v": "win",
    "src": "camp_snapshot",
-   "label": "wave 1: m1 x1.055",
+   "label": "wave 1 merged x1.055",
    "dy": 1
   },
   {
@@ -1399,7 +1399,7 @@
    "campaign": "m3:1",
    "v": "win",
    "src": "camp_snapshot",
-   "label": "m3 x1.107",
+   "label": "winner x1.107",
    "dy": 0
   },
   {
@@ -1420,7 +1420,7 @@
   {
    "lane": "Campaign",
    "commit": "9c3de9b",
-   "label": "m3 ported: x1.9 at server",
+   "label": "winner ported: x1.9 at server",
    "v": "win",
    "src": "k12",
    "dy": 0
@@ -1430,7 +1430,7 @@
   {
    "id": "dn_snap",
    "tab": "DeltaNet: before",
-   "title": "Before the port: every verify row writes a full 3.15 MB state snapshot (K1 ring)",
+   "title": "Before the port: every verify row writes a full 3.15 MB state snapshot",
    "file": "projects/swift-mk/engine/src/deltanet.cu",
    "rev": "9602811",
    "lines": [
@@ -1451,7 +1451,7 @@
     285
    ],
    "lang": "cuda",
-   "why": "agent-written (campaign lineage verify), kept by the gate at x1.021, now in engine/ via the m3 port"
+   "why": "agent-written (campaign lineage verify), kept by the gate at x1.021, now in engine/ via the campaign winner port"
   },
   {
    "id": "w4_dequant",
@@ -1464,7 +1464,7 @@
     69
    ],
    "lang": "cuda",
-   "why": "the lop3 form is the gemv2 lineage's change (SASS ~234 -> ~160 lines per group)"
+   "why": "the lop3 form is a campaign agent's change (SASS ~234 -> ~160 lines per group)"
   },
   {
    "id": "accept",
@@ -1782,5 +1782,16 @@
   },
   "src": "server_k12",
   "ratio_note": "ratios as printed in BENCH.md K12 (computed there from the per-visit medians, so they can differ in the last digit from the quotient of the rounded rows)"
+ },
+ "lineage_names": {
+  "gemv": "weight layout",
+  "verify": "lazy replay",
+  "smallk": "snapshot skip",
+  "gemv2": "GEMV loop",
+  "dnet2": "DeltaNet kernel",
+  "cycle2": "side GEMV",
+  "m1": "merge 1",
+  "m2": "merge 2",
+  "m3": "merge 3 (winner)"
  }
 }

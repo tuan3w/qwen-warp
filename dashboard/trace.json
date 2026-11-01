@@ -1,6 +1,31 @@
 {
  "commits": [
   {
+   "hash": "4439e9f",
+   "date": "2026-10-30 18:01",
+   "msg": "exp: tree-policy-bakeoff \u2014 no node-level rule beats greedy; SH8 +0.32 SD offline, +0.22 SD live (n.s.)"
+  },
+  {
+   "hash": "1fb1c71",
+   "date": "2026-10-30 21:28",
+   "msg": "experiment: pre-register E0 vLLM baseline and E1 persistence-vs-graph predictions"
+  },
+  {
+   "hash": "7f9389d",
+   "date": "2026-10-30 22:22",
+   "msg": "experiment: E1 persistence-vs-graph done; megakernel source notes; E0 script"
+  },
+  {
+   "hash": "e5428a1",
+   "date": "2026-10-30 22:33",
+   "msg": "exp: w4-multirow-verify-and-power \u2014 pre-register prediction"
+  },
+  {
+   "hash": "0c1b8a5",
+   "date": "2026-10-30 22:40",
+   "msg": "experiment: pre-register dataflow-fused-phases prediction (E2) before any code"
+  },
+  {
    "hash": "9b007df",
    "date": "2026-10-31 07:18",
    "msg": "experiment: E0 vLLM Swift INT4 bs1 baseline done"
@@ -304,6 +329,11 @@
    "hash": "b8b8feb",
    "date": "2026-11-01 23:55",
    "msg": "swift-mk: infographic updated to server-verified m3 port numbers (K12): x1.9-2.0 vs stock vLLM, port A/B, resume-bug catch"
+  },
+  {
+   "hash": "8440087",
+   "date": "2026-11-02 06:50",
+   "msg": "swift-mk: infographic plain-English labels (no internal ids as primary labels), two-bar server gauge"
   }
  ],
  "log": [
