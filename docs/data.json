@@ -6,9 +6,9 @@
   "question": "Can autonomous AI research beat vLLM on one RTX 3090?",
   "window": {
    "start": "2026-10-30T21:00:00+07:00",
-   "end": "2026-11-01T22:15:00+07:00"
+   "end": "2026-11-02T00:20:00+07:00"
   },
-  "status_note": "campaign-winner (m3) numbers are campaign-harness numbers: engine port + server-level verification pending",
+  "status_note": "m3 port measured at the server (K12); campaign gate numbers are harness numbers",
   "hardware": "1x RTX 3090 (24 GB, 936 GB/s), Swift-1.5-Qwen3.8-27B-INT4 (W4A16 g128) + MTP head",
   "exclude_commits": [
    "0b83349",
@@ -35,20 +35,20 @@
    "src": "e0"
   },
   "plain_k9_toks": {
-   "v": 55.2,
-   "src": "bench_k9"
+   "v": 58.0,
+   "src": "k12"
   },
   "plain_k9_ms": {
-   "v": 18.105,
-   "src": "bench_k9"
+   "v": 17.227,
+   "src": "k12"
   },
   "vllm_k3_code": {
-   "v": 96.4,
-   "src": "e0"
+   "v": 96.7,
+   "src": "server_k12"
   },
   "engine_k3_code": {
-   "v": 167.9,
-   "src": "bench_k11"
+   "v": 184.1,
+   "src": "server_k12"
   },
   "roofline_toks": {
    "v": 61.9,
@@ -72,15 +72,58 @@
   }
  },
  "campaign": {
-  "label": "campaign harness (port + server-level verification pending)",
+  "label": "campaign harness gate; port to engine/ and server run measured (K12)",
   "gate_verdict": 1.1068,
   "held_out": 1.098,
   "plain_guard": 1.052,
   "dev_tokps_control": 163.84,
   "dev_tokps_m3": 181.34,
-  "server_verified": null,
-  "server_verified_note": "set to {\"code\": ..., \"prose\": ..., ...} ratios when the engine port + server run exist; the generator then shows them instead",
-  "src": "camp_snapshot"
+  "server_verified": {
+   "code": 1.9,
+   "prose": 1.86,
+   "math": 1.95,
+   "8K": 1.86,
+   "basis": "server vs stock vllm serve, same client, greedy; ours 184.1/116.8/183.9/144.7 vs vLLM 96.7/63.0/94.2/77.7"
+  },
+  "server_verified_note": "measured: BENCH.md K12. Clear server_verified to fall back to the harness-only wording.",
+  "src": "camp_snapshot",
+  "port_ab": {
+   "labels": [
+    "code",
+    "prose",
+    "math",
+    "8K ctx"
+   ],
+   "base": [
+    168.3,
+    107.6,
+    165.4,
+    133.8
+   ],
+   "m3": [
+    183.4,
+    119.3,
+    179.4,
+    145.8
+   ],
+   "plain_ms_base": 18.133,
+   "plain_ms_m3": 17.227,
+   "hybrid": {
+    "a": [
+     266.2,
+     187.5
+    ],
+    "b": [
+     261.1,
+     189.2
+    ],
+    "c": [
+     308.9,
+     202.2
+    ]
+   },
+   "src": "k12"
+  }
  },
  "series": {
   "labels": [
@@ -154,6 +197,19 @@
      131.5
     ],
     "src": "bench_k11"
+   },
+   {
+    "id": "k12",
+    "label": "+ campaign m3 port (K12, engine-direct)",
+    "short": "m3 port",
+    "exp": "K12 / campaign",
+    "vals": [
+     183.4,
+     119.3,
+     179.4,
+     145.8
+    ],
+    "src": "k12"
    }
   ],
   "copy_heavy": [
@@ -222,12 +278,16 @@
     "toks": 55.2,
     "exp": "K9 / E5",
     "src": "bench_k9"
+   },
+   {
+    "id": "k12",
+    "label": "m3 port",
+    "ms": 17.227,
+    "toks": 58.0,
+    "exp": "K12",
+    "src": "k12"
    }
-  ],
-  "campaign_plain_control_toks": {
-   "v": 54.33,
-   "src": "camp_snapshot"
-  }
+  ]
  },
  "steps_factors": {
   "gemv": {
@@ -257,9 +317,10 @@
    "src": "bench_k11"
   },
   "campaign": {
-   "label": "campaign lineages",
+   "label": "campaign lineages (m3 port)",
    "x": 1.1068,
-   "src": "camp_snapshot"
+   "x_port_code": 1.09,
+   "src": "k12"
   }
  },
  "comparison": {
@@ -314,6 +375,18 @@
      2.98
     ],
     "src": "hq_tables"
+   },
+   {
+    "id": "us_m3",
+    "label": "qwen-warp + m3 (own session)",
+    "vals": [
+     184.1,
+     116.8,
+     183.9,
+     144.7
+    ],
+    "dashed": true,
+    "src": "server_k12"
    }
   ],
   "e6_ac": {
@@ -921,6 +994,12 @@
    "title": "An agent's claim, corrected by a peer",
    "text": "K5's 'bit-identical' GEMV claim was shown false by the next agent's K7 follow-up and retracted in the repo.",
    "src": "retract"
+  },
+  {
+   "id": "server",
+   "title": "The campaign never ran the server",
+   "text": "A lazy-state resume bug (warm vs cold rel-L2 0.11-0.16) was caught by the porting tests, not the gate; fixed before the numbers.",
+   "src": "k12_bug"
   }
  ],
  "rules": [
@@ -1337,13 +1416,21 @@
    "v": "partial",
    "src": "e11",
    "dy": 1
+  },
+  {
+   "lane": "Campaign",
+   "commit": "9c3de9b",
+   "label": "m3 ported: x1.9 at server",
+   "v": "win",
+   "src": "k12",
+   "dy": 0
   }
  ],
  "snippets": [
   {
    "id": "dn_snap",
    "tab": "DeltaNet: before",
-   "title": "Every verify row writes a full 3.15 MB state snapshot (K1 ring)",
+   "title": "Before the port: every verify row writes a full 3.15 MB state snapshot (K1 ring)",
    "file": "projects/swift-mk/engine/src/deltanet.cu",
    "rev": "9602811",
    "lines": [
@@ -1357,39 +1444,34 @@
    "id": "dn_lazy",
    "tab": "DeltaNet: lazy replay",
    "title": "Lazy rank-1 replay: store ~33 KB of deltas per row, replay them bit-exactly later",
-   "file": "src/deltanet.cu",
-   "rev": "70d812856822811fc8286d2dca260c583111f614",
+   "file": "projects/swift-mk/engine/src/deltanet.cu",
+   "rev": "9c3de9b",
    "lines": [
-    193,
-    204
+    274,
+    285
    ],
    "lang": "cuda",
-   "outside_repo": {
-    "repo": "~/llm-lab/swift-campaign/verify/work",
-    "rev": "70d812856822811fc8286d2dca260c583111f614"
-   },
-   "pointer": "campaign lineage verify:1 @70d8128, src/deltanet.cu:193-204 (lands in engine/ with the port)",
-   "why": "agent-written; kept by the gate at x1.021, merged into m1"
+   "why": "agent-written (campaign lineage verify), kept by the gate at x1.021, now in engine/ via the m3 port"
   },
   {
    "id": "w4_dequant",
    "tab": "W4 dequant",
-   "title": "int4 -> bf16 in two ops: mask+OR a magic exponent, one fma removes the bias (exact)",
+   "title": "int4 -> bf16: one lop3 (mask+OR a magic exponent), one fma removes the bias (exact)",
    "file": "projects/swift-mk/engine/src/common.cuh",
-   "rev": "9602811",
+   "rev": "9c3de9b",
    "lines": [
-    54,
-    63
+    61,
+    69
    ],
    "lang": "cuda",
-   "why": "the lop3 trick the gemv2 lineage then tightened (SASS ~234 -> ~160 lines per group)"
+   "why": "the lop3 form is the gemv2 lineage's change (SASS ~234 -> ~160 lines per group)"
   },
   {
    "id": "accept",
    "tab": "Spec-sampling accept",
    "title": "Exact speculative sampling: accept w.p. min(1, p/q), else resample from max(0, p-q)",
    "file": "projects/swift-mk/engine/src/mtp_sample.cu",
-   "rev": "9602811",
+   "rev": "9c3de9b",
    "lines": [
     222,
     232
@@ -1402,7 +1484,7 @@
    "tab": "Lookup proposer",
    "title": "Prompt-lookup tail: longest backward agreement among the 64 most recent matches",
    "file": "projects/swift-mk/engine/src/pld.cu",
-   "rev": "9602811",
+   "rev": "9c3de9b",
    "lines": [
     100,
     111
@@ -1446,9 +1528,12 @@
   "git": "git log of this repo at the commit shown in the footer (derived at generation time)",
   "src_studies": "sources/{MegaQwen,Megakernels,lucebox,open-jet,tpu-megakernels,megakernels-vs-cuda-graphs,pdl-megakernel-reconstruction,bonsai-turbo}.md (added in 7f9389d)",
   "idea": "ideas/fastest-single-3090-decode-of-swift-1-5-qwen3-8-27b-int4-w4a.md (frontmatter origin: human)",
-  "port": "campaign winner port to engine/ (PortM3): numbers here are campaign-harness only until it lands; update data.json 'campaign'",
+  "port": "BENCH.md '## K12' (m3 port measured, commits cc66da8 + 9c3de9b)",
   "hq_tables": "experiments/2026-11-01-hyperqwen-vs-swift-mk/results/tables.md (E0 + E6 same-client tables); dashboard/gen.py SPEC_TOKS rows",
-  "snip": "code snippets: the file:line pointer printed under each snippet (HEAD, or the campaign lineage commit named there)"
+  "snip": "code snippets: the file:line pointer printed under each snippet (HEAD, or the campaign lineage commit named there)",
+  "k12": "projects/swift-mk/engine/BENCH.md '## K12' (interleaved A/B base vs m3 port, plain step, E6 hybrid, server vs stock vllm serve table, TTFT, boot, tests table); projects/swift-mk/engine/results/m3-port/",
+  "server_k12": "projects/swift-mk/server/README.md (m3 port rows) = BENCH.md K12 'Through the real server vs stock vLLM' (server/ab_visit.py, same client, median of 2 visits x 3 reps)",
+  "k12_bug": "BENCH.md '## K12' 'Bug found and fixed in the port' (server/smk_runner._restore; runner_check warm-vs-cold rel-L2 0.108-0.162; smoke_test 20/22 before, 22/22 after)"
  },
  "builds": [
   {
@@ -1635,5 +1720,67 @@
    "what": "commit count, wall-clock span, CUDA lines, tests, experiment/bet tallies: derived by gen.py from git at the commit in the footer",
    "src": "git"
   }
- ]
+ ],
+ "server": {
+  "labels": [
+   "code",
+   "prose",
+   "math",
+   "8K ctx"
+  ],
+  "greedy": {
+   "ours": [
+    184.1,
+    116.8,
+    183.9,
+    144.7
+   ],
+   "vllm": [
+    96.7,
+    63.0,
+    94.2,
+    77.7
+   ],
+   "ratio": [
+    1.9,
+    1.86,
+    1.95,
+    1.86
+   ]
+  },
+  "t1": {
+   "ours": [
+    174.0,
+    116.2,
+    178.4,
+    147.1
+   ],
+   "vllm": [
+    88.7,
+    59.6,
+    88.1,
+    75.7
+   ],
+   "ratio": [
+    1.96,
+    1.95,
+    2.02,
+    1.94
+   ]
+  },
+  "ttft_20_ms": {
+   "ours": 37,
+   "vllm": 84
+  },
+  "ttft_8k_s": {
+   "ours": 3.91,
+   "vllm": 4.29
+  },
+  "boot_s": {
+   "ours": 19.6,
+   "vllm": "34-102"
+  },
+  "src": "server_k12",
+  "ratio_note": "ratios as printed in BENCH.md K12 (computed there from the per-visit medians, so they can differ in the last digit from the quotient of the rounded rows)"
+ }
 }

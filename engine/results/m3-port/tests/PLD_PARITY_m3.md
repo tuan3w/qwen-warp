@@ -1,0 +1,33 @@
+engine tmax 8, ctx_max 4926, build build
+### 1 greedy parity (hybrid == plain greedy, 192 tokens)
+- parity code (32 prompt tokens): EQUAL (192 tokens); cycles 52, T histogram {T=4: 40, T=8: 12}, tail tokens proposed 48, accepted-drafts histogram m=0..7 [2, 4, 4, 36, 3, 3, 0, 0], tokens/cycle 3.83 (1.1s)
+- parity prose (34 prompt tokens): NEAR-TIE divergence (accepted) at generated index 83 (plain 383, hybrid 494); plain-engine logits top1 494=19.2104 top2 383=19.1836, margin 0.0269; cycles 86, T histogram {T=4: 84, T=8: 2}, tail tokens proposed 8, accepted-drafts histogram m=0..7 [30, 23, 15, 18, 0, 0, 0, 0], tokens/cycle 2.24 (1.8s)
+- parity math (33 prompt tokens): EQUAL (192 tokens); cycles 58, T histogram {T=4: 52, T=8: 6}, tail tokens proposed 24, accepted-drafts histogram m=0..7 [2, 14, 6, 36, 0, 0, 0, 0], tokens/cycle 3.31 (1.2s)
+- parity a2_types_full (3711 prompt tokens): EQUAL (192 tokens); cycles 24, T histogram {T=8: 24}, tail tokens proposed 96, accepted-drafts histogram m=0..7 [0, 0, 0, 0, 0, 0, 0, 24], tokens/cycle 8.00 (2.3s)
+- parity b1_gitlog (4226 prompt tokens): EQUAL (192 tokens); cycles 34, T histogram {T=4: 9, T=7: 1, T=8: 24}, tail tokens proposed 99, accepted-drafts histogram m=0..7 [1, 2, 1, 8, 2, 1, 3, 16], tokens/cycle 6.03 (2.7s)
+- parity c3_edit (3457 prompt tokens): EQUAL (192 tokens); cycles 36, T histogram {T=4: 10, T=8: 26}, tail tokens proposed 104, accepted-drafts histogram m=0..7 [0, 3, 0, 12, 3, 3, 1, 14], tokens/cycle 5.72 (2.4s)
+- parity c2_write (1736 prompt tokens): EQUAL (192 tokens); cycles 36, T histogram {T=4: 14, T=8: 22}, tail tokens proposed 88, accepted-drafts histogram m=0..7 [0, 0, 2, 19, 1, 1, 0, 13], tokens/cycle 5.47 (1.6s)
+### 2 forced partial acceptance up to 8 rows
+force pattern [8]
+- rollback[8] a2_types_full (3711 prompt tokens): EQUAL (192 tokens); cycles 24, T histogram {T=8: 24}, tail tokens proposed 96, accepted-drafts histogram m=0..7 [0, 0, 0, 0, 0, 0, 0, 24], tokens/cycle 8.00 (2.3s)
+- rollback[8] b1_gitlog (4226 prompt tokens): EQUAL (192 tokens); cycles 34, T histogram {T=4: 9, T=7: 1, T=8: 24}, tail tokens proposed 99, accepted-drafts histogram m=0..7 [1, 2, 1, 8, 2, 1, 3, 16], tokens/cycle 6.03 (2.7s)
+- rollback[8] c3_edit (3457 prompt tokens): EQUAL (192 tokens); cycles 36, T histogram {T=4: 10, T=8: 26}, tail tokens proposed 104, accepted-drafts histogram m=0..7 [0, 3, 0, 12, 3, 3, 1, 14], tokens/cycle 5.72 (2.4s)
+force pattern [1]
+- rollback[1] a2_types_full (3711 prompt tokens): EQUAL (192 tokens); cycles 192, T histogram {T=4: 4, T=8: 188}, tail tokens proposed 752, accepted-drafts histogram m=0..7 [0, 1, 3, 0, 0, 0, 0, 188], tokens/cycle 1.00 (5.7s)
+- rollback[1] b1_gitlog (4226 prompt tokens): EQUAL (192 tokens); cycles 192, T histogram {T=4: 46, T=7: 7, T=8: 139}, tail tokens proposed 577, accepted-drafts histogram m=0..7 [2, 5, 7, 49, 11, 9, 13, 96], tokens/cycle 1.00 (5.9s)
+- rollback[1] c3_edit (3457 prompt tokens): EQUAL (192 tokens); cycles 192, T histogram {T=4: 45, T=8: 147}, tail tokens proposed 588, accepted-drafts histogram m=0..7 [2, 8, 4, 59, 15, 13, 8, 83], tokens/cycle 1.00 (5.5s)
+force pattern [5, 2, 7, 1, 8, 3]
+- rollback[5, 2, 7, 1, 8, 3] a2_types_full (3711 prompt tokens): EQUAL (192 tokens); cycles 46, T histogram {T=4: 1, T=8: 45}, tail tokens proposed 180, accepted-drafts histogram m=0..7 [0, 0, 1, 0, 0, 0, 0, 45], tokens/cycle 4.28 (2.7s)
+- rollback[5, 2, 7, 1, 8, 3] b1_gitlog (4226 prompt tokens): EQUAL (192 tokens); cycles 52, T histogram {T=4: 14, T=7: 2, T=8: 36}, tail tokens proposed 150, accepted-drafts histogram m=0..7 [0, 2, 2, 15, 2, 4, 4, 23], tokens/cycle 3.69 (3.1s)
+- rollback[5, 2, 7, 1, 8, 3] c3_edit (3457 prompt tokens): EQUAL (192 tokens); cycles 54, T histogram {T=4: 15, T=8: 39}, tail tokens proposed 156, accepted-drafts histogram m=0..7 [1, 3, 1, 19, 3, 3, 3, 21], tokens/cycle 3.59 (2.8s)
+force pattern [3, 4, 1, 6, 2, 8, 5, 7]
+- rollback[3, 4, 1, 6, 2, 8, 5, 7] a2_types_full (3711 prompt tokens): EQUAL (192 tokens); cycles 46, T histogram {T=4: 1, T=8: 45}, tail tokens proposed 180, accepted-drafts histogram m=0..7 [0, 0, 1, 0, 0, 0, 0, 45], tokens/cycle 4.35 (2.7s)
+- rollback[3, 4, 1, 6, 2, 8, 5, 7] b1_gitlog (4226 prompt tokens): EQUAL (192 tokens); cycles 48, T histogram {T=4: 11, T=7: 2, T=8: 35}, tail tokens proposed 146, accepted-drafts histogram m=0..7 [0, 0, 3, 11, 5, 2, 2, 25], tokens/cycle 4.04 (3.0s)
+- rollback[3, 4, 1, 6, 2, 8, 5, 7] c3_edit (3457 prompt tokens): EQUAL (192 tokens); cycles 52, T histogram {T=4: 12, T=8: 40}, tail tokens proposed 160, accepted-drafts histogram m=0..7 [0, 4, 2, 14, 3, 6, 2, 21], tokens/cycle 3.67 (2.7s)
+### 3 ring wraps with random forced acceptance 1..8
+- ring pattern [6, 7, 1, 7, 4, 5, 6, 3]: EQUAL (200 tokens); cycles 51, tokens/cycle 4.14, T histogram {3: 20, 7: 31}
+- ring pattern [8, 1, 3, 4, 5, 4, 2, 1]: EQUAL (200 tokens); cycles 63, tokens/cycle 3.16, T histogram {3: 21, 7: 42}
+- ring pattern [1, 1, 2, 8, 2, 6, 7, 2]: EQUAL (200 tokens); cycles 66, tokens/cycle 3.06, T histogram {3: 21, 7: 45}
+### 4 sampling, forced tail on the real graph
+- sampling with a forced tail of 4 (T = 8 rows every cycle, tail tokens [324, 3000, 324, 29310], 6000 cycles, 131 s): first emitted token vs analytic p over the 9-token support: chi2 5.9 df 8 p = 0.664, TV 0.0099, outside support 0; emitted per cycle mean 1.518
+RESULT: parity=OK rollback=OK ring=OK sampling=OK

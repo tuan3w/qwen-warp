@@ -1,0 +1,153 @@
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+W1101 23:34:49.167000 3781363 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 23:34:49.184000 3781363 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347] 
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347]        █     █     █▄   ▄█
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.30.0
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347]   █▄█▀ █     █     █     █  model   ~/models/swift-1.5-int4
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:347] 
+(APIServer pid=3781363) INFO 11-01 23:34:50 [api_utils.py:286] non-default args: {'enable_auto_tool_choice': True, 'tool_call_parser': 'qwen3_coder', 'enable_prompt_tokens_details': True, 'model': '~/models/swift-1.5-int4', 'dtype': 'bfloat16', 'max_model_len': 28672, 'served_model_name': ['swift'], 'reasoning_parser': 'qwen3', 'language_model_only': True, 'max_num_seqs': 1, 'speculative_config': {'method': 'mtp', 'num_speculative_tokens': 3}, 'disable_log_stats': True}
+(APIServer pid=3781363) INFO 11-01 23:34:50 [model.py:692] Resolved architecture: Qwen3_5ForConditionalGeneration
+(APIServer pid=3781363) INFO 11-01 23:34:50 [model.py:2030] Using max model len 28672
+(APIServer pid=3781363) INFO 11-01 23:34:52 [registry.py:146] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(APIServer pid=3781363) INFO 11-01 23:34:52 [model.py:900] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+(APIServer pid=3781363) INFO 11-01 23:34:52 [model.py:692] Resolved architecture: Qwen3_5MTP
+(APIServer pid=3781363) INFO 11-01 23:34:52 [model.py:2030] Using max model len 262144
+(APIServer pid=3781363) WARNING 11-01 23:34:52 [speculative.py:1361] Enabling num_speculative_tokens > 1 will run multiple times of forward on same MTP layer,which may result in lower acceptance rate
+(APIServer pid=3781363) INFO 11-01 23:34:52 [speculative.py:1651] Overriding draft model max model len from 262144 to 28672
+(APIServer pid=3781363) INFO 11-01 23:34:52 [config.py:625] Mamba cache mode is set to 'align' for Qwen3_5ForConditionalGeneration by default when prefix caching is enabled
+(APIServer pid=3781363) INFO 11-01 23:34:52 [kernel.py:416] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+(APIServer pid=3781363) WARNING 11-01 23:34:52 [vllm.py:2135] max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens.
+[W1101 23:35:01.833076583 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 50331648 bytes (free: 61407232, total: 25296044032).
+[W1101 23:35:03.783349636 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 109641728, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:35:04 [smk_core_client.py:112] swift-mk engine ready in 10.4 s (weights+MTP 6.7 s, warmup 3.4 s): ctx_max 28704, k=3, 2 cycles per sync, kv bf16, 4 snapshots, prompt-lookup tail on
+(APIServer pid=3781363) INFO 11-01 23:35:04 [entry.py:135] Supported tasks: ('generate',)
+(APIServer pid=3781363) INFO 11-01 23:35:04 [factories.py:76] Scale-out endpoints are disabled. Set --enable-scale-out to enable them.
+(APIServer pid=3781363) INFO 11-01 23:35:04 [parser_manager.py:36] "auto" tool choice has been enabled.
+(APIServer pid=3781363) INFO 11-01 23:35:05 [hf.py:642] Detected the chat template content format to be 'openai'. You can set `--chat-template-content-format` to override this.
+(APIServer pid=3781363) WARNING 11-01 23:35:05 [model.py:1772] Default vLLM sampling parameters have been overridden by the model's `generation_config.json`: `{'temperature': 1.0, 'top_k': 20, 'top_p': 0.95}`. If this is not intended, please relaunch vLLM instance with `--generation-config vllm`.
+(APIServer pid=3781363) INFO 11-01 23:35:05 [entry.py:139] Starting vLLM server on http://0.0.0.0:8000
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:61] Available routes are:
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /openapi.json, Methods: GET, HEAD
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /docs, Methods: GET, HEAD
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /docs/oauth2-redirect, Methods: GET, HEAD
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /redoc, Methods: GET, HEAD
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /load, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /version, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /health, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /metrics, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /tokenize, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /detokenize, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/models, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /ping, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /ping, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /invocations, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/chat/completions, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/chat/completions/batch, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/responses, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/responses/{response_id}, Methods: GET
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/responses/{response_id}/cancel, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/completions, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/messages, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /v1/messages/count_tokens, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /generative_scoring, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /scale_elastic_ep, Methods: POST
+(APIServer pid=3781363) INFO 11-01 23:35:05 [launcher.py:70] Route: /is_scaling_elastic_ep, Methods: POST
+(APIServer pid=3781363) INFO:     Started server process [3781363]
+(APIServer pid=3781363) INFO:     Waiting for application startup.
+(APIServer pid=3781363) INFO:     Application startup complete.
+(APIServer pid=3781363) INFO:     127.0.0.1:42514 - "GET /health HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:06 [smk_core_client.py:160] cmpl-94ad7031bdd935be-0-b59d3aed: prompt 32 (resumed at 0) prefill 0.040 s, 128 tokens in 0.66 s = 191.1 tok/s, 3.74 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:08 [smk_core_client.py:160] cmpl-8278d72ddb0c7279-0-9a112df5: prompt 34 (resumed at 0) prefill 0.044 s, 128 tokens in 1.23 s = 103.2 tok/s, 1.98 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:08 [smk_core_client.py:160] cmpl-93217b23b80a8038-0-8b3fe691: prompt 33 (resumed at 0) prefill 0.044 s, 128 tokens in 0.77 s = 164.0 tok/s, 3.17 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:35:08.788080576 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 50331648 bytes (free: 27852800, total: 25296044032).
+[W1101 23:35:12.589901169 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 80281600, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:35:13 [smk_core_client.py:160] cmpl-86ccb1182ef71952-0-9f1df214: prompt 8030 (resumed at 0) prefill 3.866 s, 128 tokens in 0.89 s = 142.2 tok/s, 2.89 tok/cycle, snapshots [8025, 8029]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:14 [smk_core_client.py:160] cmpl-bce8cd5bc905e988-0-a05f1216: prompt 32 (resumed at 0) prefill 0.044 s, 128 tokens in 0.67 s = 190.5 tok/s, 3.74 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:15 [smk_core_client.py:160] cmpl-826766aaa6dcb3f1-0-950663c2: prompt 34 (resumed at 0) prefill 0.045 s, 128 tokens in 1.23 s = 103.1 tok/s, 1.98 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:17 [smk_core_client.py:160] cmpl-987522bce2a87ad8-0-9c951963: prompt 32 (resumed at 0) prefill 0.043 s, 385 tokens in 2.10 s = 183.1 tok/s, 3.56 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:19 [smk_core_client.py:160] cmpl-bdec72b9f634e938-0-96b7c7dc: prompt 32 (resumed at 31) prefill 0.034 s, 385 tokens in 2.08 s = 184.3 tok/s, 3.56 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:21 [smk_core_client.py:160] cmpl-988245fdabaad35a-0-ad82f7a8: prompt 32 (resumed at 31) prefill 0.032 s, 385 tokens in 2.08 s = 184.2 tok/s, 3.56 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:25 [smk_core_client.py:160] cmpl-954b205fc66c8ee5-0-bf3b7b57: prompt 34 (resumed at 0) prefill 0.046 s, 385 tokens in 3.26 s = 117.6 tok/s, 2.26 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:28 [smk_core_client.py:160] cmpl-b8bf972de732309a-0-b83de6a9: prompt 34 (resumed at 33) prefill 0.032 s, 385 tokens in 3.29 s = 116.8 tok/s, 2.23 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:31 [smk_core_client.py:160] cmpl-b5b1f5bb616bed66-0-aca3a527: prompt 34 (resumed at 33) prefill 0.032 s, 385 tokens in 3.29 s = 116.8 tok/s, 2.23 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:34 [smk_core_client.py:160] cmpl-90ffef5af8612a7f-0-8c0983c7: prompt 33 (resumed at 0) prefill 0.044 s, 385 tokens in 2.10 s = 182.8 tok/s, 3.56 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:36 [smk_core_client.py:160] cmpl-964ad43d7156587d-0-b707f4ca: prompt 33 (resumed at 32) prefill 0.032 s, 385 tokens in 2.09 s = 184.0 tok/s, 3.56 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:38 [smk_core_client.py:160] cmpl-bb6f1c98e075b401-0-b20f8ece: prompt 33 (resumed at 32) prefill 0.032 s, 385 tokens in 2.09 s = 183.9 tok/s, 3.56 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:35:38.264999147 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 100663296 bytes (free: 92864512, total: 25296044032).
+[W1101 23:35:42.166249298 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 44630016, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:35:44 [smk_core_client.py:160] cmpl-8d16a548ce65b5d7-0-b336de06: prompt 8030 (resumed at 0) prefill 3.904 s, 385 tokens in 2.67 s = 143.9 tok/s, 2.91 tok/cycle, snapshots [8025, 8029]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:47 [smk_core_client.py:160] cmpl-ae39488d4ec39abe-0-82ea0c36: prompt 8030 (resumed at 8029) prefill 0.034 s, 385 tokens in 2.65 s = 145.2 tok/s, 2.91 tok/cycle, snapshots [8025, 8029]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:49 [smk_core_client.py:160] cmpl-a885e49cf0bfbdcc-0-88725b38: prompt 32 (resumed at 0) prefill 0.043 s, 385 tokens in 2.28 s = 168.6 tok/s, 3.31 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:52 [smk_core_client.py:160] cmpl-aee1be4a56ec2658-0-b7000ddd: prompt 32 (resumed at 31) prefill 0.034 s, 385 tokens in 2.23 s = 172.6 tok/s, 3.37 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:54 [smk_core_client.py:160] cmpl-a39d69b36a6b2406-0-91a6fbc5: prompt 32 (resumed at 31) prefill 0.032 s, 385 tokens in 2.18 s = 176.2 tok/s, 3.43 tok/cycle, snapshots [31]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:35:57 [smk_core_client.py:160] cmpl-9431cbdc12471b94-0-93c0a6de: prompt 34 (resumed at 0) prefill 0.050 s, 385 tokens in 3.26 s = 117.7 tok/s, 2.29 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:00 [smk_core_client.py:160] cmpl-ba6884b65c63fa44-0-b993269a: prompt 34 (resumed at 33) prefill 0.032 s, 385 tokens in 3.29 s = 116.8 tok/s, 2.26 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:04 [smk_core_client.py:160] cmpl-8a1824608cdfd48c-0-80426cd3: prompt 34 (resumed at 33) prefill 0.032 s, 385 tokens in 3.33 s = 115.5 tok/s, 2.23 tok/cycle, snapshots [33]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:06 [smk_core_client.py:160] cmpl-a4a5fc210574eb9c-0-b6adc73f: prompt 33 (resumed at 0) prefill 0.045 s, 385 tokens in 2.12 s = 180.7 tok/s, 3.56 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:08 [smk_core_client.py:160] cmpl-9ded0c0f53162517-0-be48f0f9: prompt 33 (resumed at 32) prefill 0.032 s, 385 tokens in 2.23 s = 172.4 tok/s, 3.37 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:11 [smk_core_client.py:160] cmpl-b23705d822837fd0-0-9525107f: prompt 33 (resumed at 32) prefill 0.032 s, 385 tokens in 2.19 s = 175.6 tok/s, 3.43 tok/cycle, snapshots [32]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:36:11.965101067 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 100663296 bytes (free: 80281600, total: 25296044032).
+[W1101 23:36:14.875266807 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 32047104, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:36:17 [smk_core_client.py:160] cmpl-baeefd849f49e451-0-925f5ff6: prompt 8030 (resumed at 0) prefill 3.915 s, 385 tokens in 2.89 s = 132.6 tok/s, 2.70 tok/cycle, snapshots [8025, 8029]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-9a34d1e34712d347-0-ae198e8e: prompt 8030 (resumed at 8029) prefill 0.034 s, 385 tokens in 2.67 s = 143.6 tok/s, 2.91 tok/cycle, snapshots [8025, 8029]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-9110d5237602a8c5-0-8526d6b8: prompt 20 (resumed at 0) prefill 0.037 s, 4 tokens in 0.05 s = 59.4 tok/s, 1.50 tok/cycle, snapshots [19]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-a75233b8d0ef0394-0-806cd7f8: prompt 20 (resumed at 0) prefill 0.035 s, 4 tokens in 0.05 s = 59.5 tok/s, 1.50 tok/cycle, snapshots [19]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-beaf921f800830f1-0-bd6bb177: prompt 20 (resumed at 0) prefill 0.036 s, 4 tokens in 0.05 s = 57.7 tok/s, 1.50 tok/cycle, snapshots [19]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-981e9cf5ff87ebad-0-ba99fd06: prompt 20 (resumed at 0) prefill 0.036 s, 4 tokens in 0.05 s = 58.5 tok/s, 1.50 tok/cycle, snapshots [19]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=3781363) INFO 11-01 23:36:20 [smk_core_client.py:160] cmpl-b95332cfd7faf544-0-94f265fb: prompt 20 (resumed at 0) prefill 0.036 s, 4 tokens in 0.05 s = 59.5 tok/s, 1.50 tok/cycle, snapshots [19]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:36:20.929688053 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 100663296 bytes (free: 82378752, total: 25296044032).
+[W1101 23:36:24.834522437 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 32047104, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:36:24 [smk_core_client.py:160] cmpl-895701a9050e0d42-0-9a536377: prompt 8033 (resumed at 0) prefill 3.909 s, 4 tokens in 0.06 s = 47.7 tok/s, 1.50 tok/cycle, snapshots [8028, 8032]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:36:24.906927320 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 100663296 bytes (free: 107544576, total: 25296044032).
+[W1101 23:36:28.761375462 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 57212928, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:36:28 [smk_core_client.py:160] cmpl-85cc1588ce10cbd5-0-93a0913d: prompt 8033 (resumed at 0) prefill 3.916 s, 4 tokens in 0.05 s = 57.4 tok/s, 1.50 tok/cycle, snapshots [8028, 8032]
+(APIServer pid=3781363) INFO:     127.0.0.1:42518 - "POST /v1/completions HTTP/1.1" 200 OK
+[W1101 23:36:28.878044394 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 100663296 bytes (free: 82378752, total: 25296044032).
+[W1101 23:36:32.784093566 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 150994944 bytes (free: 32047104, total: 25296044032).
+(APIServer pid=3781363) INFO 11-01 23:36:32 [smk_core_client.py:160] cmpl-97577b240b70d6a2-0-b7d96fc6: prompt 8033 (resumed at 0) prefill 3.908 s, 4 tokens in 0.06 s = 46.3 tok/s, 1.50 tok/cycle, snapshots [8028, 8032]
+(APIServer pid=3781363) INFO 11-01 23:36:32 [launcher.py:129] [shutdown] API server: shutdown triggered
+(APIServer pid=3781363) INFO 11-01 23:36:32 [launcher.py:145] [shutdown] API server: stopping engine client mode=abort timeout=0s
+(APIServer pid=3781363) INFO 11-01 23:36:32 [launcher.py:154] [shutdown] API server: engine client stopped
+(APIServer pid=3781363) INFO 11-01 23:36:32 [launcher.py:157] [shutdown] API server: signalling HTTP server shutdown
+(APIServer pid=3781363) INFO 11-01 23:36:32 [launcher.py:179] [shutdown] API server: shutting down FastAPI HTTP server
+(APIServer pid=3781363) INFO:     Shutting down
+(APIServer pid=3781363) INFO:     Waiting for application shutdown.
+(APIServer pid=3781363) INFO:     Application shutdown complete.

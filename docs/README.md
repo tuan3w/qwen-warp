@@ -36,11 +36,10 @@ PNG: open `infographic.svg` in Chromium at 1200 px width, take a full-page scree
 
 ## How to update numbers
 
-The campaign-winner (m3) numbers are **campaign-harness numbers**: engine port and server-level verification pending. When they exist:
+The campaign-winner (m3) numbers: the gate verdict is a harness number; the port is measured in BENCH.md K12 (`server`, `campaign.port_ab` and `campaign.server_verified` in `data.json`). To update after a re-measurement:
 
-1. Edit `data.json` -> `campaign`: set `gate_verdict`, `held_out`, `plain_guard`, `dev_tokps_control`, `dev_tokps_m3` to the new values and
-   put the verified ratios in `server_verified` (e.g. `{"code": 1.09, "prose": 1.06}`), and change `label` and the `port` entry in `sources`.
-   Everything derived from them (the gauge on the poster, the tiles, the waterfall step, the progression bars, the footer wording) follows.
+1. Edit `data.json`: `server` (server vs stock vLLM rows and ratios, TTFT, boot), `campaign.port_ab` (engine A/B, plain step, hybrid), `campaign.gate_verdict` etc.
+   (harness numbers); clear `campaign.server_verified` to fall back to the harness-only footer wording. Everything derived follows (gauge, tiles, progression, waterfall, footer).
 2. Edit `series.steps[*].vals` if BENCH.md has new rows (each step carries the `src` pointer to the BENCH section).
 3. `python3 gen.py`, then re-render the PNG.
 

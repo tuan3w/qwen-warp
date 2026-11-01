@@ -38,9 +38,10 @@ __device__ __forceinline__ void epi_mm(const float (&acc)[4], int row, int g, in
 
 // NW warps/CTA, KS K-split warps per row block (smem reduce at block end), U weight prefetch depth (128-k groups), NT activation n8 tiles, MT 16-row weight tiles per warp:
 // the activation fragments loaded for one k step are shared by the MT tiles (the activation traffic from L1 per mma halves for MT = 2).
-template <int MT, int NT, int NW, int KS, int U, int MINB>
+// RP = 1: repacked weight layout (smk_w4r_gemv in include/engine.h / gemv.cu k_w4).
+template <int MT, int NT, int NW, int KS, int U, int MINB, int RP>
 __global__ void __launch_bounds__(NW * 32, MINB)
-    k_w4mm(const uint4* __restrict__ W, const uint16_t* __restrict__ S, const uint4* __restrict__ X, const smk_epi epi, int N, int K, int T) {
+    k_w4mm(const uint4* __restrict__ W, const void* __restrict__ S, const uint4* __restrict__ X, const smk_epi epi, int N, int K, int T) {
   constexpr int TPC = NW / KS;
   __shared__ float red[KS > 1 ? NW : 1][32][KS > 1 ? 4 * NT * MT : 1];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -57,24 +58,39 @@ __global__ void __launch_bounds__(NW * 32, MINB)
 
   const uint4* wp;
   const uint16_t* sp;
+  const uint32_t* sp32;
   uint4 wa[U][MT], wb[U][MT];
   uint32_t ss[U][MT];
   int lm = 0, lk = 0;
   auto setp = [&](int m) {
-    const size_t row = (size_t)tile_of(m) * (16 * MT) + g;
-    wp = W + row * rowu + ks * 4 + t;
-    sp = S + row * nkg + ks;
+    if (RP) {
+      const size_t u0 = (size_t)tile_of(m) * (MT * nkg) + ks;
+      wp = W + u0 * 64 + lane;
+      sp32 = (const uint32_t*)S + u0 * 8 + g;
+    } else {
+      const size_t row = (size_t)tile_of(m) * (16 * MT) + g;
+      wp = W + row * rowu + ks * 4 + t;
+      sp = (const uint16_t*)S + row * nkg + ks;
+    }
   };
   setp(0);
   auto issue = [&](int j) {
 #pragma unroll
     for (int mt = 0; mt < MT; mt++) {
-      wa[j][mt] = ldw(wp + (size_t)(16 * mt) * rowu); wb[j][mt] = ldw(wp + (size_t)(16 * mt + 8) * rowu);
-      ss[j][mt] = ld16(sp + (size_t)(16 * mt) * nkg) | (ld16(sp + (size_t)(16 * mt + 8) * nkg) << 16);
+      if (RP) {
+        wa[j][mt] = ldw(wp + (size_t)mt * nkg * 64); wb[j][mt] = ldw(wp + (size_t)mt * nkg * 64 + 32);
+        ss[j][mt] = ld32(sp32 + (size_t)mt * nkg * 8);
+      } else {
+        wa[j][mt] = ldw(wp + (size_t)(16 * mt) * rowu); wb[j][mt] = ldw(wp + (size_t)(16 * mt + 8) * rowu);
+        ss[j][mt] = ld16(sp + (size_t)(16 * mt) * nkg) | (ld16(sp + (size_t)(16 * mt + 8) * nkg) << 16);
+      }
     }
     if (++lk == per) {
       lk = 0; ++lm;
       setp(lm);
+    } else if (RP) {
+      wp += KS * 64;
+      sp32 += KS * 8;
     } else {
       wp += KS * 4;
       sp += KS;
@@ -116,7 +132,7 @@ __global__ void __launch_bounds__(NW * 32, MINB)
           }
 #pragma unroll
           for (int nt = 0; nt < NT; nt++) {
-            const uint4 xb = perm_b(ldx(xp + xoff[nt] + u));
+            const uint4 xb = RP ? ldx(xp + xoff[nt] + u) : perm_b(ldx(xp + xoff[nt] + u));
 #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
               mma16816(part[mt][nt], pa[mt][0], pb[mt][0], pa[mt][1], pb[mt][1], xb.x, xb.y);
@@ -198,7 +214,7 @@ int grid_for(Kn kern, int threads, int groups) {
   return d * 10 >= cap * 6 ? d : cap;
 }
 
-template <int MT, int NT, int NW, int KS, int U, int MINB>
+template <int MT, int NT, int NW, int KS, int U, int MINB, int RP>
 cudaError_t run_mm(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
   constexpr int TPC = NW / KS;
   if constexpr ((KS > 1 && (size_t)NW * 32 * 4 * NT * MT * 4 > 48 * 1024) || (MT == 2 && NT > 7)) {
@@ -213,42 +229,59 @@ cudaError_t run_mm(const void* w, const void* s, const void* x, int N, int K, in
   int grid = 0;
   if (slot < 8 * 16 && cache_n[slot] == N) grid = cache_g[slot];
   else {
-    grid = grid_for(k_w4mm<MT, NT, NW, KS, U, MINB>, NW * 32, groups);
+    grid = grid_for(k_w4mm<MT, NT, NW, KS, U, MINB, RP>, NW * 32, groups);
     if (slot < 8 * 16) { cache_n[slot] = N; cache_g[slot] = grid; }
   }
-  k_w4mm<MT, NT, NW, KS, U, MINB><<<grid, NW * 32, 0, st>>>((const uint4*)w, (const uint16_t*)s, (const uint4*)x, *epi, N, K, T);
+  k_w4mm<MT, NT, NW, KS, U, MINB, RP><<<grid, NW * 32, 0, st>>>((const uint4*)w, s, (const uint4*)x, *epi, N, K, T);
   return cudaGetLastError();
   }
 }
 
-template <int NT>
+template <int NT, int RP>
 cudaError_t dispatch(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
   switch (cfg) {
-    case 0: return run_mm<1, NT, 8, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 1: return run_mm<1, NT, 8, 2, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 2: return run_mm<1, NT, 8, 1, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 3: return run_mm<1, NT, 4, 1, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 4: return run_mm<1, NT, 4, 2, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 5: return run_mm<1, NT, 8, 4, 3, 1>(w, s, x, N, K, T, epi, st);
-    case 6: return run_mm<1, NT, 4, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 7: return run_mm<1, NT, 16, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 8: return run_mm<1, NT, 8, 4, 2, 2>(w, s, x, N, K, T, epi, st);
-    case 9: return run_mm<1, NT, 4, 1, 3, 2>(w, s, x, N, K, T, epi, st);
-    case 10: return run_mm<1, NT, 16, 2, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 11: return run_mm<1, NT, 16, 1, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 12: return run_mm<1, NT, 8, 2, 3, 1>(w, s, x, N, K, T, epi, st);
-    case 13: return run_mm<1, NT, 4, 2, 3, 1>(w, s, x, N, K, T, epi, st);
-    case 14: return run_mm<1, NT, 16, 4, 3, 1>(w, s, x, N, K, T, epi, st);
+    case 0: return run_mm<1, NT, 8, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 1: return run_mm<1, NT, 8, 2, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 2: return run_mm<1, NT, 8, 1, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 3: return run_mm<1, NT, 4, 1, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 4: return run_mm<1, NT, 4, 2, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 5: return run_mm<1, NT, 8, 4, 3, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 6: return run_mm<1, NT, 4, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 7: return run_mm<1, NT, 16, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 8: return run_mm<1, NT, 8, 4, 2, 2, RP>(w, s, x, N, K, T, epi, st);
+    case 9: return run_mm<1, NT, 4, 1, 3, 2, RP>(w, s, x, N, K, T, epi, st);
+    case 10: return run_mm<1, NT, 16, 2, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 11: return run_mm<1, NT, 16, 1, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 12: return run_mm<1, NT, 8, 2, 3, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 13: return run_mm<1, NT, 4, 2, 3, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 14: return run_mm<1, NT, 16, 4, 3, 1, RP>(w, s, x, N, K, T, epi, st);
     // MT = 2 weight tiles per warp (activation fragments shared): only for NT <= 4 (registers)
-    case 100: return run_mm<2, NT, 8, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 101: return run_mm<2, NT, 8, 2, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 102: return run_mm<2, NT, 4, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 103: return run_mm<2, NT, 4, 2, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 104: return run_mm<2, NT, 16, 4, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 105: return run_mm<2, NT, 8, 1, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 106: return run_mm<2, NT, 4, 1, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 107: return run_mm<2, NT, 8, 2, 3, 1>(w, s, x, N, K, T, epi, st);
+    case 100: return run_mm<2, NT, 8, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 101: return run_mm<2, NT, 8, 2, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 102: return run_mm<2, NT, 4, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 103: return run_mm<2, NT, 4, 2, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 104: return run_mm<2, NT, 16, 4, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 105: return run_mm<2, NT, 8, 1, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 106: return run_mm<2, NT, 4, 1, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 107: return run_mm<2, NT, 8, 2, 3, 1, RP>(w, s, x, N, K, T, epi, st);
     default: return cudaErrorInvalidValue;
+  }
+}
+template <int RP>
+cudaError_t w4_gemm_cfg(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
+  if (T < 1 || T > 64) return cudaErrorInvalidValue;
+  const int nt = (T + 7) >> 3;
+  static const int kBest[9] = {0, 6, 100, 100, 103, 103, 103, 103, 12};
+  if (cfg < 0) cfg = kBest[nt];
+  switch (nt) {
+    case 1: return dispatch<1, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 2: return dispatch<2, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 3: return dispatch<3, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 4: return dispatch<4, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 5: return dispatch<5, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 6: return dispatch<6, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    case 7: return dispatch<7, RP>(w, scale, x, N, K, T, epi, cfg, st);
+    default: return dispatch<8, RP>(w, scale, x, N, K, T, epi, cfg, st);
   }
 }
 }  // namespace
@@ -257,22 +290,13 @@ extern "C" {
 // out = W4(w, scale)[N][K] x X[T][K]^T, T in 1..64, epilogue `epi` (engine.h).  cfg < 0: the config measured fastest for this number of n8 tiles
 // (tests/test_w4mm.py --bench, sum of the qkvz+o+gu+down GEMMs at T = 8*NT; cfg >= 100: two weight tiles per warp share the activation fragments).
 cudaError_t smkp_w4_gemm_cfg(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
-  if (T < 1 || T > 64) return cudaErrorInvalidValue;
-  const int nt = (T + 7) >> 3;
-  static const int kBest[9] = {0, 6, 100, 100, 103, 103, 103, 103, 12};
-  if (cfg < 0) cfg = kBest[nt];
-  switch (nt) {
-    case 1: return dispatch<1>(w, scale, x, N, K, T, epi, cfg, st);
-    case 2: return dispatch<2>(w, scale, x, N, K, T, epi, cfg, st);
-    case 3: return dispatch<3>(w, scale, x, N, K, T, epi, cfg, st);
-    case 4: return dispatch<4>(w, scale, x, N, K, T, epi, cfg, st);
-    case 5: return dispatch<5>(w, scale, x, N, K, T, epi, cfg, st);
-    case 6: return dispatch<6>(w, scale, x, N, K, T, epi, cfg, st);
-    case 7: return dispatch<7>(w, scale, x, N, K, T, epi, cfg, st);
-    default: return dispatch<8>(w, scale, x, N, K, T, epi, cfg, st);
-  }
+  return w4_gemm_cfg<0>(w, scale, x, N, K, T, epi, cfg, st);
 }
 cudaError_t smkp_w4_gemm(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
-  return smkp_w4_gemm_cfg(w, scale, x, N, K, T, epi, -1, st);
+  return w4_gemm_cfg<0>(w, scale, x, N, K, T, epi, -1, st);
+}
+// same on the repacked layout (smk_w4r_gemv, include/engine.h)
+cudaError_t smkp_w4r_gemm(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
+  return w4_gemm_cfg<1>(w, scale, x, N, K, T, epi, -1, st);
 }
 }

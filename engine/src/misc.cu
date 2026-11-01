@@ -13,6 +13,8 @@ __global__ void k_rmsnorm(uint4* __restrict__ h, const uint4* __restrict__ y, co
   const size_t base = (size_t)blockIdx.x * nch;
   float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   float ss = 0.f;
+  uint4 wv = make_uint4(0, 0, 0, 0);
+  if (c < nch) wv = w[c];  // independent of h / y: issued first so its latency hides behind the reduction
   if (c < nch) {
     const uint4 hv = h[base + c];
     v[0] = bflo(hv.x); v[1] = bfhi(hv.x); v[2] = bflo(hv.y); v[3] = bfhi(hv.y); v[4] = bflo(hv.z); v[5] = bfhi(hv.z); v[6] = bflo(hv.w); v[7] = bfhi(hv.w);
@@ -33,7 +35,6 @@ __global__ void k_rmsnorm(uint4* __restrict__ h, const uint4* __restrict__ y, co
   for (int i = 0; i < (int)((blockDim.x + 31) >> 5); i++) tot += wsum[i];
   const float r = 1.0f / sqrtf(tot / (float)H + eps);
   if (c < nch) {
-    const uint4 wv = w[c];
     const float w0 = bflo(wv.x), w1 = bfhi(wv.x), w2 = bflo(wv.y), w3 = bfhi(wv.y), w4 = bflo(wv.z), w5 = bfhi(wv.z), w6 = bflo(wv.w), w7 = bfhi(wv.w);
     xn[base + c] = make_uint4(pack_bf16x2(v[0] * r * (1.f + w0), v[1] * r * (1.f + w1)), pack_bf16x2(v[2] * r * (1.f + w2), v[3] * r * (1.f + w3)),
                               pack_bf16x2(v[4] * r * (1.f + w4), v[5] * r * (1.f + w5)), pack_bf16x2(v[6] * r * (1.f + w6), v[7] * r * (1.f + w7)));

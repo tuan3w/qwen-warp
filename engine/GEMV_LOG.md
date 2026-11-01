@@ -57,3 +57,11 @@ The whole gain is `down` (-0.85 ms) plus the K-order-independent bookkeeping; in
 * Loads-only floor (same access pattern, no dequant/mma) is ~4% under the current kernel for gate|up, 7% for o_proj; a pure streaming read is another ~8% below that (873 vs ~800 GB/s of weight bytes).
 * Remaining structural costs per kernel: ~1 us launch gap + first-DRAM-latency ramp + tail (o_proj, 16 MB, is at 695 GB/s: ~2.5 us fixed cost); L2 prefetch of the next layer does not hide it (#1).
 * Repack (#10) is the only measured remaining lever (0.2-0.45 ms).
+
+## Round 2 (gemv2 lineage, on the repacked layout)
+| # | change | result | verdict |
+|---|---|---|---|
+| 11 | dq_word as one lop3 per nibble pair (constants in registers) + branch-free (step / wrap) 32-bit stream offsets in k_w4 + activation pointer base + ct*KS*16 (SASS ~234 -> ~160 lines per group, bit-identical outputs) | full `try`: 173.15 -> 176.71 / 177.24 tok/s (+2.1% / +2.4%), check PASS | **kept** |
+| 12 | on top of 11: U+1 rotating weight register sets (no copies), 32-bit running activation offset | 173.69 (-2% vs 11, regs 96 -> 77) | rejected |
+| 13 | config re-sweep on the repacked layout inside the real graph (nsys, per shape): w8k4u2 vs w8k2u3 vs w8k1u3 | w8k4u2 best for gate\|up 110.7 / 112.1 / 115.5 us, down 55.9 / 56.9 / 84.2, o 22.4 / 23.7 / 31.8, qkv\|z 54.2 / 55.9 / 59.1 | table unchanged |
+| 14 | programmatic dependent launch (griddepcontrol) to overlap GEMV ramp/tail | ptxas: requires sm_90 | impossible on sm_86 |

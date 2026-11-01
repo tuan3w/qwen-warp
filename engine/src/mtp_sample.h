@@ -58,7 +58,7 @@ bool smk_sampling_valid(const smk_sampling* c);
 cudaError_t sk_draw_n(const Dist* pd, const SampP* sp, int n, uint32_t ctr0, int* out, cudaStream_t st);
 
 // ---- shared bookkeeping of one cycle after the emitted tokens y[0..m] (= ds[DS_OUT..]) are known; m = accepted drafts (a = m+1 tokens).
-__device__ __forceinline__ void spec_finish(int* ds, int* ss, int* ring, int m) {
+__device__ __forceinline__ void spec_finish(int* ds, int* ss, int* ring, int m, int T) {
   const int P = ds[DS_POS];
   int a = m + 1;
   const int fn = ss[SS_FORCE_N], ci = ss[SS_NCYC];
@@ -82,6 +82,7 @@ __device__ __forceinline__ void spec_finish(int* ds, int* ss, int* ring, int m) 
   ss[SS_DPOS + 1] = P + a;
   ss[SS_DPOS + 2] = P + a + 1;
   ds[DS_POS] = P + a;
+  dn_pend_after(ds, a, T);
   ds[DS_CUR] = (ds[DS_CUR] + a) % ds[DS_SLOTS];
 }
 }  // namespace smk

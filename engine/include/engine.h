@@ -39,6 +39,11 @@ cudaError_t smk_w4_gemv(const void* w, const void* scale, const void* x, int N, 
 // Same with an explicit kernel configuration (tuning/bench): 0 w8k4u2, 1 w8k8u2, 2 w8k2u3, 3 w4k4u3, 4 w16k8u2, 5 w8k1u3 (warps/CTA, K-split warps, prefetch depth).
 // Returns cudaErrorInvalidValue if (N, K) is not divisible for that config (K/128 % KS, N/16 % (warps/KS)).
 cudaError_t smk_w4_gemv_cfg(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st);
+// Same kernels on the REPACKED layout the engine / MTP / head / prefill paths use (pack.py repack_w4): per (16-row tile, 128-k group) one contiguous 1 KB unit
+// [lane 0..31: row g, 16 B chunk t][lane 32..63: row g+8], units of a tile contiguous; inside a word nibble j / j+4 = columns 2j / 2j+1;
+// scale = uint32 per (tile, group, g) = bf16(row g) | bf16(row g+8) << 16.  Same byte counts as the natural layout.
+cudaError_t smk_w4r_gemv(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st);
+cudaError_t smk_w4r_gemv_cfg(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st);
 
 
 // BF16 weights [N][K] (K % 256 == 0), fp32 logits out [T][N]: CUDA-core kernel for T == 1, mma for T in 2..8.
@@ -90,7 +95,7 @@ typedef struct smk_model_w {
   const void* final_norm;  // bf16 [5120] zero-centred
   const void* lm_head;     // bf16 [248320][5120]
   // K9 (include/head_q.h): quantised copy of lm_head used for the approximate logits (the BF16 head above stays resident for the exact rescoring of the top candidates).
-  int head_q_kind;         // SMK_HEADQ_NONE (0: BF16 head only), SMK_HEADQ_I8 (1: int8 [N][K] + fp32 scale [N]), SMK_HEADQ_I4 (2: W4 uint32 [N][K/8] + bf16 scale [N][K/128])
+  int head_q_kind;         // SMK_HEADQ_NONE (0: BF16 head only), SMK_HEADQ_I8 (1: int8 [N][K] + fp32 scale [N]), SMK_HEADQ_I4 (2: W4 uint32 [N][K/8] + bf16 scale [N][K/128]), SMK_HEADQ_I4R (3: the same in the repacked layout)
   const void *head_q, *head_qs;
 } smk_model_w;
 

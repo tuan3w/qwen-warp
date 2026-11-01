@@ -2,7 +2,7 @@
  "source": "~/llm-lab/gpu-lease.log (acquire/release pairs, holder names reduced to a kind)",
  "window": [
   "2026-10-30T21:00:00+07:00",
-  "2026-11-01T22:15:00+07:00"
+  "2026-11-01T23:50:00+07:00"
  ],
  "spans": [
   {
@@ -856,6 +856,12 @@
    "end": 1793545175,
    "kind": "experiment",
    "tag": "E11"
+  },
+  {
+   "start": 1793546104,
+   "end": 1793551701,
+   "kind": "build",
+   "tag": "K12"
   }
  ]
 }

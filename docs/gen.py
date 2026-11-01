@@ -179,6 +179,9 @@ def derive(D, C, L, H):
     X["x_k11_vs_vllm"] = [round(a / b, 2) for a, b in zip(s["k11"]["vals"], s["vllm"]["vals"])]
     X["x_plain"] = hd["vllm_plain_ms"]["v"] / hd["plain_k9_ms"]["v"]
     X["x_plain_camp"] = X["x_plain"] * cp["plain_guard"]
+    sv_ = D["server"]
+    X["x_srv_greedy"] = sv_["greedy"]["ratio"]
+    X["x_srv_t1"] = sv_["t1"]["ratio"]
     X["x_camp_vs_vllm"] = [round(a * cp["gate_verdict"] / b, 2) for a, b in zip(s["k11"]["vals"], s["vllm"]["vals"])]
     return X
 

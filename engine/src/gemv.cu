@@ -44,9 +44,12 @@ __device__ __forceinline__ void epilogue(const float (&acc)[4], int row, int g, 
 // Persistent: CTA b owns tiles b, b+grid, ...; the (tile, group) stream is flat per warp so weight prefetch crosses tile boundaries.
 // Addressing is pointer-increment (no per-group row arithmetic) and the activation fragments are loaded just in time from L1 (K5, GEMV_LOG.md #7).
 // Lanes g >= T read activation row T-1 instead of being predicated off: column n of the mma result depends only on B column n and those columns are never stored.
-template <int NW, int KS, int U, int MINB>
+// RP = 0: checkpoint-natural weight layout (engine.h).  RP = 1: repacked layout (smk_w4r_gemv, pack.py repack_w4): per (16-row tile, 128-k group) one 1 KB unit
+// [lane 0..31: row g, chunk t][32 + lane: row g+8, chunk t], units contiguous per tile; nibble j / j+4 of a word = columns 2j / 2j+1 (the activations need no permutation);
+// scales as one u32 (bf16 row g | bf16 row g+8 << 16) per (tile, group, g).  Same bytes, same numerics up to the order of k inside an mma.
+template <int NW, int KS, int U, int MINB, int RP>
 __global__ void __launch_bounds__(NW * 32, MINB)
-    k_w4(const uint4* __restrict__ W, const uint16_t* __restrict__ S, const uint4* __restrict__ X, const smk_epi epi, int N, int K, int T) {
+    k_w4(const uint4* __restrict__ W, const void* __restrict__ S, const uint4* __restrict__ X, const smk_epi epi, int N, int K, int T) {
   constexpr int TPC = NW / KS;
   __shared__ float red[KS > 1 ? NW : 1][32][4];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -56,36 +59,47 @@ __global__ void __launch_bounds__(NW * 32, MINB)
   const int cnt = (groups - (int)blockIdx.x + (int)gridDim.x - 1) / (int)gridDim.x;
   const int total = cnt * per;
   const uint4* xbase = X + (size_t)(g < T ? g : T - 1) * (K >> 3) + ks * 16 + t * 4;
-  auto tile_of = [&](int m) { return ((int)blockIdx.x + m * (int)gridDim.x) * TPC + tin; };
+  const unsigned gridsz = gridDim.x * TPC;  // tiles between two consecutive tiles of this CTA's flat stream
 
-  const uint4* wp;
-  const uint16_t* sp;
+  // Flat (tile, group) stream as 32-bit element offsets: `step` inside a tile, `wrap` from the last group of a tile to the first group of the CTA's next tile (branch-free).
+  unsigned woff, soff;
+  unsigned wstep, wwrap, sstep, swrap;
+  const unsigned tile0 = (unsigned)tin + blockIdx.x * TPC;
+  if (RP) {
+    woff = (tile0 * nkg + ks) * 64u + lane;
+    soff = (tile0 * nkg + ks) * 8u + g;
+    wstep = KS * 64u; sstep = KS * 8u;
+    wwrap = (gridsz * nkg - (per - 1) * KS) * 64u; swrap = (gridsz * nkg - (per - 1) * KS) * 8u;
+  } else {
+    woff = (tile0 * 16u + g) * rowu + ks * 4 + t;
+    soff = (tile0 * 16u + g) * nkg + ks;
+    wstep = KS * 4u; sstep = KS;
+    wwrap = gridsz * 16u * rowu - (per - 1) * KS * 4u; swrap = gridsz * 16u * nkg - (per - 1) * KS;
+  }
+  const uint4* __restrict__ Wp = W;
+  const uint32_t* S32 = (const uint32_t*)S;
+  const uint16_t* S16 = (const uint16_t*)S;
   uint4 wa[U], wb[U];
   uint32_t ss[U];
-  int lm = 0, lk = 0;
-  auto setp = [&](int m) {
-    const size_t row = (size_t)tile_of(m) * 16 + g;
-    wp = W + row * rowu + ks * 4 + t;
-    sp = S + row * nkg + ks;
-  };
-  setp(0);
+  int lk = 0;
   auto issue = [&](int j) {
-    wa[j] = ldw(wp); wb[j] = ldw(wp + (size_t)8 * rowu);
-    ss[j] = ld16(sp) | (ld16(sp + (size_t)8 * nkg) << 16);
-    if (++lk == per) {
-      lk = 0; ++lm;
-      setp(lm);
+    if (RP) {
+      wa[j] = ldw(Wp + woff); wb[j] = ldw(Wp + woff + 32);
+      ss[j] = ld32(S32 + soff);
     } else {
-      wp += KS * 4;
-      sp += KS;
+      wa[j] = ldw(Wp + woff); wb[j] = ldw(Wp + woff + (size_t)8 * rowu);
+      ss[j] = ld16(S16 + soff) | (ld16(S16 + soff + (size_t)8 * nkg) << 16);
     }
+    const bool wr = (++lk == per);
+    lk = wr ? 0 : lk;
+    woff += wr ? wwrap : wstep;
+    soff += wr ? swrap : sstep;
   };
 #pragma unroll
   for (int j = 0; j < U; j++)
     if (j < total) issue(j);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   int ct = 0, cm = 0;
-  const uint4* xp = xbase;
   for (int f = 0; f < total; f += U) {
 #pragma unroll
     for (int j = 0; j < U; j++) {
@@ -95,8 +109,7 @@ __global__ void __launch_bounds__(NW * 32, MINB)
         if (f + j + U < total) issue(j);
         uint4 xb[4];
 #pragma unroll
-        for (int u = 0; u < 4; u++) xb[u] = perm_b(ldx(xp + u));
-        xp += KS * 16;
+        for (int u = 0; u < 4; u++) xb[u] = RP ? ldx(xbase + ct * (KS * 16) + u) : perm_b(ldx(xbase + ct * (KS * 16) + u));
         float part[4] = {0.f, 0.f, 0.f, 0.f};
         const uint32_t wra[4] = {ca.x, ca.y, ca.z, ca.w}, wrb[4] = {cb.x, cb.y, cb.z, cb.w};
 #pragma unroll
@@ -112,8 +125,7 @@ __global__ void __launch_bounds__(NW * 32, MINB)
         acc[2] = fmaf(fsb, part[2], acc[2]); acc[3] = fmaf(fsb, part[3], acc[3]);
         if (++ct == per) {  // tile finished
           ct = 0;
-          xp = xbase;
-          const int row = tile_of(cm) << 4;
+          const int row = (int)(tile0 + (unsigned)cm * gridsz) << 4;
           ++cm;
           if (KS > 1) {
             if (ks > 0) {
@@ -272,7 +284,7 @@ __global__ void __launch_bounds__(NW * 32, MINB) k_bf16_cc(const uint4* __restri
 
 // ---------------------------------------------------------------------------------------------- small BF16 GEMV (in_proj_a|b)
 // one 128-thread block per weight row (K split across the 4 warps, smem reduce); T <= 8 token rows; bf16 output (HF rounds the Linear output).
-__global__ void __launch_bounds__(128) k_bf16_small(const uint4* __restrict__ W, const uint4* __restrict__ X, int N, int na, int K, int T,
+__global__ void __launch_bounds__(128, 8) k_bf16_small(const uint4* __restrict__ W, const uint4* __restrict__ X, int N, int na, int K, int T,
                                                     uint16_t* __restrict__ out_a, uint16_t* __restrict__ out_b) {
   __shared__ float red[4][8];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -341,14 +353,14 @@ static int grid_for(Kn kern, int threads, int groups) {
   return d * 10 >= cap * 6 ? d : cap;
 }
 
-template <int NW, int KS, int U, int MINB>
+template <int NW, int KS, int U, int MINB, int RP>
 static cudaError_t run_w4(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
   constexpr int TPC = NW / KS;
   if (((K >> 7) % KS) || ((N >> 4) % TPC) || (K & 127) || (N & 15) || T < 1 || T > 8) return cudaErrorInvalidValue;
   static int grid_cache_n = -1, grid_cache_g = 0;  // single-config cache keyed by N (K/T do not change the group count)
   const int groups = (N >> 4) / TPC;
-  if (grid_cache_n != N) { grid_cache_g = grid_for(k_w4<NW, KS, U, MINB>, NW * 32, groups); grid_cache_n = N; }
-  k_w4<NW, KS, U, MINB><<<grid_cache_g, NW * 32, 0, st>>>((const uint4*)w, (const uint16_t*)s, (const uint4*)x, *epi, N, K, T);
+  if (grid_cache_n != N) { grid_cache_g = grid_for(k_w4<NW, KS, U, MINB, RP>, NW * 32, groups); grid_cache_n = N; }
+  k_w4<NW, KS, U, MINB, RP><<<grid_cache_g, NW * 32, 0, st>>>((const uint4*)w, s, (const uint4*)x, *epi, N, K, T);
   return cudaGetLastError();
 }
 template <int NW, int KS, int U, int MINB>
@@ -366,22 +378,21 @@ static cudaError_t run_bf16_mma(const void* w, const void* x, int N, int K, int 
 
 using namespace smk;
 
-extern "C" {
-
-// config table for tuning (bench) -- ids match experiments/..w4-multirow..: 0 w8k4u2, 1 w8k8u2, 2 w8k2u3, 3 w4k4u3, 4 w16k8u2, 5 w8k1u3
-cudaError_t smk_w4_gemv_cfg(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
+template <int RP>
+static cudaError_t w4_cfg(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
   switch (cfg) {
-    case 0: return run_w4<8, 4, 2, 2>(w, s, x, N, K, T, epi, st);
-    case 1: return run_w4<8, 8, 2, 2>(w, s, x, N, K, T, epi, st);
-    case 2: return run_w4<8, 2, 3, 2>(w, s, x, N, K, T, epi, st);
-    case 3: return run_w4<4, 4, 3, 4>(w, s, x, N, K, T, epi, st);
-    case 4: return run_w4<16, 8, 2, 1>(w, s, x, N, K, T, epi, st);
-    case 5: return run_w4<8, 1, 3, 2>(w, s, x, N, K, T, epi, st);
+    case 0: return run_w4<8, 4, 2, 2, RP>(w, s, x, N, K, T, epi, st);
+    case 1: return run_w4<8, 8, 2, 2, RP>(w, s, x, N, K, T, epi, st);
+    case 2: return run_w4<8, 2, 3, 2, RP>(w, s, x, N, K, T, epi, st);
+    case 3: return run_w4<4, 4, 3, 4, RP>(w, s, x, N, K, T, epi, st);
+    case 4: return run_w4<16, 8, 2, 1, RP>(w, s, x, N, K, T, epi, st);
+    case 5: return run_w4<8, 1, 3, 2, RP>(w, s, x, N, K, T, epi, st);
   }
   return cudaErrorInvalidValue;
 }
 
-cudaError_t smk_w4_gemv(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
+template <int RP>
+static cudaError_t w4_gemv(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
   // In-graph sweep of the full step (k_w4 v2, GEMV_LOG.md): w8k4u2 for every shape except the 14336-row attention q|k|v (w8k8u2); +-0.2% between configs.
   // Tuning override: SMK_CFG="<N>:<cfg>,..." (e.g. 34816:4,5120:0) applies to every call with that N (100000+K keys a K-specific override).
   int cfg = (N == 14336) ? 1 : 0;
@@ -398,11 +409,23 @@ cudaError_t smk_w4_gemv(const void* w, const void* s, const void* x, int N, int 
       ++p;
     }
   }
-  cudaError_t e = smk_w4_gemv_cfg(w, s, x, N, K, T, epi, cfg, st);
-  if (e == cudaErrorInvalidValue) e = smk_w4_gemv_cfg(w, s, x, N, K, T, epi, cfg == 0 ? 1 : 0, st);
-  if (e == cudaErrorInvalidValue) e = smk_w4_gemv_cfg(w, s, x, N, K, T, epi, 5, st);  // always-valid fallback (KS=1)
+  cudaError_t e = w4_cfg<RP>(w, s, x, N, K, T, epi, cfg, st);
+  if (e == cudaErrorInvalidValue) e = w4_cfg<RP>(w, s, x, N, K, T, epi, cfg == 0 ? 1 : 0, st);
+  if (e == cudaErrorInvalidValue) e = w4_cfg<RP>(w, s, x, N, K, T, epi, 5, st);  // always-valid fallback (KS=1)
   return e;
 }
+
+extern "C" {
+
+// config table for tuning (bench) -- ids match experiments/..w4-multirow..: 0 w8k4u2, 1 w8k8u2, 2 w8k2u3, 3 w4k4u3, 4 w16k8u2, 5 w8k1u3
+cudaError_t smk_w4_gemv_cfg(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
+  return w4_cfg<0>(w, s, x, N, K, T, epi, cfg, st);
+}
+cudaError_t smk_w4_gemv(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) { return w4_gemv<0>(w, s, x, N, K, T, epi, st); }
+cudaError_t smk_w4r_gemv_cfg(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
+  return w4_cfg<1>(w, s, x, N, K, T, epi, cfg, st);
+}
+cudaError_t smk_w4r_gemv(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) { return w4_gemv<1>(w, s, x, N, K, T, epi, st); }
 
 cudaError_t smk_bf16_gemv_f32(const void* w, const void* x, int N, int K, int T, float* out, cudaStream_t st) {
   if (K & 255) return cudaErrorInvalidValue;

@@ -1,0 +1,73 @@
+PASS qkvz     T= 1 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T= 5 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T= 8 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T= 9 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=16 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=24 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=31 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=32 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=33 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=48 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=57 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS qkvz     T=64 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T= 1 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T= 5 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T= 8 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T= 9 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=16 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=24 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=31 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=32 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=33 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=48 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=57 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS attn_qkv T=64 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T= 1 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS o        T= 5 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS o        T= 8 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS o        T= 9 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=16 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=24 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=31 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=32 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=33 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=48 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=57 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS o        T=64 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS gu       T= 1 cfg=0 silu: rel-L2 vs fp32 ref 6.10e-07, bit-identical to smk_w4_gemv: True
+PASS gu       T= 5 cfg=0 silu: rel-L2 vs fp32 ref 3.52e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T= 8 cfg=0 silu: rel-L2 vs fp32 ref 1.74e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T= 9 cfg=0 silu: rel-L2 vs fp32 ref 3.95e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=16 cfg=0 silu: rel-L2 vs fp32 ref 1.68e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=24 cfg=0 silu: rel-L2 vs fp32 ref 1.31e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=31 cfg=0 silu: rel-L2 vs fp32 ref 4.08e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=32 cfg=0 silu: rel-L2 vs fp32 ref 3.43e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=33 cfg=0 silu: rel-L2 vs fp32 ref 1.20e-04, bit-identical to smk_w4_gemv: True
+PASS gu       T=48 cfg=0 silu: rel-L2 vs fp32 ref 1.08e-04, bit-identical to smk_w4_gemv: True
+PASS gu       T=57 cfg=0 silu: rel-L2 vs fp32 ref 8.61e-05, bit-identical to smk_w4_gemv: True
+PASS gu       T=64 cfg=0 silu: rel-L2 vs fp32 ref 7.73e-05, bit-identical to smk_w4_gemv: True
+PASS down     T= 1 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS down     T= 5 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T= 8 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS down     T= 9 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=16 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=24 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=31 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=32 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=33 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=48 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=57 cfg=0 segs: rel-L2 vs fp32 ref 1.67e-03, bit-identical to smk_w4_gemv: True
+PASS down     T=64 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T= 1 cfg=0 segs: rel-L2 vs fp32 ref 1.62e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T= 5 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T= 8 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T= 9 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=16 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=24 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=31 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=32 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=33 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=48 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=57 cfg=0 segs: rel-L2 vs fp32 ref 1.65e-03, bit-identical to smk_w4_gemv: True
+PASS fc       T=64 cfg=0 segs: rel-L2 vs fp32 ref 1.66e-03, bit-identical to smk_w4_gemv: True
+RESULT: PASS

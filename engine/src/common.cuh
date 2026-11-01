@@ -34,6 +34,7 @@ __device__ __forceinline__ uint4 ldw(const uint4* p) {
 }
 __device__ __forceinline__ uint4 ldx(const uint4* p) { return __ldg(p); }  // activations: L1/L2 resident
 __device__ __forceinline__ uint32_t ld16(const uint16_t* p) { return (uint32_t)__ldg(p); }
+__device__ __forceinline__ uint32_t ld32(const uint32_t* p) { return __ldg(p); }
 
 __device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -51,11 +52,16 @@ __device__ __forceinline__ uint4 perm_b(uint4 v) {
   return r;
 }
 
-// one 32-bit word of 8 nibbles -> 4 bf16x2 registers (n_j, n_{j+4}) - 8, exact
+// one 32-bit word of 8 nibbles -> 4 bf16x2 registers (n_j, n_{j+4}) - 8, exact.  (w >> 4j) & 0x000F000F | 0x43004300 is one lop3 with the constants in registers.
+__device__ __forceinline__ uint32_t lop_and_or(uint32_t a, uint32_t m, uint32_t c) {
+  uint32_t r;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;\n" : "=r"(r) : "r"(a), "r"(m), "r"(c));  // (a & m) | c
+  return r;
+}
 __device__ __forceinline__ void dq_word(uint32_t w, uint32_t (&p)[4]) {
 #pragma unroll
   for (int j = 0; j < 4; j++) {
-    uint32_t q = ((w >> (4 * j)) & 0x000F000Fu) | 0x43004300u;  // bf16x2 (128+n_j, 128+n_{j+4})
+    uint32_t q = lop_and_or(j ? (w >> (4 * j)) : w, 0x000F000Fu, 0x43004300u);  // bf16x2 (128+n_j, 128+n_{j+4})
     uint32_t r;
     asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(q), "r"(0x3F803F80u), "r"(0xC308C308u));  // q*1.0 - 136.0 -> exact (n-8)
     p[j] = r;

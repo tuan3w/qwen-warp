@@ -30,21 +30,36 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 
 // ------------------------------------------------------------------------------------------------ W4 -> bf16
 // out[r][k] = (nibble - 8) * scale[row0 + r][k / 128] for r in [0, nrows).  One thread = 4 words = 32 columns.
-__global__ void __launch_bounds__(256) k_dequant(const uint4* __restrict__ w, const uint16_t* __restrict__ s, uint4* __restrict__ out, int K, int row0, long long total) {
+// RP = 1: repacked layout of smk_w4r_gemv (engine.h): word chunk (tile, kg, half, g, t), nibble j / j+4 = columns 2j / 2j+1, u32 scale pair per (tile, kg, g).
+template <int RP>
+__global__ void __launch_bounds__(256) k_dequant(const uint4* __restrict__ w, const void* __restrict__ sv, uint4* __restrict__ out, int K, int row0, long long total) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int cpr = K >> 5;  // 32-column chunks per row
   const long long r = i / cpr;
   const int c = (int)(i - r * cpr);
-  const uint4 wv = w[(size_t)(row0 + r) * cpr + c];
-  const float sc = bf2f(s[(size_t)(row0 + r) * (K >> 7) + (c >> 2)]);
+  const size_t row = (size_t)(row0 + r);
+  uint4 wv;
+  float sc;
+  if (RP) {
+    const size_t unit = (row >> 4) * (size_t)(K >> 7) + (c >> 2);
+    const int half = (int)(row >> 3) & 1, g = (int)row & 7;
+    wv = w[unit * 64 + half * 32 + g * 4 + (c & 3)];
+    sc = bf2f((uint16_t)(((const uint32_t*)sv)[unit * 8 + g] >> (16 * half)));
+  } else {
+    wv = w[row * cpr + c];
+    sc = bf2f(((const uint16_t*)sv)[row * (K >> 7) + (c >> 2)]);
+  }
   const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
   uint4* dst = out + (size_t)r * (K >> 3) + (size_t)c * 4;
 #pragma unroll
   for (int j = 0; j < 4; j++) {
     float v[8];
 #pragma unroll
-    for (int e = 0; e < 8; e++) v[e] = (float)((int)((ww[j] >> (4 * e)) & 15u) - 8) * sc;
+    for (int e = 0; e < 8; e++) {
+      const int sh = RP ? 4 * ((e >> 1) + 4 * (e & 1)) : 4 * e;
+      v[e] = (float)((int)((ww[j] >> sh) & 15u) - 8) * sc;
+    }
     dst[j] = make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]), pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
   }
 }
@@ -287,6 +302,7 @@ inline unsigned cdiv(long long a, long long b) { return (unsigned)((a + b - 1) /
 __global__ void k_head_finish(int* ds, int pos) {
   ds[DS_POS] = pos;
   ds[DS_CUR] = (ds[DS_CUR] + 1) % ds[DS_SLOTS];
+  ds[DS_PEND] = 0;  // the T=1 row wrote a full snapshot
   ds[DS_TOK] = ds[DS_OUT];
 }
 }  // namespace
@@ -313,9 +329,15 @@ void* smkp_engine_ptr(smk_engine* e, int what) {
 // (a fused [qkv|z] GEMM output row), ab = [a 48 | b 48] row.  y = bf16 [6144].
 cudaError_t smkp_dn_row(smk_engine* e, int di, const void* qkvz_row, const void* ab_row, const void* conv_w, const void* A_log, const void* dt_bias, const void* norm_w, void* y,
                         cudaStream_t st) {
-  return swiftmk_deltanet_step(1, qkvz_row, (const char*)qkvz_row + CONVD * 2, ab_row, (const char*)ab_row + NV * 2, conv_w, A_log, dt_bias, norm_w,
-                               e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
-                               e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, e->ds + DS_CUR, e->slots, y, e->ws_dn, st);
+  return swiftmk_deltanet_step_lazy(1, qkvz_row, (const char*)qkvz_row + CONVD * 2, ab_row, (const char*)ab_row + NV * 2, conv_w, A_log, dt_bias, norm_w,
+                                    e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
+                                    e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, e->ds + DS_CUR, e->slots, y, e->ws_dn,
+                                    e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), e->ds + DS_PEND, st);
+}
+
+// Write the pending lazy DeltaNet state of every layer into ring slot cur (the python prefill reads / writes dn_state[:, cur] directly) and clear the pending count.
+cudaError_t smkp_materialize(smk_engine* e, cudaStream_t st) {
+  return swiftmk_deltanet_materialize(e->dn_state, e->dn_dbuf, 48, e->ds + DS_CUR, e->ds + DS_PEND, e->slots, st);
 }
 
 cudaError_t smkp_head_finish(smk_engine* e, int pos, cudaStream_t st) {
@@ -329,7 +351,15 @@ void* smk_spec_kv_ptr(smk_spec* s);
 cudaError_t smkp_dequant_w4(const void* w, const void* scale, void* out, int K, int row0, int nrows, cudaStream_t st) {
   if (K % 128 || nrows < 1) return cudaErrorInvalidValue;
   const long long total = (long long)nrows * (K >> 5);
-  k_dequant<<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, (const uint16_t*)scale, (uint4*)out, K, row0, total);
+  k_dequant<0><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total);
+  return cudaGetLastError();
+}
+
+// same on the repacked layout (smk_w4r_gemv, include/engine.h)
+cudaError_t smkp_dequant_w4r(const void* w, const void* scale, void* out, int K, int row0, int nrows, cudaStream_t st) {
+  if (K % 128 || nrows < 1) return cudaErrorInvalidValue;
+  const long long total = (long long)nrows * (K >> 5);
+  k_dequant<1><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total);
   return cudaGetLastError();
 }
 

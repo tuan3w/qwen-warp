@@ -1,0 +1,84 @@
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+W1101 22:18:42.843000 3629569 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 22:18:42.866000 3629569 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+engine 0.92 GiB, torch 17.71 GiB, kv_fp8=0
+### code (32 prompt tokens, kv_fp8=0)
+- first token slow 71093 fast 71093; prefill time slow 0.16s, fast 0.723s (first call includes triton autotune/compile)
+- fast: last-token hidden rel-L2 vs slow: max over 64 layers 0.0189, final-norm 0.0192; DeltaNet state max/mean 0.0217/0.0119, conv state max 0.0271; KV K max/mean 0.0124/0.0089, V max/mean 0.0150/0.0105 (attention layer idx of max V: 13, per-layer V: 0.008 0.008 0.008 0.009 0.010 0.010 0.009 0.010 0.011 0.012 0.012 0.014 0.014 0.015 0.012 0.008); MTP KV K/V 0.0122/0.0111; drafts fast [71093, 12305, 198, 727] slow [71093, 12305, 198, 727]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0201, slow 0.0192
+  fast: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (26) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- fast_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0189, final-norm 0.0192; DeltaNet state max/mean 0.0217/0.0119, conv state max 0.0271; KV K max/mean 0.0124/0.0089, V max/mean 0.0150/0.0105 (attention layer idx of max V: 13, per-layer V: 0.008 0.008 0.008 0.009 0.010 0.010 0.009 0.010 0.011 0.012 0.012 0.014 0.014 0.015 0.012 0.008); MTP KV K/V 0.0122/0.0111; drafts fast [71093, 12305, 198, 727] slow [71093, 12305, 198, 727]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0201, slow 0.0192
+  fast_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (26) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_nofold: last-token hidden rel-L2 vs slow: max over 64 layers 0.0218, final-norm 0.0210; DeltaNet state max/mean 0.0218/0.0113, conv state max 0.0261; KV K max/mean 0.0123/0.0083, V max/mean 0.0143/0.0098 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.007 0.008 0.009 0.009 0.008 0.009 0.010 0.011 0.011 0.013 0.013 0.014 0.011 0.008); MTP KV K/V 0.0118/0.0109; drafts fast [71093, 12305, 198, 727] slow [71093, 12305, 198, 727]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0194, slow 0.0192
+  w4_nofold: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (26) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4: last-token hidden rel-L2 vs slow: max over 64 layers 0.0192, final-norm 0.0197; DeltaNet state max/mean 0.0220/0.0113, conv state max 0.0261; KV K max/mean 0.0123/0.0083, V max/mean 0.0143/0.0098 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.008 0.008 0.009 0.009 0.008 0.009 0.010 0.011 0.011 0.013 0.013 0.014 0.011 0.008); MTP KV K/V 0.0118/0.0109; drafts fast [71093, 12305, 198, 727] slow [71093, 12305, 198, 727]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0182, slow 0.0192
+  w4: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (26) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0239, final-norm 0.0207; DeltaNet state max/mean 0.0226/0.0114, conv state max 0.0272; KV K max/mean 0.0138/0.0087, V max/mean 0.0153/0.0102 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.007 0.008 0.009 0.010 0.008 0.010 0.011 0.012 0.011 0.014 0.014 0.015 0.012 0.009); MTP KV K/V 0.0133/0.0124; drafts fast [71093, 12305, 198, 727] slow [71093, 12305, 198, 727]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0210, slow 0.0192
+  w4_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (26) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+### prose (34 prompt tokens, kv_fp8=0)
+- first token slow 760 fast 760; prefill time slow 0.17s, fast 0.165s (first call includes triton autotune/compile)
+- fast: last-token hidden rel-L2 vs slow: max over 64 layers 0.0137, final-norm 0.0137; DeltaNet state max/mean 0.0173/0.0107, conv state max 0.0197; KV K max/mean 0.0119/0.0088, V max/mean 0.0135/0.0105 (attention layer idx of max V: 13, per-layer V: 0.009 0.009 0.009 0.010 0.010 0.010 0.010 0.011 0.011 0.012 0.010 0.012 0.012 0.014 0.011 0.008); MTP KV K/V 0.0119/0.0112; drafts fast [760, 20513, 314, 279] slow [760, 20513, 314, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0139, slow 0.0130
+  fast: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (14) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- fast_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0137, final-norm 0.0137; DeltaNet state max/mean 0.0173/0.0107, conv state max 0.0197; KV K max/mean 0.0119/0.0088, V max/mean 0.0135/0.0105 (attention layer idx of max V: 13, per-layer V: 0.009 0.009 0.009 0.010 0.010 0.010 0.010 0.011 0.011 0.012 0.010 0.012 0.012 0.014 0.011 0.008); MTP KV K/V 0.0119/0.0112; drafts fast [760, 20513, 314, 279] slow [760, 20513, 314, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0139, slow 0.0130
+  fast_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (14) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_nofold: last-token hidden rel-L2 vs slow: max over 64 layers 0.0135, final-norm 0.0137; DeltaNet state max/mean 0.0165/0.0098, conv state max 0.0195; KV K max/mean 0.0117/0.0084, V max/mean 0.0136/0.0098 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.008 0.008 0.009 0.009 0.009 0.010 0.011 0.012 0.011 0.012 0.013 0.014 0.011 0.007); MTP KV K/V 0.0114/0.0107; drafts fast [760, 20513, 314, 279] slow [760, 20513, 314, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0132, slow 0.0130
+  w4_nofold: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (14) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4: last-token hidden rel-L2 vs slow: max over 64 layers 0.0131, final-norm 0.0132; DeltaNet state max/mean 0.0164/0.0099, conv state max 0.0194; KV K max/mean 0.0117/0.0084, V max/mean 0.0136/0.0098 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.008 0.008 0.009 0.009 0.009 0.010 0.011 0.012 0.011 0.012 0.013 0.014 0.011 0.007); MTP KV K/V 0.0114/0.0107; drafts fast [760, 20513, 314, 279] slow [760, 20513, 314, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0132, slow 0.0130
+  w4: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (14) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0129, final-norm 0.0131; DeltaNet state max/mean 0.0161/0.0099, conv state max 0.0189; KV K max/mean 0.0117/0.0086, V max/mean 0.0139/0.0101 (attention layer idx of max V: 13, per-layer V: 0.006 0.008 0.008 0.009 0.009 0.010 0.010 0.011 0.011 0.012 0.010 0.012 0.012 0.014 0.011 0.008); MTP KV K/V 0.0114/0.0108; drafts fast [760, 20513, 314, 279] slow [760, 20513, 314, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0130, slow 0.0130
+  w4_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (14) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+### math (33 prompt tokens, kv_fp8=0)
+- first token slow 760 fast 760; prefill time slow 0.15s, fast 0.164s (first call includes triton autotune/compile)
+- fast: last-token hidden rel-L2 vs slow: max over 64 layers 0.0153, final-norm 0.0151; DeltaNet state max/mean 0.0187/0.0111, conv state max 0.0213; KV K max/mean 0.0259/0.0120, V max/mean 0.0430/0.0145 (attention layer idx of max V: 10, per-layer V: 0.008 0.007 0.008 0.009 0.009 0.010 0.009 0.010 0.011 0.011 0.043 0.037 0.024 0.016 0.012 0.008); MTP KV K/V 0.0122/0.0110; drafts fast [760, 4952, 421, 279] slow [760, 4952, 421, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0163, slow 0.0155
+  fast: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (30) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- fast_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0153, final-norm 0.0151; DeltaNet state max/mean 0.0187/0.0111, conv state max 0.0213; KV K max/mean 0.0259/0.0120, V max/mean 0.0430/0.0145 (attention layer idx of max V: 10, per-layer V: 0.008 0.007 0.008 0.009 0.009 0.010 0.009 0.010 0.011 0.011 0.043 0.037 0.024 0.016 0.012 0.008); MTP KV K/V 0.0122/0.0110; drafts fast [760, 4952, 421, 279] slow [760, 4952, 421, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0163, slow 0.0155
+  fast_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (30) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_nofold: last-token hidden rel-L2 vs slow: max over 64 layers 0.0151, final-norm 0.0147; DeltaNet state max/mean 0.0177/0.0104, conv state max 0.0201; KV K max/mean 0.0152/0.0094, V max/mean 0.0237/0.0113 (attention layer idx of max V: 10, per-layer V: 0.007 0.007 0.007 0.008 0.009 0.009 0.008 0.010 0.011 0.011 0.024 0.022 0.017 0.014 0.011 0.007); MTP KV K/V 0.0112/0.0105; drafts fast [760, 4952, 421, 279] slow [760, 4952, 421, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0154, slow 0.0155
+  w4_nofold: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (30) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4: last-token hidden rel-L2 vs slow: max over 64 layers 0.0177, final-norm 0.0149; DeltaNet state max/mean 0.0179/0.0104, conv state max 0.0202; KV K max/mean 0.0152/0.0094, V max/mean 0.0237/0.0113 (attention layer idx of max V: 10, per-layer V: 0.007 0.007 0.007 0.008 0.009 0.009 0.008 0.010 0.011 0.011 0.024 0.022 0.017 0.014 0.011 0.007); MTP KV K/V 0.0112/0.0105; drafts fast [760, 4952, 421, 279] slow [760, 4952, 421, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0152, slow 0.0155
+  w4: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (30) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+- w4_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0154, final-norm 0.0153; DeltaNet state max/mean 0.0169/0.0101, conv state max 0.0191; KV K max/mean 0.0149/0.0092, V max/mean 0.0235/0.0111 (attention layer idx of max V: 10, per-layer V: 0.007 0.007 0.007 0.008 0.009 0.009 0.008 0.010 0.011 0.011 0.024 0.021 0.016 0.013 0.010 0.007); MTP KV K/V 0.0108/0.0103; drafts fast [760, 4952, 421, 279] slow [760, 4952, 421, 279]
+  vs bf16 oracle dump (last prompt token, max over layers): fast 0.0159, slow 0.0155
+  w4_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (30) EQUAL
+  vs oracle gen_ids (9): fast EQUAL, slow EQUAL
+### long (24 prompt tokens, kv_fp8=0)
+- first token slow 2064 fast 2064; prefill time slow 0.12s, fast 0.165s (first call includes triton autotune/compile)
+- fast: last-token hidden rel-L2 vs slow: max over 64 layers 0.0206, final-norm 0.0184; DeltaNet state max/mean 0.0245/0.0133, conv state max 0.0259; KV K max/mean 0.0216/0.0124, V max/mean 0.0253/0.0140 (attention layer idx of max V: 13, per-layer V: 0.009 0.009 0.009 0.010 0.011 0.011 0.010 0.012 0.012 0.015 0.015 0.021 0.022 0.025 0.019 0.014); MTP KV K/V 0.0187/0.0198; drafts fast [2064, 7701, 1017, 513] slow [2064, 7701, 1017, 513]
+  fast: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (28) EQUAL
+- fast_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0206, final-norm 0.0184; DeltaNet state max/mean 0.0245/0.0133, conv state max 0.0259; KV K max/mean 0.0216/0.0124, V max/mean 0.0253/0.0140 (attention layer idx of max V: 13, per-layer V: 0.009 0.009 0.009 0.010 0.011 0.011 0.010 0.012 0.012 0.015 0.015 0.021 0.022 0.025 0.019 0.014); MTP KV K/V 0.0187/0.0198; drafts fast [2064, 7701, 1017, 513] slow [2064, 7701, 1017, 513]
+  fast_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (28) EQUAL
+- w4_nofold: last-token hidden rel-L2 vs slow: max over 64 layers 0.0226, final-norm 0.0195; DeltaNet state max/mean 0.0220/0.0120, conv state max 0.0256; KV K max/mean 0.0181/0.0107, V max/mean 0.0226/0.0122 (attention layer idx of max V: 13, per-layer V: 0.006 0.006 0.007 0.008 0.010 0.010 0.009 0.010 0.012 0.014 0.013 0.018 0.019 0.023 0.017 0.011); MTP KV K/V 0.0158/0.0165; drafts fast [2064, 7701, 1017, 513] slow [2064, 7701, 1017, 513]
+  w4_nofold: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (28) EQUAL
+- w4: last-token hidden rel-L2 vs slow: max over 64 layers 0.0214, final-norm 0.0186; DeltaNet state max/mean 0.0218/0.0119, conv state max 0.0255; KV K max/mean 0.0181/0.0107, V max/mean 0.0225/0.0121 (attention layer idx of max V: 13, per-layer V: 0.006 0.006 0.007 0.008 0.010 0.010 0.008 0.010 0.012 0.014 0.013 0.018 0.019 0.023 0.017 0.011); MTP KV K/V 0.0158/0.0165; drafts fast [2064, 7701, 1017, 513] slow [2064, 7701, 1017, 513]
+  w4: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (28) EQUAL
+- w4_seg: last-token hidden rel-L2 vs slow: max over 64 layers 0.0214, final-norm 0.0186; DeltaNet state max/mean 0.0218/0.0119, conv state max 0.0255; KV K max/mean 0.0181/0.0107, V max/mean 0.0225/0.0121 (attention layer idx of max V: 13, per-layer V: 0.006 0.006 0.007 0.008 0.010 0.010 0.008 0.010 0.012 0.014 0.013 0.018 0.019 0.023 0.017 0.011); MTP KV K/V 0.0158/0.0165; drafts fast [2064, 7701, 1017, 513] slow [2064, 7701, 1017, 513]
+  w4_seg: first token EQUAL, plain greedy 33 ids EQUAL, spec k=3 ids (28) EQUAL
+RESULT: PASS

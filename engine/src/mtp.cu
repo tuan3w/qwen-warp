@@ -132,7 +132,7 @@ __global__ void k_pld_report(const int* ds, int* ss, PldRes* res) {
 __global__ void k_accept(int* ds, int* ss, int* ring, int k) {
   int m = 0;
   while (m < k && ds[DS_TOK + m + 1] == ds[DS_OUT + m]) m++;
-  spec_finish(ds, ss, ring, m);
+  spec_finish(ds, ss, ring, m, k + 1);
 }
 
 // first catch-up after the prefill's last row: pair (hidden of position pos-1, first generated token)
@@ -161,23 +161,23 @@ static cudaError_t mtp_layer(smk_spec* s, int T, const void* hid_src, const int*
   CKS(cudaGetLastError());
   smk_epi ef = {};
   ef.kind = SMK_EPI_SEGS; ef.end[0] = ef.end[1] = ef.end[2] = H; ef.out[0] = e->h;
-  CKS(smk_w4_gemv(W.fc_w, W.fc_s, s->cat, H, 2 * H, T, &ef, st));
+  CKS(smk_w4r_gemv(W.fc_w, W.fc_s, s->cat, H, 2 * H, T, &ef, st));
   CKS(smk_rmsnorm(e->h, nullptr, L.ln1, e->xn, nullptr, T, H, 1e-6f, st));
   smk_epi eq = {};
   eq.kind = SMK_EPI_SEGS; eq.end[0] = 12288; eq.end[1] = 13312; eq.end[2] = 14336; eq.out[0] = e->qb; eq.out[1] = e->kb; eq.out[2] = e->vb;
-  CKS(smk_w4_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &eq, st));
+  CKS(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &eq, st));
   CKS(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, s->kvbuf, e->ctx_max, 0, 1.f, 1.f, pos, e->y6, e->ws_attn, st));
   if (kv_only) return cudaSuccess;
   smk_epi eo = {};
   eo.kind = SMK_EPI_SEGS; eo.end[0] = eo.end[1] = eo.end[2] = H; eo.out[0] = e->mix;
-  CKS(smk_w4_gemv(L.o_w, L.o_s, e->y6, H, 6144, T, &eo, st));
+  CKS(smk_w4r_gemv(L.o_w, L.o_s, e->y6, H, 6144, T, &eo, st));
   CKS(smk_rmsnorm(e->h, e->mix, L.ln2, e->xn, nullptr, T, H, 1e-6f, st));
   smk_epi eg = {};
   eg.kind = SMK_EPI_SILU; eg.out[0] = e->act;
-  CKS(smk_w4_gemv(L.gu_w, L.gu_s, e->xn, 2 * I, H, T, &eg, st));
+  CKS(smk_w4r_gemv(L.gu_w, L.gu_s, e->xn, 2 * I, H, T, &eg, st));
   smk_epi ed = {};
   ed.kind = SMK_EPI_SEGS; ed.end[0] = ed.end[1] = ed.end[2] = H; ed.out[0] = e->dn;
-  CKS(smk_w4_gemv(L.dn_w, L.dn_s, e->act, H, I, T, &ed, st));
+  CKS(smk_w4r_gemv(L.dn_w, L.dn_s, e->act, H, I, T, &ed, st));
   k_mtp_final<<<T, NH, 0, st>>>((const uint4*)e->h, (const uint4*)e->dn, (const uint4*)W.norm, sel, (uint4*)out);
   return cudaGetLastError();
 }
@@ -191,7 +191,7 @@ static cudaError_t mtp_head(smk_spec* s, int j, bool samp, cudaStream_t st) {
     if (s->head_mode == 1) return cudaErrorNotSupported;  // diagnostic full-vocab head: greedy only
     smk_epi ep = {};
     ep.kind = SMK_EPI_F32; ep.out[0] = s->lg;
-    CKS(smk_w4_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
+    CKS(smk_w4r_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
     CKS(sk_topk(s->lg, 1, s->w.head_nv, s->w.head_nv, s->w.head_ids, s->sp, 1, s->ws_d, s->qd + (j - 1), st));
     return sk_draft_pick(s->qd + (j - 1), s->sp, s->ss, j, dst, st);
   }
@@ -201,7 +201,7 @@ static cudaError_t mtp_head(smk_spec* s, int j, bool samp, cudaStream_t st) {
   }
   smk_epi ep = {};
   ep.kind = SMK_EPI_F32; ep.out[0] = s->lg;
-  CKS(smk_w4_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
+  CKS(smk_w4r_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
   CKS(smk_argmax(s->lg, 1, s->w.head_nv, s->ss + SS_IDX, nullptr, e->ws_am, st));
   k_map_draft<<<1, 1, 0, st>>>(s->ss + SS_IDX, s->w.head_ids, dst);
   return cudaGetLastError();
@@ -573,6 +573,7 @@ static cudaError_t snap_copy(smk_spec* s, int dir, cudaStream_t st) {
     if (e->failed) return cudaErrorMemoryAllocation;
   }
   if (dir == 0) {
+    CKS(swiftmk_deltanet_materialize(e->dn_state, e->dn_dbuf, nd, e->ds + DS_CUR, e->ds + DS_PEND, e->slots, st));
     CKS(cudaMemcpyAsync(s->snap_ds, e->ds, DS_N * sizeof(int), cudaMemcpyDeviceToDevice, st));
     CKS(cudaMemcpyAsync(s->snap_tap, e->dbg + tap, (size_t)H * 2, cudaMemcpyDeviceToDevice, st));
   }

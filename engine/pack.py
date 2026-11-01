@@ -23,8 +23,34 @@ NL = 64
 LAYER_TYPES = ["attention" if i % 4 == 3 else "linear" for i in range(NL)]
 
 
+def repack_w4(w, s, rows=2048):
+    """In place: checkpoint-natural W4 (w int32 [N, K/8], s bf16 [N, K/128]) -> the repacked layout of smk_w4r_gemv (include/engine.h): per (16-row tile, 128-k group) one
+    contiguous 1 KB unit [row g chunk t (32 x 16 B)][row g+8 chunk t], units of a tile contiguous; nibble j / j+4 of a word = columns 2j / 2j+1; scales one u32
+    (bf16 row g | bf16 row g+8 << 16) per (tile, group, g).  Same tensors, same sizes.  Returns (w, s)."""
+    N, K8 = w.shape
+    nkg = K8 // 16
+    assert N % 16 == 0 and K8 % 16 == 0 and rows % 16 == 0
+    sh = (4 * torch.arange(8, device=w.device, dtype=torch.int64)).view(1, 1, 8)
+    order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=w.device)
+    for r0 in range(0, N, rows):
+        n = min(rows, N - r0)
+        nt = n // 16
+        wc = w[r0 : r0 + n].view(nt, 2, 8, nkg, 4, 4)  # [tile, half, g, kg, t, u]
+        nib = ((wc.to(torch.int64).unsqueeze(-1) >> sh) & 0xF)[..., order]  # [..., 8] new nibble order
+        word = (nib << sh).sum(-1)  # < 2**32
+        word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
+        w[r0 : r0 + n].copy_(word.permute(0, 3, 1, 2, 4, 5).reshape(n, K8))  # [tile, kg, half, g, t, u]
+        sc = s[r0 : r0 + n].view(nt, 2, 8, nkg).permute(0, 3, 2, 1).contiguous()  # [tile, kg, g, half]
+        s[r0 : r0 + n].copy_(sc.view(n, nkg))
+    return w, s
+
+
 class W4:
-    """Packed int4 weight on the device: w int32 [N, K/8], s bf16 [N, K/128]."""
+    """Packed int4 weight on the device: w int32 [N, K/8], s bf16 [N, K/128]; repack() converts to the engine layout (engine.py / spec.py do it after loading)."""
+
+    def repack(self):
+        repack_w4(self.w, self.s)
+        return self
 
     def __init__(self, N, K, dev):
         self.N, self.K = N, K

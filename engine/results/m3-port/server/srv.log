@@ -1,0 +1,49 @@
+=== r1 ours 23:34:43
+[ours r1] healthy after 19.6 s
+  greedy code      184.2 tok/s [183.1, 184.26, 184.2]
+  greedy prose     116.8 tok/s [117.64, 116.85, 116.81]
+  greedy math      183.9 tok/s [182.75, 183.95, 183.9]
+  greedy long8k    144.7 tok/s [144.01, 145.3]
+  T1     code      172.6 tok/s [168.62, 172.57, 176.19]
+  T1     prose     116.8 tok/s [117.7, 116.81, 115.45]
+  T1     math      175.6 tok/s [180.74, 172.36, 175.57]
+  T1     long8k    138.3 tok/s [132.77, 143.77]
+  TTFT 20 tok 37 ms [39, 37, 37, 37, 37]   8K 3916 ms [3916, 3923, 3913]
+[ours r1] done; GPU after stop 420 MiB
+=== r1 vllm 23:36:33
+[vllm r1] healthy after 102.2 s
+  greedy code       96.7 tok/s [96.7, 96.74, 96.75]
+  greedy prose      62.9 tok/s [62.96, 62.87, 62.87]
+  greedy math       94.0 tok/s [94.01, 93.95, 94.1]
+  greedy long8k     77.6 tok/s [77.63, 77.47]
+  T1     code       88.5 tok/s [88.5, 91.47, 86.47]
+  T1     prose      59.6 tok/s [58.89, 59.59, 59.6]
+  T1     math       88.0 tok/s [85.06, 88.03, 91.91]
+  T1     long8k     75.6 tok/s [77.83, 73.31]
+  TTFT 20 tok 84 ms [92, 83, 85, 84, 83]   8K 4284 ms [4288, 4284, 4283]
+[vllm r1] done; GPU after stop 420 MiB
+=== r2 ours 23:40:55
+[ours r2] healthy after 19.7 s
+  greedy code      184.0 tok/s [183.07, 184.06, 184.04]
+  greedy prose     116.8 tok/s [117.6, 116.79, 116.77]
+  greedy math      183.9 tok/s [182.81, 183.92, 183.93]
+  greedy long8k    144.7 tok/s [143.99, 145.35]
+  T1     code      175.3 tok/s [175.29, 185.87, 172.76]
+  T1     prose     115.5 tok/s [109.81, 115.54, 122.49]
+  T1     math      185.6 tok/s [199.05, 175.97, 185.61]
+  T1     long8k    153.3 tok/s [156.19, 150.41]
+  TTFT 20 tok 37 ms [38, 37, 36, 36, 37]   8K 3904 ms [3904, 3909, 3899]
+[ours r2] done; GPU after stop 420 MiB
+=== r2 vllm 23:42:44
+[vllm r2] healthy after 34.2 s
+  greedy code       96.6 tok/s [96.63, 96.62, 97.0]
+  greedy prose      63.1 tok/s [62.98, 63.07, 63.08]
+  greedy math       94.3 tok/s [94.29, 94.27, 94.29]
+  greedy long8k     77.9 tok/s [77.85, 77.87]
+  T1     code       88.9 tok/s [88.86, 92.06, 86.68]
+  T1     prose      59.8 tok/s [59.09, 59.77, 59.78]
+  T1     math       88.2 tok/s [85.24, 88.22, 92.17]
+  T1     long8k     75.7 tok/s [77.97, 73.47]
+  TTFT 20 tok 84 ms [84, 83, 84, 84, 84]   8K 4288 ms [4290, 4288, 4287]
+[vllm r2] done; GPU after stop 420 MiB
+=== done 23:45:57

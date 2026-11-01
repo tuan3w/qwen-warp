@@ -66,7 +66,7 @@ def build(D, C, X):
         "cards": cards, "dots": dots, "lanes": LANES, "win0": X["win0"], "win1": X["win1"],
         "gpu": [[a, b] for a, b in X["gpu_union"]], "human": [[t, c] for t, c in hp], "commits": [datetime.fromisoformat(c["iso"]).timestamp() for c in X["commits"]],
         "predictions": D["predictions"], "snips": snips, "rules": D["rules"], "campaign": D["campaign"],
-        "tree_note": "campaign numbers: campaign harness; engine port + server-level verification pending" if not X["camp_verified"] else "server-verified",
+        "tree_note": "campaign numbers: campaign harness; engine port + server-level verification pending" if not X["camp_verified"] else "the campaign winner (m3) was ported and measured at the server: BENCH.md K12 (x1.9-2.0 vs stock vLLM, same client)",
     }
     blob = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     return TEMPLATE.replace("__DATA__", blob)
@@ -179,7 +179,7 @@ function body(c){let h='';const sec=(t,x,scroll)=>x?'<h4>'+t+'</h4><div class="t
   h+=sec('Agent hypothesis (measured by the agent before the gate)',c.hypothesis)+sec('What it changed',c.change)+
    '<div class="facts"><span>vs pristine <b>x'+fmtP(c.speedup)+'</b></span><span>step over '+esc(c.parent)+(c.parents2.length?' + '+esc(c.parents2.join(', ')):'')+' <b>x'+fmtP(c.step)+'</b></span>'+(c.merge?'<span>predicted before the gate <b>x'+fmtP(c.pred)+'</b></span>':'<span>agent predicted <b>+'+((c.pred-1)*100).toFixed(1)+'%</b></span>')+
    '<span>held-out <b>x'+(c.held?fmtP(c.held):'n/a')+'</b></span><span>plain guard <b>x'+fmtP(c.plain)+'</b></span><span>correctness check <b>'+(c.check?'passed':'failed')+'</b></span>'+(c.merge?'':'<span>agent session <b>'+c.session_min.toFixed(0)+' min</b>, '+c.tries+' quick tries</span>')+'<span>gate <b>'+c.gate_min.toFixed(1)+' GPU-min</b></span><span>diff <b>'+esc(c.files)+'</b></span></div>'+
-   (c.notes?'<h4>Agent lab notebook (excerpt)</h4><div class="txt scroll mono" style="font-size:12px">'+esc(c.notes)+'</div>':'')+'<p class="note" style="margin-top:10px">Numbers: campaign harness (paired pristine controls); engine port and server-level verification pending.</p>';
+   (c.notes?'<h4>Agent lab notebook (excerpt)</h4><div class="txt scroll mono" style="font-size:12px">'+esc(c.notes)+'</div>':'')+'<p class="note" style="margin-top:10px">Numbers on this card: campaign harness (paired pristine controls). The m3 port itself was measured separately in BENCH.md K12.</p>';
  }return h}
 let cardEls=[];
 function buildCards(){const host=$('#cards');let lastDay='';D.cards.forEach(c=>{const day=c.when.slice(0,10);if(day!==lastDay){lastDay=day;host.append(el('div','day',day))}

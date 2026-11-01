@@ -1,0 +1,9 @@
+qkvz: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 5.9e-06 max 1.3e-04
+attn_qkv: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 2.4e-05 max 2.1e-04
+o: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 4.5e-06 max 1.2e-04
+gu: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 1.3e-05 max 2.0e-04
+down: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 9.3e-06 max 2.0e-04
+fc: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 1.7e-05 max 2.0e-04
+head: done, natural-vs-repacked differing-element fraction over 52 comparisons: mean 6.1e-06 max 1.1e-04
+637/637 checks passed
+ALL PASS

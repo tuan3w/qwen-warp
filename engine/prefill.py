@@ -43,7 +43,7 @@ def _view(ptr, nbytes, dtype):
 def setup_prefill_api(lib):
     vp, ci, cf = C.c_void_p, C.c_int, C.c_float
     sig = {
-        "smkp_dequant_w4": [vp, vp, vp, ci, ci, ci, vp],
+        "smkp_dequant_w4r": [vp, vp, vp, ci, ci, ci, vp],
         "smkp_conv": [vp, ci, vp, vp, vp, vp, vp, vp, ci, vp],
         "smkp_gates": [vp, vp, vp, vp, vp, ci, vp],
         "smkp_gnorm": [vp, vp, ci, vp, vp, ci, vp],
@@ -52,9 +52,10 @@ def setup_prefill_api(lib):
         "smkp_attn_gate": [vp, vp, ci, vp, ci, vp],
         "smkp_silu_mul": [vp, vp, ci, vp],
         "smkp_mtp_cat": [vp, vp, vp, vp, vp, vp, ci, vp],
-        "smkp_w4_gemm_cfg": [vp, vp, vp, ci, ci, ci, C.POINTER(smk.Epi), ci, vp],
+        "smkp_w4r_gemm": [vp, vp, vp, ci, ci, ci, C.POINTER(smk.Epi), vp],
         "smkp_dn_row": [vp, ci, vp, vp, vp, vp, vp, vp, vp, vp],
         "smkp_head_finish": [vp, ci, vp],
+        "smkp_materialize": [vp, vp],
         "smk_engine_head_tail": [vp, ci, vp],
     }
     for n, a in sig.items():
@@ -79,7 +80,7 @@ class FastPrefill:
         self.taps = False  # test hook: write the last row's per-layer residual into the engine debug taps (a folded head has no step that does)
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
-        self.ds = _view(lib.smkp_engine_ptr(e, 0), 18 * 4, torch.int32)
+        self.ds = _view(lib.smkp_engine_ptr(e, 0), 20 * 4, torch.int32)  # engine_impl.h DS_N = 20 (DS_PEND = 19: pending lazy DeltaNet rows)
         nsl = eng.tmax + 1  # DeltaNet ring slots (K11: tmax + 1)
         self.dn_state = _view(lib.smkp_engine_ptr(e, 1), 48 * nsl * 48 * 128 * 128 * 4, torch.float32).view(48, nsl, 48, 128, 128)
         self.dn_conv = _view(lib.smkp_engine_ptr(e, 2), 48 * nsl * 10240 * 3 * 2, torch.bfloat16).view(48, nsl, 10240 * 3)
@@ -151,7 +152,7 @@ class FastPrefill:
         N, K = w4.w.shape[0], w4.w.shape[1] * 8
         nrows = N - row0 if nrows is None else nrows
         with self._t("dequant"):
-            smk.check(self.lib.smkp_dequant_w4(w4.w.data_ptr(), w4.s.data_ptr(), wbuf.data_ptr(), K, row0, nrows, self.e.st), "dequant")
+            smk.check(self.lib.smkp_dequant_w4r(w4.w.data_ptr(), w4.s.data_ptr(), wbuf.data_ptr(), K, row0, nrows, self.e.st), "dequant")
         return wbuf[: nrows * K].view(nrows, K)
 
     def _mm(self, x, w, out):
@@ -190,7 +191,7 @@ class FastPrefill:
             r = 0
             for n in self._w4_plan(T):
                 ep = smk.epi_simple(smk.SMK_EPI_SILU, out[r : r + n]) if silu else smk.epi_segs(N, [out[r : r + n]])
-                smk.check(self.lib.smkp_w4_gemm_cfg(wp, sp, x[r : r + n].data_ptr(), N, K, n, C.byref(ep), -1, self.e.st), "w4gemm")
+                smk.check(self.lib.smkp_w4r_gemm(wp, sp, x[r : r + n].data_ptr(), N, K, n, C.byref(ep), self.e.st), "w4gemm")
                 r += n
 
     def _w4mm(self, x, w4, wbuf, out):
@@ -345,6 +346,7 @@ class FastPrefill:
         assert pos0 + len(ids) <= self.ctx_max, "ctx_max too small"
         if spec:
             assert pos0 == 0 and self.mtp_kv, "MTP prefill needs a fresh SpecEngine"
+        smk.check(self.lib.smkp_materialize(e.h, e.st), "materialize")  # lazy DeltaNet snapshots: slot cur must hold the state before dn_state is read / written
         torch.cuda.synchronize()
         cur = int(self.ds[1])
         self._ev = []

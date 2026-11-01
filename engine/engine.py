@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 HERE = Path(__file__).resolve().parent
+HEADQ_I4R = 3  # include/head_q.h SMK_HEADQ_I4R: int4 head in the repacked layout
 DEFAULT_HEAD = "int4"  # K9: lm_head path: "int8" | "int4" (quantised head + exact BF16 rescoring) | "bf16" (the plain BF16 head); env SMK_HEAD overrides
 sys.path.insert(0, str(HERE / "tests"))
 sys.path.insert(0, str(HERE))
@@ -31,6 +32,14 @@ class Engine:
         t0 = time.time()
         G, Ls = pack.load_all(verbose=verbose, head=head)
         self.G, self.Ls = G, Ls  # keep the tensors alive: the C engine only holds pointers
+        for L in Ls:  # the engine kernels read the repacked W4 layout (smk_w4r_gemv, pack.repack_w4); converted in place, the tensors are not used in the natural layout afterwards
+            for w4 in (L.qkvz, L.o, L.gu, L.down):
+                w4.repack()
+        if G.hq is not None and G.hq.kind == pack.HEAD_KINDS["int4"]:
+            pack.repack_w4(G.hq.w, G.hq.s)
+            self.hq_kind = HEADQ_I4R
+        elif G.hq is not None:
+            self.hq_kind = G.hq.kind
         self.load_s = time.time() - t0
         m = smk.ModelW()
         p = smk.ptr
@@ -48,7 +57,7 @@ class Engine:
             d.dn_w, d.dn_s = p(L.down.w), p(L.down.s)
         m.embed, m.final_norm, m.lm_head = p(G.embed), p(G.final_norm), p(G.lm_head)
         if G.hq is not None:  # K9: quantised head + exact BF16 rescoring (the BF16 head above stays resident for the rescoring)
-            m.head_q_kind, m.head_q, m.head_qs = G.hq.kind, p(G.hq.w), p(G.hq.s)
+            m.head_q_kind, m.head_q, m.head_qs = self.hq_kind, p(G.hq.w), p(G.hq.s)
         self.m = m
         self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet ring has tmax + 1 slots (8: +0.62 GiB, needed for the prompt-lookup tail)
         self.h = self.lib.smk_engine_create_ex(C.byref(m), ctx_max, kv_fp8, self.tmax)

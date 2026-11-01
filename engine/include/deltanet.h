@@ -28,6 +28,7 @@ extern "C" {
 #define SWIFTMK_DN_MAX_SLOTS 9  // ring slots at tmax = 8; the engine allocates tmax + 1 (smk_engine_create_ex)
 #define SWIFTMK_DN_STATE_SLOT_FLOATS (48 * 128 * 128)
 #define SWIFTMK_DN_CONV_SLOT_ELEMS (10240 * 3)
+#define SWIFTMK_DN_LAZY_ROWS 16  // rows of the per-layer delta buffer of the lazy engine entry
 
 size_t swiftmk_deltanet_ws_bytes(void);
 
@@ -35,6 +36,20 @@ size_t swiftmk_deltanet_ws_bytes(void);
 cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
                                   const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                   void* conv_state, const int* cur, int slots, void* y, void* ws, cudaStream_t stream);
+
+// ---- Engine entry with lazy ring snapshots (K12).  A step with T >= 2 does not write its T per-row state snapshots to the ring; it appends the rank-1 updates of its rows to a
+// per-layer delta buffer (swiftmk_deltanet_dbuf_floats() floats, SWIFTMK_DN_LAZY_ROWS rows).  Device scalar *pend = p | base << 8 | half << 12 (p = pending rows, base = ring slot of a full
+// state, p == 0: slot cur itself is the state): the state at slot cur is "slot base + the first p delta rows".  Whoever advances cur by `a` accepted rows after a T >= 2
+// step does *pend = dn_pend_after(...) (engine_impl.h); after a T == 1 step (full snapshot written to slot cur+1) *pend = 0.  A step replays the pending rows bitwise like the
+// recurrence did.  Anything that reads or writes the state ring from outside (snapshot, prefill) calls swiftmk_deltanet_materialize first: it writes the pending state of
+// all layers to slot cur and clears *pend.
+size_t swiftmk_deltanet_dbuf_floats(void);
+cudaError_t swiftmk_deltanet_step_lazy(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
+                                       const void* A_log, const void* dt_bias, const void* norm_w, float* state,
+                                       void* conv_state, const int* cur, int slots, void* y, void* ws, float* dbuf, const int* pend,
+                                       cudaStream_t stream);
+// state = [nlayers][slots][48][128][128] fp32, dbuf = [nlayers][swiftmk_deltanet_dbuf_floats()]
+cudaError_t swiftmk_deltanet_materialize(float* state, const float* dbuf, int nlayers, const int* cur, int* pend, int slots, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,24 @@
+compile: g++ -x c++ -std=c++17 -O2 -shared -fPIC -I <repo>/projects/swift-mk/engine/include <repo>/projects/swift-mk/engine/src/pld.cu -o /tmp/smk_pld_test.so
+(1) done 2s: walk cycles 5094
+
+config                                                      positions  mismatches
+n=2 longest m=3 Lt=4: policy walk (pol_ext T,r,l)                5094 (see total)
+n=2 longest: every position (l, tail, gate)                     20000 (see total)
+n=2 longest: nd=0,1,2 drafts                                    12051 (see total)
+analyze.prep() cross-check (2 tasks)                             1534 (see total)
+n=1 longest (m=1)                                               20000           0
+n=1 recent (m=1)                                                20000           0
+n=2 recent (m=1)                                                20000           0
+n=3 longest (m=1)                                               20000           0
+n=3 recent (m=1)                                                20000           0
+n=4 longest (m=1)                                               20000           0
+n=4 recent (m=1)                                                20000           0
+n=2 longest cap/back/m/Lt grid                                   4905           0
+walk-through (1) mismatches                                                     0
+TOTAL mismatches                                                                0
+
+propose, real 8191-token context (700 steps, incl. ctypes call overhead 0.25 us): mean 2.85 us, p99 3.26 us, max 5.70 us
+propose, adversarial 8.2K-token context (64 candidates x 40 agreeing tokens): mean 3.48 us, max 8.98 us
+reset(8259 tokens): 0.45 ms; append(1 token): 1.32 us (incl. ctypes)
+total time 4s
+PASS

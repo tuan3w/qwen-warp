@@ -1,0 +1,130 @@
+{
+ "server": "vllm",
+ "round": 1,
+ "cmd": [
+  "~/llm-lab/venv/bin/python",
+  "-m",
+  "vllm.entrypoints.cli.main",
+  "serve",
+  "~/models/swift-1.5-int4",
+  "--served-model-name",
+  "swift",
+  "--dtype",
+  "bfloat16",
+  "--language-model-only",
+  "--max-model-len",
+  "16384",
+  "--gpu-memory-utilization",
+  "0.93",
+  "--max-num-seqs",
+  "4",
+  "--no-enable-prefix-caching",
+  "--speculative-config",
+  "{\"method\":\"mtp\",\"num_speculative_tokens\":3}",
+  "--port",
+  "8000"
+ ],
+ "started": "2026-11-01T23:36:36",
+ "boot_s": 102.20433235168457,
+ "greedy": {
+  "code": {
+   "decode": [
+    96.7,
+    96.74,
+    96.75
+   ],
+   "median": 96.74096473455427,
+   "chunks": 109,
+   "prompt": 32
+  },
+  "prose": {
+   "decode": [
+    62.96,
+    62.87,
+    62.87
+   ],
+   "median": 62.87417673085059,
+   "chunks": 168,
+   "prompt": 34
+  },
+  "math": {
+   "decode": [
+    94.01,
+    93.95,
+    94.1
+   ],
+   "median": 94.00895795725064,
+   "chunks": 112,
+   "prompt": 33
+  },
+  "long8k": {
+   "decode": [
+    77.63,
+    77.47
+   ],
+   "median": 77.55175653483683,
+   "chunks": 133.0,
+   "prompt": 8030
+  }
+ },
+ "T1": {
+  "code": {
+   "decode": [
+    88.5,
+    91.47,
+    86.47
+   ],
+   "median": 88.49747828873062,
+   "chunks": 118,
+   "prompt": 32
+  },
+  "prose": {
+   "decode": [
+    58.89,
+    59.59,
+    59.6
+   ],
+   "median": 59.593954514598366,
+   "chunks": 176,
+   "prompt": 34
+  },
+  "math": {
+   "decode": [
+    85.06,
+    88.03,
+    91.91
+   ],
+   "median": 88.0328907237539,
+   "chunks": 119,
+   "prompt": 33
+  },
+  "long8k": {
+   "decode": [
+    77.83,
+    73.31
+   ],
+   "median": 75.5672695713983,
+   "chunks": 136.0,
+   "prompt": 8030
+  }
+ },
+ "ttft": {
+  "t20_s": [
+   0.09226930502336472,
+   0.08298200101125985,
+   0.08482395502505824,
+   0.08443375997012481,
+   0.08323862095130607
+  ],
+  "t20_ms": 84.43375997012481,
+  "t8k_s": [
+   4.287850330001675,
+   4.283669247000944,
+   4.282958924013656
+  ],
+  "t8k_ms": 4283.669247000944,
+  "prompt8k": 8033
+ },
+ "vram_used_mib": 21772,
+ "vram_after_stop_mib": 420
+}

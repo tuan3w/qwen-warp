@@ -1,0 +1,44 @@
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+W1101 23:11:50.452000 3737216 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 23:11:50.470000 3737216 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+suite e6, 32 tasks, modes ['base', 'pld'], reps 1, T=0.0, tail gate m=3 Lt=4, build build
+                a1 n= 768 | base  201.9 tok/s E 3.98 | pld  370.3 tok/s E 7.67
+                a2 n= 768 | base  201.9 tok/s E 3.96 | pld  368.9 tok/s E 7.66
+                a3 n= 768 | base  198.3 tok/s E 3.92 | pld  368.8 tok/s E 7.69
+                a4 n= 336 | base  159.6 tok/s E 3.14 | pld  172.4 tok/s E 3.43
+                a5 n= 768 | base  161.7 tok/s E 3.17 | pld  190.7 tok/s E 3.83
+                a6 n= 360 | base  184.3 tok/s E 3.65 | pld  230.0 tok/s E 4.70
+                a7 n= 768 | base  189.6 tok/s E 3.71 | pld  241.6 tok/s E 4.89
+                a8 n= 768 | base  194.5 tok/s E 3.85 | pld  258.9 tok/s E 5.33
+                b1 n= 638 | base  202.1 tok/s E 3.98 | pld  334.9 tok/s E 6.87
+                b2 n= 768 | base  194.9 tok/s E 3.83 | pld  277.8 tok/s E 5.64
+                b3 n= 768 | base  197.8 tok/s E 3.89 | pld  320.6 tok/s E 6.60
+                b4 n= 204 | base  155.1 tok/s E 3.04 | pld  163.8 tok/s E 3.24
+                b5 n= 437 | base  190.4 tok/s E 3.70 | pld  212.7 tok/s E 4.26
+                b6 n= 729 | base  176.1 tok/s E 3.45 | pld  226.9 tok/s E 4.56
+                c1 n= 109 | base  200.0 tok/s E 3.89 | pld  227.5 tok/s E 4.67
+                c2 n= 570 | base  204.2 tok/s E 3.97 | pld  307.5 tok/s E 6.22
+                c3 n= 768 | base  200.5 tok/s E 3.91 | pld  309.4 tok/s E 6.34
+                c4 n=  37 | base  168.2 tok/s E 3.27 | pld  224.3 tok/s E 5.00
+                c5 n=  53 | base  193.1 tok/s E 3.93 | pld  324.0 tok/s E 7.00
+                c6 n= 595 | base  206.4 tok/s E 4.00 | pld  337.8 tok/s E 6.83
+                d1 n= 664 | base  114.7 tok/s E 2.27 | pld  114.3 tok/s E 2.27
+                d2 n= 768 | base  117.9 tok/s E 2.28 | pld  117.5 tok/s E 2.28
+                d3 n= 708 | base  118.9 tok/s E 2.28 | pld  118.9 tok/s E 2.28
+                d4 n= 768 | base  119.1 tok/s E 2.28 | pld  119.4 tok/s E 2.29
+                d5 n= 768 | base  132.0 tok/s E 2.53 | pld  133.3 tok/s E 2.57
+                d6 n= 768 | base  137.5 tok/s E 2.63 | pld  133.8 tok/s E 2.57
+                e1 n= 768 | base  179.0 tok/s E 3.43 | pld  192.3 tok/s E 3.73
+                e2 n= 768 | base  175.2 tok/s E 3.36 | pld  185.3 tok/s E 3.60
+                e3 n= 768 | base  180.7 tok/s E 3.46 | pld  191.7 tok/s E 3.73
+                e4 n= 768 | base  175.9 tok/s E 3.36 | pld  190.6 tok/s E 3.69
+                e5 n= 768 | base  187.4 tok/s E 3.60 | pld  202.3 tok/s E 3.94
+                e6 n= 768 | base  196.5 tok/s E 3.76 | pld  217.0 tok/s E 4.25
+
+per class (pooled tokens / pooled time; median over reps):
+class a: base 187.5 tok/s (E 3.69) | pld 266.2 tok/s (E 5.43) x1.420 | tail cycles 0.62, T hist {4: 369, 5: 0, 6: 0, 7: 0, 8: 613}, host wait 20246 us + work 5 us per cycle
+class b: base 189.2 tok/s (E 3.71) | pld 261.0 tok/s (E 5.28) x1.379 | tail cycles 0.63, T hist {4: 251, 5: 0, 6: 0, 7: 7, 8: 414}, host wait 20159 us + work 5 us per cycle
+class c: base 202.2 tok/s (E 3.94) | pld 308.9 tok/s (E 6.30) x1.527 | tail cycles 0.83, T hist {4: 58, 5: 0, 6: 0, 7: 0, 8: 283}, host wait 20176 us + work 5 us per cycle
+class d: base 123.1 tok/s (E 2.37) | pld 122.7 tok/s (E 2.37) x0.996 | tail cycles 0.07, T hist {4: 1734, 5: 0, 6: 0, 7: 0, 8: 134}, host wait 19264 us + work 3 us per cycle
+class e: base 182.2 tok/s (E 3.49) | pld 196.0 tok/s (E 3.81) x1.076 | tail cycles 0.31, T hist {4: 837, 5: 0, 6: 0, 7: 0, 8: 373}, host wait 19396 us + work 3 us per cycle

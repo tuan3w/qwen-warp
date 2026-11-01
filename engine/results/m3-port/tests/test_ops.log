@@ -1,0 +1,22 @@
+PASS rmsnorm  mismatch frac 0.00e+00, max |d| 0.00e+00
+PASS rmsnorm+residual  h_mid mismatch 0.00e+00, xnorm2 mismatch 0.00e+00
+PASS w4 qkv T=1  rel-L2 vs fp32 1.72e-03, vs bf16(ref) 8.71e-06
+PASS w4 z T=1  rel-L2 vs fp32 1.68e-03, vs bf16(ref) 5.64e-05
+PASS w4 qkv T=2  rel-L2 vs fp32 1.67e-03, vs bf16(ref) 6.31e-06
+PASS w4 z T=2  rel-L2 vs fp32 1.67e-03, vs bf16(ref) 0.00e+00
+PASS w4 qkv T=3  rel-L2 vs fp32 1.67e-03, vs bf16(ref) 5.39e-06
+PASS w4 z T=3  rel-L2 vs fp32 1.66e-03, vs bf16(ref) 1.34e-06
+PASS w4 qkv T=4  rel-L2 vs fp32 1.71e-03, vs bf16(ref) 4.51e-06
+PASS w4 z T=4  rel-L2 vs fp32 1.65e-03, vs bf16(ref) 1.03e-06
+PASS w4 qkv|z vs dump taps  rel-L2 qkv 1.42e-07 z 1.03e-06
+PASS w4 cfg 0  rel-L2 vs first valid cfg 0.0e+00 (fp32 K-split order differs)
+PASS w4 cfg 1  rel-L2 vs first valid cfg 4.5e-06 (fp32 K-split order differs)
+PASS w4 cfg 2  rel-L2 vs first valid cfg 4.5e-06 (fp32 K-split order differs)
+PASS w4 cfg 3  rel-L2 vs first valid cfg 0.0e+00 (fp32 K-split order differs)
+PASS w4 cfg 4  rel-L2 vs first valid cfg 4.5e-06 (fp32 K-split order differs)
+PASS w4 cfg 5  rel-L2 vs first valid cfg 4.5e-06 (fp32 K-split order differs)
+PASS gate|up silu*mul  rel-L2 vs torch bf16 chain 5.13e-06, vs dump mlp_act 5.13e-06
+PASS w4 down T=4  rel-L2 vs fp32 1.76e-03, vs bf16(ref) 5.31e-07
+PASS w4 out_proj T=4  rel-L2 vs fp32 1.28e-03, vs bf16(ref) 5.09e-10
+PASS bf16 small a|b  rel-L2 a 0.00e+00 b 0.00e+00
+21/21 passed

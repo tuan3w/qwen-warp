@@ -46,8 +46,8 @@ VLLM_SWIFT_MK=1 PYTHONPATH=server/plugin ~/llm-lab/venv/bin/python -m vllm.entry
 
 ### Startup, memory, `--max-model-len`
 
-* Startup to `/health` OK: **~17 s** with a warm page cache (engine 7.2 s = weights + MTP pack 3.5 s + warmup 3.7 s; the rest is vLLM's config / tokenizer / chat-template warmup).
-  There is no prepacked-weight cache: `engine/pack.py` copies the checkpoint's W4 tensors as they are (no repack) and the MTP int4 quantisation runs on the GPU in < 1 s, so the load is
+* Startup to `/health` OK: **~20 s** with a warm page cache (K8 text: 17 s with an engine load of 7.2 s = weights + MTP pack 3.5 s + warmup 3.7 s; the m3 port adds the in-place W4 repack of the loaded tensors; the rest is vLLM's config / tokenizer / chat-template warmup).
+  There is no prepacked-weight cache: `engine/pack.py` copies the checkpoint's W4 tensors as they are and `Engine` / `SpecEngine` convert them to the tile-contiguous layout in place on the GPU after loading (`pack.repack_w4`), and the MTP int4 quantisation runs on the GPU in < 1 s, so the load is
   page-cache -> device copy bound; a cold page cache adds the disk read of 19.5 GB.  The warmup runs a 4160-token prefill so the fla autotune / prefill scratch are paid at startup, not by the first request.
 * VRAM (23.56 GiB card, 0.91 GiB used by other processes; `maxctx.py`, prompt of ctx-512 tokens prefilled in 4096-token segments).  Since K9 the engine keeps an int4 copy of the lm_head (+0.59 GiB, next to the BF16 head it needs for the exact rescoring of the top candidates; `SMK_HEAD=int8` +1.18 GiB, `SMK_HEAD=bf16` = the pre-K9 head and limits):
 
@@ -110,6 +110,20 @@ The resumed run is numerically the same state as a cold prefill up to the accumu
   3-turn chat resumes (`cached_tokens` > 0) and equals the cold answer.  Needs the GPU lease: `~/llm-lab/venv/bin/python server/smoke_test.py`.
 * `runner_check.py` — engine-level checks (k = 0..3 equal greedy ids, exact cuts, prefix reuse in both thinking modes, sampling reproducibility).
 * `bench_server.py` — the HTTP benchmark used for the numbers below (same client for swift-mk and stock `vllm serve`); `bench_ttft.py` — short-prompt TTFT sweep (8..512 tokens); `maxctx.py` — the VRAM probe.
+* `ab_visit.py` — one visit of the server-vs-stock-vLLM A/B (boot time, E0 decode greedy + T=1, TTFT 20 tokens / 8K); driver loop `engine/results/m3-port/srv.sh`.
+
+### Numbers, m3 port (2026-11-01, `ab_visit.py`, order ours / stock / ours / stock, both servers stopped in between, lease held; median of 2 visits x 3 reps (8K: 2); ours = defaults (prompt-lookup auto, bf16 KV, k=3, max-model-len 28672), stock = `vllm serve` 0.30 `--max-model-len 16384 --max-num-seqs 4 --no-enable-prefix-caching` MTP k=3; raw: `engine/results/m3-port/server/`; `engine/BENCH.md` "K12 m3 port")
+
+| decode tok/s | code | prose | math | 8K ctx |
+|---|---|---|---|---|
+| **swift-mk server, greedy** | **184.1** | **116.8** | **183.9** | **144.7** |
+| stock vLLM, greedy | 96.7 | 63.0 | 94.2 | 77.7 |
+| ratio | **x1.90** | **x1.86** | **x1.95** | **x1.86** |
+| swift-mk server, T=1 top_p .95 top_k 20 | 174.0 | 116.2 | 178.4 | 147.1 |
+| stock vLLM, T=1 | 88.7 | 59.6 | 88.1 | 75.7 |
+| ratio | x1.96 | x1.95 | x2.02 | x1.94 |
+
+TTFT 20-token prompt **37 ms** (stock 84 ms), 8K prompt (8,030 tokens) **3.91 s** (stock 4.29 s); boot to `/health` 19.6 / 19.7 s (stock 102 s cold / 34 s warm cache).  The tables below are the older K8 measurements (BF16 head, no m3 kernels).
 
 ### Numbers (2026-10-31, RTX 3090, lease held, `bench_server.py`, same HTTP client for both servers; `--max-model-len` 16384 (stock vLLM 12288: 16384 does not fit next to the 0.9 GiB of other processes), greedy, ignore_eos, 385 tokens, median of 3 reps)
 
@@ -153,7 +167,7 @@ Stock = `vllm serve` 0.30 with E0's engine settings (`--speculative-config mtp k
 
   3.8x / 3.9x faster first token on turns 2 / 3; the remaining 240 ms = restore (13 ms) + prefill of the ~90 new tokens through the fast path (0.18 s fixed) + the head step.  Thinking on: resume point is the `<|im_start|>assistant\n` snapshot, `runner_check.py` (first-token logits warm vs cold rel-L2 0.004-0.027 = the prefill's bf16 noise floor, K6).
   Stock vLLM did not reuse anything in this setting (hybrid-model prefix caching reported `cached_tokens` 0 and TTFT grew with the context).
-* Startup 16.5 s to `/health` (engine 7.2 s), stock vLLM 55 s (warm compile / CUDA-graph cache).
+* Startup 16.5 s to `/health` (engine 7.2 s) at K8; **19.6 / 19.7 s with the m3 port** (`ab_visit.py`, 2 visits; the load-time W4 repack is the only new load work), stock vLLM 55 s at K8, **102 s (cold compile cache) / 34 s (warm)** in the 2026-11-01 visits.
 * Abort: the next request after a dropped 2000-token stream is served 0.22 s later.
 
 

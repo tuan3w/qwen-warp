@@ -87,6 +87,10 @@ class SpecEngine(Engine):
         t0 = time.time()
         self.M = pack_mtp.load_mtp(self.G, quant=quant, head_quant=head_quant, nv=nv, verbose=verbose)
         M, p = self.M, smk.ptr
+        for w4 in (M.fc, M.qkv, M.o, M.gu, M.down):  # engine layout (smk_w4r_gemv, pack.repack_w4), in place
+            pack.repack_w4(w4.w, w4.s)
+        M.head_r = pack_mtp.W4t(M.head.w.clone(), M.head.s.clone())  # the draft head is small: M.head stays natural (tests / references), the engine reads this copy
+        pack.repack_w4(M.head_r.w, M.head_r.s)
         w = MtpW()
         d = w.layer
         d.kind = 1
@@ -94,7 +98,7 @@ class SpecEngine(Engine):
         d.qkv_w, d.qkv_s, d.o_w, d.o_s = p(M.qkv.w), p(M.qkv.s), p(M.o.w), p(M.o.s)
         d.gu_w, d.gu_s, d.dn_w, d.dn_s = p(M.gu.w), p(M.gu.s), p(M.down.w), p(M.down.s)
         w.fc_w, w.fc_s, w.pre_e, w.pre_h, w.norm = p(M.fc.w), p(M.fc.s), p(M.pre_e), p(M.pre_h), p(M.norm)
-        w.head_w, w.head_s, w.head_ids, w.head_nv = p(M.head.w), p(M.head.s), p(M.ids_t), M.nv
+        w.head_w, w.head_s, w.head_ids, w.head_nv = p(M.head_r.w), p(M.head_r.s), p(M.ids_t), M.nv
         self.mw = w
         self.sp = self.lib.smk_spec_create(self.h, C.byref(w), head_mode)
         if not self.sp:

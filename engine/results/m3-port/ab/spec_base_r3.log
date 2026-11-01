@@ -1,0 +1,19 @@
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+  packed layer 7 (1.3s)
+  packed layer 15 (1.5s)
+  packed layer 23 (1.7s)
+  packed layer 31 (1.9s)
+  packed layer 39 (2.1s)
+  packed layer 47 (2.4s)
+  packed layer 55 (2.6s)
+  packed layer 63 (2.8s)
+weights loaded in 2.8s; cuda mem 17.17 GiB
+MTP packed (int4clip, head int4, nv=68864): layer+fc 209 MiB, draft head 173 MiB
+W1101 23:17:10.928000 3747826 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 23:17:10.947000 3747826 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+engine+MTP ready; sampling greedy; prompts code:32, prose:34, math:33, long8k:8030
+code   k=3:  168.3 tok/s (reps [168.4, 168.3, 168.3])  tokens/cycle 3.50 pos-acc 0.92/0.86/0.72
+prose  k=3:  107.6 tok/s (reps [107.7, 107.6, 107.5])  tokens/cycle 2.24 pos-acc 0.67/0.38/0.19
+math   k=3:  165.4 tok/s (reps [165.5, 165.4, 165.4])  tokens/cycle 3.45 pos-acc 0.96/0.79/0.71
+long8k k=3:  133.8 tok/s (reps [133.8])  tokens/cycle 2.90 pos-acc 0.83/0.60/0.46

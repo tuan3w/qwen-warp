@@ -1,0 +1,60 @@
+## unit: head = int8
+hidden states: 19979 positions from <repo>/experiments/2026-10-31-lm-head-quantisation-quality/runs/hidden.pt (53 docs, real engine final-norm outputs)
+quantised head bytes 1213 MiB (bf16 head 2425 MiB)
+- PASS  approx logits T=1 vs fp64 (dequantised head)  rel-L2 8.46e-08, max abs 1.79e-06
+- PASS  approx logits T=2 vs fp64 (dequantised head)  rel-L2 8.86e-08, max abs 1.79e-06
+- PASS  approx logits T=3 vs fp64 (dequantised head)  rel-L2 8.41e-08, max abs 2.42e-06
+- PASS  approx logits T=4 vs fp64 (dequantised head)  rel-L2 7.53e-08, max abs 2.55e-06
+- PASS  R=16: candidate ids == exact top-R of the approximate logits (value desc, index asc), 8 rows  0 rows differ
+- PASS  R=16: rescored candidate logits == fp64 dot of the bf16 rows  max rel err 1.22e-07
+- PASS  R=16: argmax == argmax of the exact candidate logits  
+- PASS  R=64: candidate ids == exact top-R of the approximate logits (value desc, index asc), 8 rows  0 rows differ
+- PASS  R=64: rescored candidate logits == fp64 dot of the bf16 rows  max rel err 1.51e-07
+- PASS  R=64: argmax == argmax of the exact candidate logits  
+- PASS  R=16 (greedy): pipeline vs bf16 head  19976 positions, T=4: argmax mismatches vs bf16 head 1 (of which fp32 near-ties < 1e-5: 1), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 9.54e-05 (25 s)  first mismatches (pos, quant, bf16, margin, in_cand) [(12527, 279, 264, 0.0, True)]
+- PASS  R=16 (greedy): pipeline vs bf16 head  1200 positions, T=1: argmax mismatches vs bf16 head 0 (of which fp32 near-ties < 1e-5: 0), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 3.81e-06 (5 s)
+- PASS  R=64 (sampling): pipeline vs bf16 head  19976 positions, T=4: argmax mismatches vs bf16 head 1 (of which fp32 near-ties < 1e-5: 1), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 9.54e-05 (33 s); true top-20 within candidates 19976/19976, true top-64 within 13563/19976; TV(T=1.0,k=20,p=0.95) vs bf16 head over 4994 positions: mean 0.00000 p99 0.00000 max 0.00000; TV(T=1.0,k=64,p=1.0) vs bf16 head over 4994 positions: mean 0.00013 p99 0.00308 max 0.01531; TV(T=0.7,k=20,p=0.95) vs bf16 head over 4994 positions: mean 0.00000 p99 0.00000 max 0.00001  first mismatches (pos, quant, bf16, margin, in_cand) [(12527, 279, 264, 0.0, True)]
+- PASS  R=64 (sampling): pipeline vs bf16 head  1200 positions, T=1: argmax mismatches vs bf16 head 0 (of which fp32 near-ties < 1e-5: 0), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 3.81e-06 (6 s); true top-20 within candidates 1200/1200, true top-64 within 813/1200; TV(T=1.0,k=20,p=0.95) vs bf16 head over 300 positions: mean 0.00000 p99 0.00000 max 0.00000; TV(T=1.0,k=64,p=1.0) vs bf16 head over 300 positions: mean 0.00012 p99 0.00336 max 0.00703; TV(T=0.7,k=20,p=0.95) vs bf16 head over 300 positions: mean 0.00000 p99 0.00000 max 0.00000
+  log-loss (R=64 pipeline logits vs bf16 head, teacher-forced, 15278 eval positions, mean over docs +- s.e. over docs, 71 s): full-vocab softmax dNLL -0.00001 +- 0.00003 nats (E5 int4 rescore16 +0.0018, int8 +0.0000); sampler's top-64 distribution dNLL +0.00000 +- 0.00000 (14429 positions with the true token in both top-64)
+- PASS  log-loss: sampler's top-64 dNLL < 0.002 nats and |full-vocab dNLL| < 0.003  
+## unit: head = int4
+hidden states: 19979 positions from <repo>/experiments/2026-10-31-lm-head-quantisation-quality/runs/hidden.pt (53 docs, real engine final-norm outputs)
+quantised head bytes 625 MiB (bf16 head 2425 MiB)
+- PASS  approx logits T=1 vs fp64 (dequantised head)  rel-L2 8.36e-08, max abs 1.53e-06
+- PASS  approx logits T=2 vs fp64 (dequantised head)  rel-L2 8.40e-08, max abs 1.69e-06
+- PASS  approx logits T=3 vs fp64 (dequantised head)  rel-L2 8.33e-08, max abs 2.92e-06
+- PASS  approx logits T=4 vs fp64 (dequantised head)  rel-L2 7.83e-08, max abs 2.92e-06
+- PASS  R=16: candidate ids == exact top-R of the approximate logits (value desc, index asc), 8 rows  0 rows differ
+- PASS  R=16: rescored candidate logits == fp64 dot of the bf16 rows  max rel err 1.22e-07
+- PASS  R=16: argmax == argmax of the exact candidate logits  
+- PASS  R=64: candidate ids == exact top-R of the approximate logits (value desc, index asc), 8 rows  0 rows differ
+- PASS  R=64: rescored candidate logits == fp64 dot of the bf16 rows  max rel err 1.51e-07
+- PASS  R=64: argmax == argmax of the exact candidate logits  
+- PASS  R=16 (greedy): pipeline vs bf16 head  19976 positions, T=4: argmax mismatches vs bf16 head 1 (of which fp32 near-ties < 1e-5: 1), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 9.54e-05 (21 s)  first mismatches (pos, quant, bf16, margin, in_cand) [(12527, 279, 264, 0.0, True)]
+- PASS  R=16 (greedy): pipeline vs bf16 head  1200 positions, T=1: argmax mismatches vs bf16 head 0 (of which fp32 near-ties < 1e-5: 0), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 3.81e-06 (5 s)
+- PASS  R=64 (sampling): pipeline vs bf16 head  19976 positions, T=4: argmax mismatches vs bf16 head 1 (of which fp32 near-ties < 1e-5: 1), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 9.54e-05 (29 s); true top-20 within candidates 19968/19976, true top-64 within 182/19976; TV(T=1.0,k=20,p=0.95) vs bf16 head over 4994 positions: mean 0.00000 p99 0.00000 max 0.01896; TV(T=1.0,k=64,p=1.0) vs bf16 head over 4994 positions: mean 0.00154 p99 0.01838 max 0.06767; TV(T=0.7,k=20,p=0.95) vs bf16 head over 4994 positions: mean 0.00000 p99 0.00000 max 0.00001  first mismatches (pos, quant, bf16, margin, in_cand) [(12527, 279, 264, 0.0, True)]
+- PASS  R=64 (sampling): pipeline vs bf16 head  1200 positions, T=1: argmax mismatches vs bf16 head 0 (of which fp32 near-ties < 1e-5: 0), bf16 top-1 outside the candidate set 0, max |exact - bf16-head logit| on candidates 3.81e-06 (5 s); true top-20 within candidates 1200/1200, true top-64 within 8/1200; TV(T=1.0,k=20,p=0.95) vs bf16 head over 300 positions: mean 0.00000 p99 0.00000 max 0.00000; TV(T=1.0,k=64,p=1.0) vs bf16 head over 300 positions: mean 0.00124 p99 0.01710 max 0.05344; TV(T=0.7,k=20,p=0.95) vs bf16 head over 300 positions: mean 0.00000 p99 0.00000 max 0.00000
+  log-loss (R=64 pipeline logits vs bf16 head, teacher-forced, 15278 eval positions, mean over docs +- s.e. over docs, 68 s): full-vocab softmax dNLL +0.00080 +- 0.00035 nats (E5 int4 rescore16 +0.0018, int8 +0.0000); sampler's top-64 distribution dNLL -0.00012 +- 0.00003 (14413 positions with the true token in both top-64)
+- PASS  log-loss: sampler's top-64 dNLL < 0.002 nats and |full-vocab dNLL| < 0.003  
+## e2e parity: Engine(head=int8) quantised head + rescoring vs the BF16 head in the same engine
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+src/mtp.cu:161 invalid argument
+src/mtp.cu:214 invalid argument
+Traceback (most recent call last):
+  File "<repo>/projects/swift-mk/engine/tests/test_headq.py", line 405, in <module>
+    main()
+  File "<repo>/projects/swift-mk/engine/tests/test_headq.py", line 395, in main
+    ok &= parity(args)
+          ^^^^^^^^^^^^
+  File "<repo>/projects/swift-mk/engine/tests/test_headq.py", line 311, in parity
+    spec, st = e.generate(ids, args.n, k=3)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/projects/swift-mk/engine/spec.py", line 227, in generate
+    first = self.prefill_spec(ids, k)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/projects/swift-mk/engine/spec.py", line 143, in prefill_spec
+    smk.check(self.lib.smk_spec_prefill_chunk(self.sp, T, nt, i, self.st), "spec_prefill_chunk")
+  File "<repo>/projects/swift-mk/engine/tests/smk.py", line 52, in check
+    raise RuntimeError(f"{what}: cuda/smk error {err}")
+RuntimeError: spec_prefill_chunk: cuda/smk error 1

@@ -284,6 +284,26 @@
    "hash": "fed67d2",
    "date": "2026-11-01 22:31",
    "msg": "swift-mk: dashboard gen.py layout detection by dir names"
+  },
+  {
+   "hash": "cc66da8",
+   "date": "2026-11-01 23:48",
+   "msg": "swift-mk engine: port campaign lineage m3 (repacked W4 layout, lazy rank-1 DeltaNet replay, lop3 GEMV, DeltaNet prologue, register cap); fix stale lazy-DeltaNet pending count on server snapshot restore; tests/test_w4r.py; server/ab_visit.py"
+  },
+  {
+   "hash": "9c3de9b",
+   "date": "2026-11-01 23:48",
+   "msg": "swift-mk: K12 m3 port measured \u2014 k=3 x1.09-1.11, plain step -5%, server vs stock vLLM greedy x1.86-1.95 / T=1 x1.94-2.02, TTFT 37 vs 84 ms; BENCH/ENGINE/server README/dashboard, evidence in engine/results/m3-port"
+  },
+  {
+   "hash": "aef1db8",
+   "date": "2026-11-01 23:50",
+   "msg": "swift-mk: public README reflects the ported m3 engine (K12, server-verified numbers, known issues)"
+  },
+  {
+   "hash": "b8b8feb",
+   "date": "2026-11-01 23:55",
+   "msg": "swift-mk: infographic updated to server-verified m3 port numbers (K12): x1.9-2.0 vs stock vLLM, port A/B, resume-bug catch"
   }
  ],
  "log": [

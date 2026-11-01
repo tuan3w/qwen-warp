@@ -1,0 +1,88 @@
+[ref vs oracle gated] worst rel L2 1.07e-06
+[graph first-call-in-capture T=2 bf16] rel L2 vs ref 1.66e-03
+[graph first-call-in-capture T=2 fp8] rel L2 vs ref 1.70e-03
+[real L3 bf16 code  ctx 32..40] vs oracle: T=1 3.34e-03  T=4 3.34e-03   T4-vs-4xT1 3.77e-04 cache-equal=True
+[real L3 bf16 prose ctx 34..42] vs oracle: T=1 3.39e-03  T=4 3.35e-03   T4-vs-4xT1 4.31e-04 cache-equal=True
+[real L3 bf16 math  ctx 33..41] vs oracle: T=1 3.59e-03  T=4 3.56e-03   T4-vs-4xT1 3.65e-04 cache-equal=True
+[real L3 fp8 code  ctx 32..40] vs oracle: T=1 1.79e-02  T=4 1.81e-02   T4-vs-4xT1 9.11e-05 cache-equal=True
+[real L3 fp8 prose ctx 34..42] vs oracle: T=1 2.11e-02  T=4 2.10e-02   T4-vs-4xT1 8.32e-05 cache-equal=True
+[real L3 fp8 math  ctx 33..41] vs oracle: T=1 1.95e-02  T=4 1.91e-02   T4-vs-4xT1 9.54e-05 cache-equal=True
+<repo>/projects/swift-mk/engine/tests/test_attn.py:232: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/ReduceOps.cpp:1861.)
+  K = K + 0.05 * K.std(1, keepdim=True) * torch.randn(K.shape, device=DEV, generator=g)
+<repo>/projects/swift-mk/engine/tests/test_attn.py:233: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/ReduceOps.cpp:1861.)
+  V = V + 0.05 * V.std(1, keepdim=True) * torch.randn(V.shape, device=DEV, generator=g)
+[synth bf16 ctx     1 T=1] vs ref: rel L2 1.71e-03 max/maxabs 2.87e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx     4 T=4] vs ref: rel L2 1.68e-03 max/maxabs 2.76e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx     8 T=8] vs ref: rel L2 1.73e-03 max/maxabs 1.64e-03  new-K row rel 1.1e-09 V 0.0e+00
+[synth bf16 ctx    33 T=1] vs ref: rel L2 2.08e-03 max/maxabs 3.06e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx    33 T=4] vs ref: rel L2 1.70e-03 max/maxabs 2.53e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx    33 T=8] vs ref: rel L2 1.74e-03 max/maxabs 1.51e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  1000 T=1] vs ref: rel L2 1.93e-03 max/maxabs 3.24e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  1000 T=4] vs ref: rel L2 1.68e-03 max/maxabs 2.35e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  1000 T=8] vs ref: rel L2 1.54e-03 max/maxabs 1.94e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  8000 T=1] vs ref: rel L2 2.04e-03 max/maxabs 3.28e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  8000 T=4] vs ref: rel L2 1.86e-03 max/maxabs 3.16e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx  8000 T=8] vs ref: rel L2 1.73e-03 max/maxabs 2.25e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx 32000 T=1] vs ref: rel L2 1.84e-03 max/maxabs 3.10e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx 32000 T=4] vs ref: rel L2 1.75e-03 max/maxabs 3.03e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx 32000 T=8] vs ref: rel L2 1.80e-03 max/maxabs 2.97e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx     1 T=1] vs ref: rel L2 2.17e-03 max/maxabs 3.61e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx     4 T=4] vs ref: rel L2 1.87e-03 max/maxabs 3.53e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx     8 T=8] vs ref: rel L2 1.81e-03 max/maxabs 2.10e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx    33 T=1] vs ref: rel L2 1.46e-03 max/maxabs 1.98e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx    33 T=4] vs ref: rel L2 1.75e-03 max/maxabs 3.12e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx    33 T=8] vs ref: rel L2 1.95e-03 max/maxabs 2.76e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  1000 T=1] vs ref: rel L2 1.65e-03 max/maxabs 1.89e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  1000 T=4] vs ref: rel L2 1.74e-03 max/maxabs 3.15e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  1000 T=8] vs ref: rel L2 2.01e-03 max/maxabs 2.94e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  8000 T=1] vs ref: rel L2 1.70e-03 max/maxabs 3.02e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  8000 T=4] vs ref: rel L2 1.62e-03 max/maxabs 2.09e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx  8000 T=8] vs ref: rel L2 1.79e-03 max/maxabs 3.26e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx 32000 T=1] vs ref: rel L2 2.18e-03 max/maxabs 3.25e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx 32000 T=4] vs ref: rel L2 1.90e-03 max/maxabs 3.29e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth fp8 ctx 32000 T=8] vs ref: rel L2 1.77e-03 max/maxabs 2.07e-03  new-K row rel 0.0e+00 V 0.0e+00
+[synth bf16 ctx     5 T=2] vs ref: rel L2 1.97e-03 max/maxabs 3.17e-03
+[synth bf16 ctx     5 T=3] vs ref: rel L2 1.85e-03 max/maxabs 1.83e-03
+[synth bf16 ctx     5 T=5] vs ref: rel L2 1.71e-03 max/maxabs 2.11e-03
+[synth bf16 ctx     5 T=6] vs ref: rel L2 1.71e-03 max/maxabs 1.64e-03
+[synth bf16 ctx     5 T=7] vs ref: rel L2 1.75e-03 max/maxabs 1.64e-03
+[synth bf16 ctx   100 T=2] vs ref: rel L2 1.53e-03 max/maxabs 1.68e-03
+[synth bf16 ctx   100 T=3] vs ref: rel L2 1.63e-03 max/maxabs 2.10e-03
+[synth bf16 ctx   100 T=5] vs ref: rel L2 1.78e-03 max/maxabs 2.26e-03
+[synth bf16 ctx   100 T=6] vs ref: rel L2 1.45e-03 max/maxabs 1.20e-03
+[synth bf16 ctx   100 T=7] vs ref: rel L2 1.81e-03 max/maxabs 2.58e-03
+[synth bf16 ctx  5000 T=2] vs ref: rel L2 2.07e-03 max/maxabs 3.03e-03
+[synth bf16 ctx  5000 T=3] vs ref: rel L2 1.89e-03 max/maxabs 3.00e-03
+[synth bf16 ctx  5000 T=5] vs ref: rel L2 1.80e-03 max/maxabs 3.07e-03
+[synth bf16 ctx  5000 T=6] vs ref: rel L2 1.79e-03 max/maxabs 2.95e-03
+[synth bf16 ctx  5000 T=7] vs ref: rel L2 1.69e-03 max/maxabs 2.67e-03
+[synth fp8 ctx     5 T=2] vs ref: rel L2 1.87e-03 max/maxabs 2.35e-03
+[synth fp8 ctx     5 T=3] vs ref: rel L2 1.70e-03 max/maxabs 1.90e-03
+[synth fp8 ctx     5 T=5] vs ref: rel L2 1.89e-03 max/maxabs 2.75e-03
+[synth fp8 ctx     5 T=6] vs ref: rel L2 1.78e-03 max/maxabs 2.10e-03
+[synth fp8 ctx     5 T=7] vs ref: rel L2 1.82e-03 max/maxabs 2.10e-03
+[synth fp8 ctx   100 T=2] vs ref: rel L2 1.63e-03 max/maxabs 1.58e-03
+[synth fp8 ctx   100 T=3] vs ref: rel L2 1.74e-03 max/maxabs 2.88e-03
+[synth fp8 ctx   100 T=5] vs ref: rel L2 1.82e-03 max/maxabs 1.96e-03
+[synth fp8 ctx   100 T=6] vs ref: rel L2 1.82e-03 max/maxabs 2.45e-03
+[synth fp8 ctx   100 T=7] vs ref: rel L2 1.77e-03 max/maxabs 2.21e-03
+[synth fp8 ctx  5000 T=2] vs ref: rel L2 1.90e-03 max/maxabs 3.10e-03
+[synth fp8 ctx  5000 T=3] vs ref: rel L2 1.70e-03 max/maxabs 2.82e-03
+[synth fp8 ctx  5000 T=5] vs ref: rel L2 1.79e-03 max/maxabs 2.23e-03
+[synth fp8 ctx  5000 T=6] vs ref: rel L2 1.63e-03 max/maxabs 1.58e-03
+[synth fp8 ctx  5000 T=7] vs ref: rel L2 1.87e-03 max/maxabs 3.25e-03
+[T=4 vs 4xT=1 ctx 8000 bf16] rel L2 6.62e-04 cache-equal=True
+[T=8 vs 8xT=1 ctx 8000 bf16] rel L2 6.09e-04 cache-equal=True
+[T=4 vs 4xT=1 ctx 8000 fp8] rel L2 5.93e-05 cache-equal=True
+[T=8 vs 8xT=1 ctx 8000 fp8] rel L2 5.43e-05 cache-equal=True
+[fp8 vs bf16 real code ctx 32..40] rel L2 fp8-vs-bf16 1.83e-02   (bf16-vs-oracle 3.34e-03)
+[fp8 vs bf16 real prose ctx 34..42] rel L2 fp8-vs-bf16 2.05e-02   (bf16-vs-oracle 3.39e-03)
+[fp8 vs bf16 real math ctx 33..41] rel L2 fp8-vs-bf16 1.97e-02   (bf16-vs-oracle 3.59e-03)
+[fp8 vs bf16 synth ctx 2000] rel L2 T=1 7.86e-03 T=4 1.22e-02
+[fp8 vs bf16 synth ctx 8000] rel L2 T=1 8.16e-03 T=4 1.13e-02
+[fp8 vs bf16 synth ctx 32000] rel L2 T=1 9.19e-03 T=4 1.15e-02
+[mtp attn event 0 pos 31] new K vs oracle k_rope 2.26e-03  V 1.72e-03  out vs ref 1.69e-03
+[mtp attn event 3 pos 34] new K vs oracle k_rope 2.41e-03  V 1.78e-03  out vs ref 1.75e-03
+[graph bf16] one captured graph, pos0 in 1..4088: graph-vs-eager worst rel 0.0e+00
+[graph fp8] one captured graph, pos0 in 1..4088: graph-vs-eager worst rel 0.0e+00
+ALL PASSED

@@ -13,11 +13,22 @@
 
 namespace smk {
 constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX;
-constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_N = 20;  // DS_SLOTS: DeltaNet ring slots (tmax + 1)
+constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_PEND = 19, DS_N = 20;  // DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | delta-buffer parity << 8 (deltanet.h)
 constexpr int DBG_SLOTS = NLAYER + 2;  // 0 embed, 1..64 layer outputs, 65 final norm out
 constexpr int NHEAD_MODES = 3;         // head 0: none, 1: final norm + lm_head + argmax, 2: final norm only (MTP prefill chunks)
 constexpr int NHEAD_VARIANTS = 3;      // head 1 graphs: 0 BF16 head, 1 quantised head + rescore R=16 (greedy), 2 quantised head + rescore R=64 (sampling: top_k <= 64)
 constexpr int HEAD_R_GREEDY = 16, HEAD_R_SAMPLING = 64;
+
+// DeltaNet lazy snapshots (deltanet.h): call BEFORE ds[DS_CUR] advances by a (a rows accepted of a step of T rows).  Mirrors the flush decision of the kernel:
+// a T >= 2 step that finds pending rows and no room for its T rows writes the pending state to slot cur (the new base) and restarts the delta buffer.
+__device__ __forceinline__ void dn_pend_after(int* ds, int a, int T) {
+  if (T < 2) { ds[DS_PEND] = 0; return; }
+  const int pv = ds[DS_PEND];
+  int pc = pv & 255, base = (pv >> 8) & 15, half = (pv >> 12) & 1;
+  if (pc == 0) base = ds[DS_CUR];
+  else if (pc + T > SWIFTMK_DN_LAZY_ROWS) { pc = 0; base = ds[DS_CUR]; half ^= 1; }
+  ds[DS_PEND] = (pc + a) | (base << 8) | (half << 12);
+}
 }  // namespace smk
 
 struct smk_engine {
@@ -32,6 +43,7 @@ struct smk_engine {
   float* logits;
   void *ws_dn, *ws_attn, *ws_am;
   float* dn_state;
+  float* dn_dbuf;  // [48][swiftmk_deltanet_dbuf_floats()] rank-1 updates of the last two lazy steps
   uint16_t* dn_conv;
   char* kv;
   size_t kv_layer_bytes;

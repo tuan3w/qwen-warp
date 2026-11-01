@@ -264,7 +264,7 @@ __global__ void k_accept_s(int* ds, int* ss, int* ring, int k, const Dist* pd, c
   __syncwarp();
   if (lane < a) ds[DS_OUT + lane] = y[lane];
   __syncwarp();
-  if (lane == 0) spec_finish(ds, ss, ring, a - 1);
+  if (lane == 0) spec_finish(ds, ss, ring, a - 1, k + 1);
 }
 
 __global__ void k_draft_pick(const Dist* qd, const SampP* sp, const int* ss, int j, int* dst) {

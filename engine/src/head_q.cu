@@ -1,4 +1,4 @@
-// swift-mk K9: quantised lm_head GEMV (int8 per-row CUDA-core kernel; int4 g128 = smk_w4_gemv) + top-R select + exact BF16 rescoring.  See include/head_q.h.
+// swift-mk K9: quantised lm_head GEMV (int8 per-row CUDA-core kernel; int4 g128 = smk_w4_gemv / smk_w4r_gemv) + top-R select + exact BF16 rescoring.  See include/head_q.h.
 // The int8 kernel is the E5 prototype (experiments/2026-10-31-lm-head-quantisation-quality/bench_head.cu, same author): one warp = two rows, lane l reads a uint4
 // (16 columns) per 512-column step, int8 -> fp32 by the magic-number trick (xor 0x80 per byte, PRMT into the mantissa of 2^23, subtract 2^23 + 128), x in smem in a
 // lane-permuted fp32 layout (conflict-free LDS.128), persistent grid (smem filled once per CTA).
@@ -304,11 +304,12 @@ cudaError_t smk_headq_gemv(int kind, const void* wq, const void* sq, const void*
       default: return launch_i8<4, 8>(wq, (const float*)sq, x, logits, N, nsm, st);
     }
   }
-  if (kind == SMK_HEADQ_I4) {
+  if (kind == SMK_HEADQ_I4 || kind == SMK_HEADQ_I4R) {
     smk_epi ep = {};
     ep.kind = SMK_EPI_F32;
     ep.out[0] = logits;
-    return smk_w4_gemv_cfg(wq, sq, x, N, K, T, &ep, 1, st);  // w8k8u2: best config at every T (E5 Table 5)
+    // w8k8u2: best config at every T (E5 Table 5)
+    return kind == SMK_HEADQ_I4 ? smk_w4_gemv_cfg(wq, sq, x, N, K, T, &ep, 1, st) : smk_w4r_gemv_cfg(wq, sq, x, N, K, T, &ep, 1, st);
   }
   return cudaErrorInvalidValue;
 }

@@ -34,6 +34,7 @@ STEP_MS = [  # plain decode ms/step at ctx ~64 (T=1)
     ("K5 GEMV rewrite", 20.195, "engine/GEMV_LOG.md, commit 8fcbc1e"),
     ("K9 int8 head + exact rescoring", 18.800, "engine/BENCH.md (K9), experiments/2026-10-31-lm-head-quant-engine/results/bench_ab_int8.log"),
     ("K9 int4 head + exact rescoring (default)", 18.105, "engine/BENCH.md (K9), experiments/2026-10-31-lm-head-quant-engine/results/bench_ab_int4.log"),
+    ("K12 m3 port (repacked W4 + lazy DeltaNet + lop3 GEMV)", 17.227, "engine/BENCH.md (K12), engine/results/m3-port/ab/summary.txt (base 18.133 in the same A/B)"),
 ]
 SPEC_TOKS = {  # k=3 decode tok/s, greedy
     "labels": ["code", "prose", "math", "8K ctx"],
@@ -51,6 +52,11 @@ SPEC_TOKS = {  # k=3 decode tok/s, greedy
         ("HyperQwen MTP `SPEC=mtp CTX=fast` on Swift-1.5, same HTTP client, 350 W (greedy)", [173.9, 104.1, 177.4, 139.2], "experiments/2026-11-01-hyperqwen-vs-swift-mk/results/tables.md"),
         ("HyperQwen DFlash2 (7 drafts + lookup) on Swift-1.5, same client (greedy)", [253.6, 102.9, 225.3, 121.3], "experiments/2026-11-01-hyperqwen-vs-swift-mk/results/tables.md"),
         ("swift-mk server K11, same client, 2 rounds (greedy)", [165.6, 107.2, 165.7, 131.2], "experiments/2026-11-01-hyperqwen-vs-swift-mk/results/tables.md"),
+        ("engine K12 m3 port (greedy, bench_spec, 3 interleaved rounds)", [183.4, 119.3, 179.4, 145.8], "engine/BENCH.md K12, engine/results/m3-port/ab/summary.txt"),
+        ("swift-mk server K12 m3 port (greedy, ab_visit, 2 visits x 3 reps)", [184.1, 116.8, 183.9, 144.7], "engine/results/m3-port/server/"),
+        ("stock vllm serve in the same visits (greedy)", [96.7, 63.0, 94.2, 77.7], "engine/results/m3-port/server/"),
+        ("swift-mk server K12 m3 port T=1 sampling", [174.0, 116.2, 178.4, 147.1], "engine/results/m3-port/server/"),
+        ("stock vllm serve T=1 sampling, same visits", [88.7, 59.6, 88.1, 75.7], "engine/results/m3-port/server/"),
     ],
 }
 # prediction vs outcome (pre-registered numbers; outcome from the experiment README)
@@ -105,6 +111,7 @@ AGENTS = [  # engineering work packages (parallel agents), outcome one-liners wi
     ("BuildK10ShortPrefill", "short-prompt TTFT: multi-row W4 mma GEMM (T<=64, bit-identical to decode GEMV) + last row folded into the batch", "engine/BENCH.md K10: server TTFT 8/20/40/64/128 tokens 74/130/235/217/227 -> 34/38/47/75/128 ms (stock vLLM ~96 ms at 30 tokens); engine-direct 31/34/44/75/125 ms; 240-600 tokens unchanged (K6 path)"),
     ("BuildK11Pld", "hybrid draft: MTP chain + host prompt-lookup tail, verify T<=8 (DeltaNet 9-slot ring, attention / head / sampling T<=8, per-width graphs with a mapped mailbox), exact greedy + K7 sampling", "BENCH.md K11: V(8) 21.6 ms, host gap < 10 us, E6 workload a/b/c/d/e x1.389/1.329/1.461/1.014/1.072 greedy (x1.359/1.315/1.426/1.004/1.072 T=1), +0.62 GiB (max-model-len 36864 -> 28672), server --prompt-lookup auto"),
     ("BuildK9HeadQ", "quantised lm_head (int4 g128 default / int8) + exact bf16 rescoring of the top-16/64 candidates", "BENCH.md K9: plain step 20.15 -> 18.105 ms, k=3 +10% (167.8/107.4/165.5/151.9), greedy streams identical to the BF16 head, +0.59 GiB (max-model-len 40960 -> 36864)"),
+    ("PortM3", "m3 campaign lineage ported: repacked W4 layout + lazy rank-1 DeltaNet replay + lop3 GEMV / DeltaNet / register-cap kernels; found + fixed the stale-pending-state bug of the server snapshot resume", "BENCH.md K12: plain step 18.133 -> 17.227 ms (-5.0%), k=3 greedy x1.085-1.109 (183.4/119.3/179.4/145.8), E6 prompt-lookup a/b/c x1.42/1.38/1.53 over the m3 MTP cycle; server vs stock vllm serve greedy x1.86-1.95 (184.1/116.8/183.9/144.7 vs 96.7/63.0/94.2/77.7), T=1 x1.94-2.02, TTFT 20 tok 37 vs 84 ms, boot 19.6 s vs 34-102 s; tests: engine/results/m3-port/"),
 ]
 
 

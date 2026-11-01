@@ -155,6 +155,7 @@ class Runner:
         cur = self._cur()
         fp.dn_state[:, cur].copy_(s.dn)
         fp.dn_conv[:, cur].copy_(s.conv)
+        fp.ds[19] = 0  # DS_PEND (engine_impl.h): the restored state replaces what the lazy DeltaNet ring still held pending from the previous request (the prefill's materialize would replay it on top)
         fp.ds[0] = s.pos
         e.pos = s.pos
         torch.cuda.synchronize()

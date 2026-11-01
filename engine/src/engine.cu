@@ -6,6 +6,7 @@ using namespace smk;
 // ---------------------------------------------------------------------------------------------- tiny kernels
 __global__ void k_advance(int* ds, int acc, int feedback) {
   ds[DS_POS] += acc;
+  dn_pend_after(ds, acc, acc);
   ds[DS_CUR] = (ds[DS_CUR] + acc) % ds[DS_SLOTS];
   if (feedback) ds[DS_TOK] = ds[DS_OUT + acc - 1];
 }
@@ -49,32 +50,33 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       CK(cudaStreamWaitEvent(e->side, e->ev_fork, 0));
       CK(smk_bf16_gemv_small(L.ab, e->xn, 96, 48, H, T, e->ba, e->bb, e->side));  // in_proj_a|b: parallel branch, overlaps the qkv|z GEMV
       CK(cudaEventRecord(e->ev_join, e->side));
-      CK(smk_w4_gemv(L.qkv_w, L.qkv_s, e->xn, 16384, H, T, &ep, st));
+      CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 16384, H, T, &ep, st));
       CK(cudaStreamWaitEvent(st, e->ev_join, 0));
       const int di = e->dn_idx[l];
-      CK(swiftmk_deltanet_step(T, e->qkv, e->z, e->ba, e->bb, L.conv_w, L.A_log, L.dt_bias, L.norm_w,
-                               e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
-                               e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, ds + DS_CUR, e->slots, e->y6, e->ws_dn, st));
+      CK(swiftmk_deltanet_step_lazy(T, e->qkv, e->z, e->ba, e->bb, L.conv_w, L.A_log, L.dt_bias, L.norm_w,
+                                    e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
+                                    e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, ds + DS_CUR, e->slots, e->y6, e->ws_dn,
+                                    e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), ds + DS_PEND, st));
     } else {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 12288; ep.end[1] = 13312; ep.end[2] = 14336; ep.out[0] = e->qb; ep.out[1] = e->kb; ep.out[2] = e->vb;
-      CK(smk_w4_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
+      CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
       CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_fp8,
                            L.k_scale, L.v_scale, ds + DS_POS, e->y6, e->ws_attn, st));
     }
     {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = ep.end[1] = ep.end[2] = H; ep.out[0] = e->mix;
-      CK(smk_w4_gemv(L.o_w, L.o_s, e->y6, H, 6144, T, &ep, st));
+      CK(smk_w4r_gemv(L.o_w, L.o_s, e->y6, H, 6144, T, &ep, st));
     }
     CK(smk_rmsnorm(e->h, e->mix, L.ln2, e->xn, nullptr, T, H, 1e-6f, st));
     {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SILU; ep.out[0] = e->act;
-      CK(smk_w4_gemv(L.gu_w, L.gu_s, e->xn, 2 * I, H, T, &ep, st));
+      CK(smk_w4r_gemv(L.gu_w, L.gu_s, e->xn, 2 * I, H, T, &ep, st));
       smk_epi ed = {};
       ed.kind = SMK_EPI_SEGS; ed.end[0] = ed.end[1] = ed.end[2] = H; ed.out[0] = e->dn;
-      CK(smk_w4_gemv(L.dn_w, L.dn_s, e->act, H, I, T, &ed, st));
+      CK(smk_w4r_gemv(L.dn_w, L.dn_s, e->act, H, I, T, &ed, st));
     }
   }
   l = NLAYER;
@@ -132,6 +134,7 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   e->hq_on = w->head_q_kind != SMK_HEADQ_NONE;
   e->dn_state = (float*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, true);
   e->dn_conv = (uint16_t*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, true);
+  e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
   e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
   e->kv = (char*)dalloc(e, (size_t)na * e->kv_layer_bytes, true);
   cudaStreamCreateWithFlags(&e->cap, cudaStreamNonBlocking);
@@ -159,6 +162,7 @@ void smk_engine_destroy(smk_engine* e) {
 cudaError_t smk_engine_reset(smk_engine* e, cudaStream_t st) {
   const int nd = 48, na = 16;
   cudaMemsetAsync(e->ds, 0, DS_SLOTS * sizeof(int), st);  // ds[DS_SLOTS] (ring size) is constant
+  cudaMemsetAsync(e->ds + DS_PEND, 0, sizeof(int), st);
   cudaMemsetAsync(e->dn_state, 0, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, st);
   cudaMemsetAsync(e->dn_conv, 0, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, st);
   cudaMemsetAsync(e->kv, 0, (size_t)na * e->kv_layer_bytes, st);

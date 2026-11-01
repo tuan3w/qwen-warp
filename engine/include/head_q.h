@@ -19,6 +19,7 @@ extern "C" {
 #define SMK_HEADQ_NONE 0
 #define SMK_HEADQ_I8 1
 #define SMK_HEADQ_I4 2
+#define SMK_HEADQ_I4R 3  // kind 2 in the repacked W4 layout of smk_w4r_gemv (include/engine.h; the engine's own copy, pack.repack_w4)
 #define SMK_HEADQ_RMAX 64
 
 size_t smk_headq_ws_bytes(void);
