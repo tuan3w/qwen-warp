@@ -1,0 +1,42 @@
+W1101 07:53:10.580000 2434273 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 07:53:10.597000 2434273 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+suite e6, 32 tasks, modes ['base', 'pld'], reps 3, T=1.0, tail gate m=3 Lt=4, build build/k11
+                a1 n= 768 | base  183.8 tok/s E 3.98 | pld  320.5 tok/s E 7.67
+                a2 n= 768 | base  183.5 tok/s E 3.95 | pld  313.4 tok/s E 7.53
+                a3 n= 768 | base  181.8 tok/s E 3.92 | pld  322.1 tok/s E 7.69
+                a4 n= 336 | base  149.5 tok/s E 3.27 | pld  170.3 tok/s E 3.85
+                a5 n= 768 | base  154.6 tok/s E 3.32 | pld  160.2 tok/s E 3.56
+                a6 n= 360 | base  166.6 tok/s E 3.60 | pld  209.2 tok/s E 4.79
+                a7 n= 768 | base  166.8 tok/s E 3.60 | pld  197.2 tok/s E 4.47
+                a8 n= 768 | base  172.4 tok/s E 3.73 | pld  221.9 tok/s E 5.17
+                b1 n= 638 | base  177.7 tok/s E 3.85 | pld  282.5 tok/s E 6.68
+                b2 n= 768 | base  175.1 tok/s E 3.76 | pld  220.5 tok/s E 5.11
+                b3 n= 768 | base  183.4 tok/s E 3.95 | pld  281.1 tok/s E 6.63
+                b4 n= 204 | base  152.5 tok/s E 3.29 | pld  146.3 tok/s E 3.25
+                b5 n= 437 | base  171.9 tok/s E 3.70 | pld  196.1 tok/s E 4.46
+                b6 n= 729 | base  162.8 tok/s E 3.52 | pld  202.3 tok/s E 4.62
+                c1 n= 109 | base  118.1 tok/s E 3.56 | pld  184.8 tok/s E 5.00
+                c2 n= 570 | base  174.8 tok/s E 3.95 | pld  262.8 tok/s E 6.29
+                c3 n= 768 | base  182.0 tok/s E 3.89 | pld  242.9 tok/s E 5.69
+                c4 n=  37 | base  153.1 tok/s E 3.36 | pld  223.1 tok/s E 5.14
+                c5 n=  53 | base  176.3 tok/s E 3.86 | pld  182.1 tok/s E 4.23
+                c6 n= 595 | base  188.6 tok/s E 4.00 | pld  286.0 tok/s E 6.69
+                d1 n= 664 | base  106.0 tok/s E 2.30 | pld  105.5 tok/s E 2.27
+                d2 n= 768 | base  107.1 tok/s E 2.28 | pld  104.4 tok/s E 2.25
+                d3 n= 708 | base  106.5 tok/s E 2.24 | pld  107.2 tok/s E 2.27
+                d4 n= 768 | base  108.1 tok/s E 2.27 | pld  111.4 tok/s E 2.36
+                d5 n= 768 | base  120.5 tok/s E 2.53 | pld  119.3 tok/s E 2.52
+                d6 n= 768 | base  126.3 tok/s E 2.65 | pld  122.3 tok/s E 2.59
+                e1 n= 768 | base  162.4 tok/s E 3.42 | pld  171.0 tok/s E 3.69
+                e2 n= 768 | base  156.8 tok/s E 3.30 | pld  166.3 tok/s E 3.59
+                e3 n= 768 | base  161.6 tok/s E 3.40 | pld  170.3 tok/s E 3.71
+                e4 n= 768 | base  155.5 tok/s E 3.26 | pld  173.1 tok/s E 3.79
+                e5 n= 768 | base  167.5 tok/s E 3.53 | pld  175.3 tok/s E 3.82
+                e6 n= 768 | base  177.4 tok/s E 3.72 | pld  196.6 tok/s E 4.33
+
+per class (pooled tokens / pooled time; median over reps):
+class a: base 172.0 tok/s (E 3.71) | pld 228.1 tok/s (E 5.28) x1.326 | tail cycles 0.59, T hist {4: 1223, 5: 0, 6: 0, 7: 0, 8: 1724}, host wait 22879 us + work 4 us per cycle
+class b: base 172.5 tok/s (E 3.72) | pld 227.0 tok/s (E 5.21) x1.316 | tail cycles 0.61, T hist {4: 755, 5: 0, 6: 0, 7: 21, 8: 1184}, host wait 22881 us + work 4 us per cycle
+class c: base 179.9 tok/s (E 3.86) | pld 259.6 tok/s (E 5.99) x1.443 | tail cycles 0.76, T hist {4: 217, 5: 0, 6: 0, 7: 0, 8: 670}, host wait 23031 us + work 5 us per cycle
+class d: base 112.0 tok/s (E 2.38) | pld 111.9 tok/s (E 2.38) x0.999 | tail cycles 0.06, T hist {4: 5199, 5: 0, 6: 0, 7: 0, 8: 335}, host wait 21239 us + work 3 us per cycle
+class e: base 163.9 tok/s (E 3.45) | pld 175.8 tok/s (E 3.81) x1.072 | tail cycles 0.31, T hist {4: 2486, 5: 0, 6: 0, 7: 1, 8: 1140}, host wait 21711 us + work 4 us per cycle

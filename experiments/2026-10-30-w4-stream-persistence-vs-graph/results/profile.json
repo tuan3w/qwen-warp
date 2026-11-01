@@ -1,0 +1,386 @@
+{
+ "v3:w8r2d2": {
+  "cfg": "w8r2d2",
+  "cross": 0,
+  "grid": 82,
+  "unit": "us per phase (mean over phases of that kind and 20 steps)",
+  "groups": [
+   {
+    "kind": "core",
+    "phases_per_step": 81,
+    "phase_wall_us": 1.78,
+    "start_skew_us": 0.17,
+    "prologue_us": 0.0,
+    "stream_median_block_us": 0.2,
+    "tail_us(last_arrival-median_arrival)": 0.45,
+    "barrier_us(last_arrival->first_release)": 0.89,
+    "ms_per_step_total": 0.144
+   },
+   {
+    "kind": "down",
+    "phases_per_step": 64,
+    "phase_wall_us": 58.63,
+    "start_skew_us": 0.18,
+    "prologue_us": 3.31,
+    "stream_median_block_us": 50.77,
+    "tail_us(last_arrival-median_arrival)": 2.61,
+    "barrier_us(last_arrival->first_release)": 1.67,
+    "ms_per_step_total": 3.752
+   },
+   {
+    "kind": "gateup",
+    "phases_per_step": 64,
+    "phase_wall_us": 112.19,
+    "start_skew_us": 0.17,
+    "prologue_us": 4.6,
+    "stream_median_block_us": 101.41,
+    "tail_us(last_arrival-median_arrival)": 3.86,
+    "barrier_us(last_arrival->first_release)": 1.97,
+    "ms_per_step_total": 7.18
+   },
+   {
+    "kind": "lm_head",
+    "phases_per_step": 1,
+    "phase_wall_us": 2881.54,
+    "start_skew_us": 0.2,
+    "prologue_us": 4.47,
+    "stream_median_block_us": 2842.14,
+    "tail_us(last_arrival-median_arrival)": 34.41,
+    "barrier_us(last_arrival->first_release)": 0.0,
+    "ms_per_step_total": 2.882
+   },
+   {
+    "kind": "oproj",
+    "phases_per_step": 64,
+    "phase_wall_us": 22.32,
+    "start_skew_us": 0.18,
+    "prologue_us": 2.28,
+    "stream_median_block_us": 17.81,
+    "tail_us(last_arrival-median_arrival)": 0.89,
+    "barrier_us(last_arrival->first_release)": 0.94,
+    "ms_per_step_total": 1.429
+   },
+   {
+    "kind": "qkv_attn",
+    "phases_per_step": 16,
+    "phase_wall_us": 48.93,
+    "start_skew_us": 0.14,
+    "prologue_us": 4.59,
+    "stream_median_block_us": 40.98,
+    "tail_us(last_arrival-median_arrival)": 1.62,
+    "barrier_us(last_arrival->first_release)": 1.19,
+    "ms_per_step_total": 0.783
+   },
+   {
+    "kind": "qkvz_gdn",
+    "phases_per_step": 48,
+    "phase_wall_us": 56.23,
+    "start_skew_us": 0.18,
+    "prologue_us": 4.59,
+    "stream_median_block_us": 46.83,
+    "tail_us(last_arrival-median_arrival)": 3.29,
+    "barrier_us(last_arrival->first_release)": 1.25,
+    "ms_per_step_total": 2.699
+   },
+   {
+    "kind": "ALL",
+    "phases_per_step": 338,
+    "phase_wall_us": 55.82,
+    "start_skew_us": 0.18,
+    "prologue_us": 2.81,
+    "stream_median_block_us": 49.24,
+    "tail_us(last_arrival-median_arrival)": 2.15,
+    "barrier_us(last_arrival->first_release)": 1.31,
+    "ms_per_step_total": 18.869
+   }
+  ]
+ },
+ "v4:w8r2d5": {
+  "cfg": "w8r2d5",
+  "cross": 1,
+  "grid": 82,
+  "unit": "us per phase (mean over phases of that kind and 20 steps)",
+  "groups": [
+   {
+    "kind": "core",
+    "phases_per_step": 81,
+    "phase_wall_us": 1.7,
+    "start_skew_us": 0.16,
+    "prologue_us": 0.0,
+    "stream_median_block_us": 0.27,
+    "tail_us(last_arrival-median_arrival)": 0.47,
+    "barrier_us(last_arrival->first_release)": 0.7,
+    "ms_per_step_total": 0.138
+   },
+   {
+    "kind": "down",
+    "phases_per_step": 64,
+    "phase_wall_us": 56.42,
+    "start_skew_us": 0.18,
+    "prologue_us": 2.2,
+    "stream_median_block_us": 52.38,
+    "tail_us(last_arrival-median_arrival)": 0.75,
+    "barrier_us(last_arrival->first_release)": 0.84,
+    "ms_per_step_total": 3.611
+   },
+   {
+    "kind": "gateup",
+    "phases_per_step": 64,
+    "phase_wall_us": 111.74,
+    "start_skew_us": 0.17,
+    "prologue_us": 3.46,
+    "stream_median_block_us": 101.52,
+    "tail_us(last_arrival-median_arrival)": 4.59,
+    "barrier_us(last_arrival->first_release)": 1.79,
+    "ms_per_step_total": 7.152
+   },
+   {
+    "kind": "lm_head",
+    "phases_per_step": 1,
+    "phase_wall_us": 2863.67,
+    "start_skew_us": 0.31,
+    "prologue_us": 3.41,
+    "stream_median_block_us": 2835.69,
+    "tail_us(last_arrival-median_arrival)": 23.96,
+    "barrier_us(last_arrival->first_release)": 0.0,
+    "ms_per_step_total": 2.864
+   },
+   {
+    "kind": "oproj",
+    "phases_per_step": 64,
+    "phase_wall_us": 21.77,
+    "start_skew_us": 0.19,
+    "prologue_us": 1.1,
+    "stream_median_block_us": 18.52,
+    "tail_us(last_arrival-median_arrival)": 0.76,
+    "barrier_us(last_arrival->first_release)": 0.77,
+    "ms_per_step_total": 1.393
+   },
+   {
+    "kind": "qkv_attn",
+    "phases_per_step": 16,
+    "phase_wall_us": 47.8,
+    "start_skew_us": 0.19,
+    "prologue_us": 3.48,
+    "stream_median_block_us": 41.93,
+    "tail_us(last_arrival-median_arrival)": 1.16,
+    "barrier_us(last_arrival->first_release)": 0.94,
+    "ms_per_step_total": 0.765
+   },
+   {
+    "kind": "qkvz_gdn",
+    "phases_per_step": 48,
+    "phase_wall_us": 55.06,
+    "start_skew_us": 0.2,
+    "prologue_us": 3.47,
+    "stream_median_block_us": 47.18,
+    "tail_us(last_arrival-median_arrival)": 2.87,
+    "barrier_us(last_arrival->first_release)": 1.17,
+    "ms_per_step_total": 2.643
+   },
+   {
+    "kind": "ALL",
+    "phases_per_step": 338,
+    "phase_wall_us": 54.93,
+    "start_skew_us": 0.18,
+    "prologue_us": 1.95,
+    "stream_median_block_us": 49.79,
+    "tail_us(last_arrival-median_arrival)": 1.8,
+    "barrier_us(last_arrival->first_release)": 1.02,
+    "ms_per_step_total": 18.565
+   }
+  ]
+ },
+ "v4:w8r4d1": {
+  "cfg": "w8r4d1",
+  "cross": 1,
+  "grid": 82,
+  "unit": "us per phase (mean over phases of that kind and 20 steps)",
+  "groups": [
+   {
+    "kind": "core",
+    "phases_per_step": 81,
+    "phase_wall_us": 1.56,
+    "start_skew_us": 0.16,
+    "prologue_us": 0.0,
+    "stream_median_block_us": 0.23,
+    "tail_us(last_arrival-median_arrival)": 0.43,
+    "barrier_us(last_arrival->first_release)": 0.68,
+    "ms_per_step_total": 0.127
+   },
+   {
+    "kind": "down",
+    "phases_per_step": 64,
+    "phase_wall_us": 57.71,
+    "start_skew_us": 0.17,
+    "prologue_us": 2.09,
+    "stream_median_block_us": 51.27,
+    "tail_us(last_arrival-median_arrival)": 2.74,
+    "barrier_us(last_arrival->first_release)": 1.2,
+    "ms_per_step_total": 3.694
+   },
+   {
+    "kind": "gateup",
+    "phases_per_step": 64,
+    "phase_wall_us": 113.79,
+    "start_skew_us": 0.17,
+    "prologue_us": 3.31,
+    "stream_median_block_us": 100.2,
+    "tail_us(last_arrival-median_arrival)": 7.67,
+    "barrier_us(last_arrival->first_release)": 2.24,
+    "ms_per_step_total": 7.282
+   },
+   {
+    "kind": "lm_head",
+    "phases_per_step": 1,
+    "phase_wall_us": 2874.52,
+    "start_skew_us": 0.26,
+    "prologue_us": 3.34,
+    "stream_median_block_us": 2828.88,
+    "tail_us(last_arrival-median_arrival)": 41.32,
+    "barrier_us(last_arrival->first_release)": 0.0,
+    "ms_per_step_total": 2.875
+   },
+   {
+    "kind": "oproj",
+    "phases_per_step": 64,
+    "phase_wall_us": 21.94,
+    "start_skew_us": 0.18,
+    "prologue_us": 1.04,
+    "stream_median_block_us": 18.43,
+    "tail_us(last_arrival-median_arrival)": 1.35,
+    "barrier_us(last_arrival->first_release)": 0.87,
+    "ms_per_step_total": 1.404
+   },
+   {
+    "kind": "qkv_attn",
+    "phases_per_step": 16,
+    "phase_wall_us": 50.05,
+    "start_skew_us": 0.14,
+    "prologue_us": 3.29,
+    "stream_median_block_us": 38.91,
+    "tail_us(last_arrival-median_arrival)": 5.7,
+    "barrier_us(last_arrival->first_release)": 1.29,
+    "ms_per_step_total": 0.801
+   },
+   {
+    "kind": "qkvz_gdn",
+    "phases_per_step": 48,
+    "phase_wall_us": 57.7,
+    "start_skew_us": 0.18,
+    "prologue_us": 3.31,
+    "stream_median_block_us": 45.89,
+    "tail_us(last_arrival-median_arrival)": 6.73,
+    "barrier_us(last_arrival->first_release)": 1.35,
+    "ms_per_step_total": 2.77
+   },
+   {
+    "kind": "ALL",
+    "phases_per_step": 338,
+    "phase_wall_us": 56.07,
+    "start_skew_us": 0.17,
+    "prologue_us": 1.86,
+    "stream_median_block_us": 48.95,
+    "tail_us(last_arrival-median_arrival)": 3.68,
+    "barrier_us(last_arrival->first_release)": 1.23,
+    "ms_per_step_total": 18.952
+   }
+  ]
+ },
+ "v3:w8r4d1": {
+  "cfg": "w8r4d1",
+  "cross": 0,
+  "grid": 82,
+  "unit": "us per phase (mean over phases of that kind and 20 steps)",
+  "groups": [
+   {
+    "kind": "core",
+    "phases_per_step": 81,
+    "phase_wall_us": 1.56,
+    "start_skew_us": 0.16,
+    "prologue_us": 0.0,
+    "stream_median_block_us": 0.21,
+    "tail_us(last_arrival-median_arrival)": 0.43,
+    "barrier_us(last_arrival->first_release)": 0.67,
+    "ms_per_step_total": 0.126
+   },
+   {
+    "kind": "down",
+    "phases_per_step": 64,
+    "phase_wall_us": 57.87,
+    "start_skew_us": 0.17,
+    "prologue_us": 2.95,
+    "stream_median_block_us": 51.24,
+    "tail_us(last_arrival-median_arrival)": 2.33,
+    "barrier_us(last_arrival->first_release)": 1.12,
+    "ms_per_step_total": 3.704
+   },
+   {
+    "kind": "gateup",
+    "phases_per_step": 64,
+    "phase_wall_us": 113.45,
+    "start_skew_us": 0.17,
+    "prologue_us": 4.47,
+    "stream_median_block_us": 99.51,
+    "tail_us(last_arrival-median_arrival)": 6.89,
+    "barrier_us(last_arrival->first_release)": 2.04,
+    "ms_per_step_total": 7.261
+   },
+   {
+    "kind": "lm_head",
+    "phases_per_step": 1,
+    "phase_wall_us": 2863.77,
+    "start_skew_us": 0.2,
+    "prologue_us": 4.4,
+    "stream_median_block_us": 2813.95,
+    "tail_us(last_arrival-median_arrival)": 44.75,
+    "barrier_us(last_arrival->first_release)": 0.0,
+    "ms_per_step_total": 2.864
+   },
+   {
+    "kind": "oproj",
+    "phases_per_step": 64,
+    "phase_wall_us": 22.27,
+    "start_skew_us": 0.17,
+    "prologue_us": 2.11,
+    "stream_median_block_us": 17.6,
+    "tail_us(last_arrival-median_arrival)": 1.2,
+    "barrier_us(last_arrival->first_release)": 0.87,
+    "ms_per_step_total": 1.425
+   },
+   {
+    "kind": "qkv_attn",
+    "phases_per_step": 16,
+    "phase_wall_us": 49.84,
+    "start_skew_us": 0.2,
+    "prologue_us": 4.44,
+    "stream_median_block_us": 38.25,
+    "tail_us(last_arrival-median_arrival)": 5.36,
+    "barrier_us(last_arrival->first_release)": 1.13,
+    "ms_per_step_total": 0.797
+   },
+   {
+    "kind": "qkvz_gdn",
+    "phases_per_step": 48,
+    "phase_wall_us": 57.45,
+    "start_skew_us": 0.16,
+    "prologue_us": 4.45,
+    "stream_median_block_us": 45.13,
+    "tail_us(last_arrival-median_arrival)": 6.07,
+    "barrier_us(last_arrival->first_release)": 1.21,
+    "ms_per_step_total": 2.758
+   },
+   {
+    "kind": "ALL",
+    "phases_per_step": 338,
+    "phase_wall_us": 56.02,
+    "start_skew_us": 0.17,
+    "prologue_us": 2.66,
+    "stream_median_block_us": 48.47,
+    "tail_us(last_arrival-median_arrival)": 3.33,
+    "barrier_us(last_arrival->first_release)": 1.15,
+    "ms_per_step_total": 18.935
+   }
+  ]
+ }
+}

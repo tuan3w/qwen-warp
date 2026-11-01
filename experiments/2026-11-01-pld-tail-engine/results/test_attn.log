@@ -1,0 +1,40 @@
+[synth bf16 ctx   100 T=2] vs ref: rel L2 1.53e-03 max/maxabs 1.68e-03
+[synth bf16 ctx   100 T=3] vs ref: rel L2 1.63e-03 max/maxabs 2.10e-03
+[synth bf16 ctx   100 T=5] vs ref: rel L2 1.78e-03 max/maxabs 2.26e-03
+[synth bf16 ctx   100 T=6] vs ref: rel L2 1.45e-03 max/maxabs 1.20e-03
+[synth bf16 ctx   100 T=7] vs ref: rel L2 1.81e-03 max/maxabs 2.58e-03
+[synth bf16 ctx  5000 T=2] vs ref: rel L2 2.07e-03 max/maxabs 3.03e-03
+[synth bf16 ctx  5000 T=3] vs ref: rel L2 1.89e-03 max/maxabs 3.00e-03
+[synth bf16 ctx  5000 T=5] vs ref: rel L2 1.80e-03 max/maxabs 3.07e-03
+[synth bf16 ctx  5000 T=6] vs ref: rel L2 1.79e-03 max/maxabs 2.95e-03
+[synth bf16 ctx  5000 T=7] vs ref: rel L2 1.69e-03 max/maxabs 2.67e-03
+[synth fp8 ctx     5 T=2] vs ref: rel L2 1.87e-03 max/maxabs 2.35e-03
+[synth fp8 ctx     5 T=3] vs ref: rel L2 1.70e-03 max/maxabs 1.90e-03
+[synth fp8 ctx     5 T=5] vs ref: rel L2 1.89e-03 max/maxabs 2.75e-03
+[synth fp8 ctx     5 T=6] vs ref: rel L2 1.78e-03 max/maxabs 2.10e-03
+[synth fp8 ctx     5 T=7] vs ref: rel L2 1.82e-03 max/maxabs 2.10e-03
+[synth fp8 ctx   100 T=2] vs ref: rel L2 1.63e-03 max/maxabs 1.58e-03
+[synth fp8 ctx   100 T=3] vs ref: rel L2 1.74e-03 max/maxabs 2.88e-03
+[synth fp8 ctx   100 T=5] vs ref: rel L2 1.82e-03 max/maxabs 1.96e-03
+[synth fp8 ctx   100 T=6] vs ref: rel L2 1.82e-03 max/maxabs 2.45e-03
+[synth fp8 ctx   100 T=7] vs ref: rel L2 1.77e-03 max/maxabs 2.21e-03
+[synth fp8 ctx  5000 T=2] vs ref: rel L2 1.90e-03 max/maxabs 3.10e-03
+[synth fp8 ctx  5000 T=3] vs ref: rel L2 1.70e-03 max/maxabs 2.82e-03
+[synth fp8 ctx  5000 T=5] vs ref: rel L2 1.79e-03 max/maxabs 2.23e-03
+[synth fp8 ctx  5000 T=6] vs ref: rel L2 1.63e-03 max/maxabs 1.58e-03
+[synth fp8 ctx  5000 T=7] vs ref: rel L2 1.87e-03 max/maxabs 3.25e-03
+[T=4 vs 4xT=1 ctx 8000 bf16] rel L2 6.62e-04 cache-equal=True
+[T=8 vs 8xT=1 ctx 8000 bf16] rel L2 6.09e-04 cache-equal=True
+[T=4 vs 4xT=1 ctx 8000 fp8] rel L2 5.93e-05 cache-equal=True
+[T=8 vs 8xT=1 ctx 8000 fp8] rel L2 5.43e-05 cache-equal=True
+[fp8 vs bf16 real code ctx 32..40] rel L2 fp8-vs-bf16 1.83e-02   (bf16-vs-oracle 3.34e-03)
+[fp8 vs bf16 real prose ctx 34..42] rel L2 fp8-vs-bf16 2.05e-02   (bf16-vs-oracle 3.39e-03)
+[fp8 vs bf16 real math ctx 33..41] rel L2 fp8-vs-bf16 1.97e-02   (bf16-vs-oracle 3.59e-03)
+[fp8 vs bf16 synth ctx 2000] rel L2 T=1 7.86e-03 T=4 1.22e-02
+[fp8 vs bf16 synth ctx 8000] rel L2 T=1 8.16e-03 T=4 1.13e-02
+[fp8 vs bf16 synth ctx 32000] rel L2 T=1 9.19e-03 T=4 1.15e-02
+[mtp attn event 0 pos 31] new K vs oracle k_rope 2.26e-03  V 1.72e-03  out vs ref 1.69e-03
+[mtp attn event 3 pos 34] new K vs oracle k_rope 2.41e-03  V 1.78e-03  out vs ref 1.75e-03
+[graph bf16] one captured graph, pos0 in 1..4088: graph-vs-eager worst rel 0.0e+00
+[graph fp8] one captured graph, pos0 in 1..4088: graph-vs-eager worst rel 0.0e+00
+ALL PASSED

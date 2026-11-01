@@ -1,0 +1,38 @@
+{
+ "title": "swift-mk decode throughput",
+ "unit": "tok/s",
+ "target": "Swift-1.5-Qwen3.8-27B-INT4 on one RTX 3090: greedy decode of the K11 engine as the server ships it (MTP chain k=3 + prompt-lookup tail, verify T<=8), harness-decided",
+ "code_dir": "",
+ "share": [],
+ "gitignore": ["__pycache__/", "*.pyc", "build/", "build_*/", "*.o", "*.so", "*.npz", "*.nsys-rep", "*.ncu-rep"],
+ "lock": "gpu",
+ "cleanup": "pkill -f 'swift-campaign/adapter/[m]etric.py' || true",
+ "cleanup_wait": 3,
+ "timeout": 1500,
+ "baseline_dev_runs": 3,
+ "baseline_held_runs": 2,
+ "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "TOKENIZERS_PARALLELISM": "false"},
+ "path_prepend": ["/usr/local/cuda/bin"],
+ "primary": "main",
+ "guards": {"main": ["plain"]},
+ "forbidden": [],
+ "gate": {"keep": 1.005, "held_min": 0.99, "drift_max": 0.01, "guard_min": 0.99},
+ "task": "task.md",
+ "brief": "templates/brief.md",
+ "metrics": {
+  "main": {
+   "label": "greedy MTP k=3 + prompt-lookup tail decode (K11, verify T<=8), geomean tok/s over code / prose / math / 8K-context + 2 copy-heavy prompts",
+   "dev":  "$HOME/llm-lab/venv/bin/python {root}/adapter/metric.py dev {tree} {out}",
+   "try":  "$HOME/llm-lab/venv/bin/python {root}/adapter/metric.py dev {tree} {out} {extra}",
+   "held": "$HOME/llm-lab/venv/bin/python {root}/adapter/metric.py held {tree} {out}",
+   "check":   "$HOME/llm-lab/venv/bin/python {root}/adapter/check.py {result} {tree} {out}",
+   "compare": "$HOME/llm-lab/venv/bin/python {root}/adapter/compare.py {a} {b} {out}",
+   "compare_min": 0.7,
+   "compare_margin": 0.03
+  },
+  "plain": {
+   "label": "plain greedy decode (k=0, tmax=8 engine), geomean tok/s at short and 8K context (guard: must not regress)",
+   "dev": "$HOME/llm-lab/venv/bin/python {root}/adapter/metric.py plain {tree} {out}"
+  }
+ }
+}

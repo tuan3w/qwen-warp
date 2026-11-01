@@ -1,0 +1,42 @@
+W1101 06:43:10.459000 2346030 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 06:43:10.476000 2346030 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+suite e6, 32 tasks, modes ['base', 'pld', 'adapt'], reps 3, T=0.0, tail gate m=3 Lt=4 adapt [0.2, 0.3, 8.0, 64.0], build build/k11
+                a1 n= 768 | base  186.0 tok/s E 3.98 | pld  326.0 tok/s E 7.67 | adapt  326.3 tok/s E 7.67
+                a2 n= 768 | base  185.3 tok/s E 3.96 | pld  325.3 tok/s E 7.73 | adapt  325.3 tok/s E 7.73
+                a3 n= 768 | base  182.0 tok/s E 3.92 | pld  323.0 tok/s E 7.69 | adapt  322.9 tok/s E 7.69
+                a4 n= 336 | base  146.6 tok/s E 3.14 | pld  156.1 tok/s E 3.43 | adapt  156.1 tok/s E 3.43
+                a5 n= 768 | base  149.9 tok/s E 3.18 | pld  182.7 tok/s E 4.06 | adapt  155.6 tok/s E 3.41
+                a6 n= 360 | base  173.3 tok/s E 3.72 | pld  202.3 tok/s E 4.60 | adapt  202.4 tok/s E 4.60
+                a7 n= 768 | base  174.2 tok/s E 3.71 | pld  217.0 tok/s E 4.89 | adapt  217.0 tok/s E 4.89
+                a8 n= 768 | base  178.9 tok/s E 3.85 | pld  230.8 tok/s E 5.37 | adapt  230.8 tok/s E 5.37
+                b1 n= 638 | base  185.4 tok/s E 3.98 | pld  293.5 tok/s E 6.87 | adapt  293.7 tok/s E 6.87
+                b2 n= 768 | base  179.7 tok/s E 3.85 | pld  246.0 tok/s E 5.64 | adapt  246.0 tok/s E 5.64
+                b3 n= 768 | base  181.5 tok/s E 3.89 | pld  282.2 tok/s E 6.60 | adapt  282.3 tok/s E 6.60
+                b4 n= 204 | base  140.1 tok/s E 2.99 | pld  142.2 tok/s E 3.08 | adapt  142.0 tok/s E 3.08
+                b5 n= 437 | base  174.6 tok/s E 3.70 | pld  188.8 tok/s E 4.26 | adapt  186.9 tok/s E 4.18
+                b6 n= 729 | base  160.9 tok/s E 3.43 | pld  201.5 tok/s E 4.52 | adapt  201.5 tok/s E 4.52
+                c1 n= 109 | base  184.2 tok/s E 3.89 | pld  202.5 tok/s E 4.67 | adapt  190.8 tok/s E 4.19
+                c2 n= 570 | base  187.8 tok/s E 3.97 | pld  270.8 tok/s E 6.22 | adapt  270.9 tok/s E 6.22
+                c3 n= 768 | base  184.4 tok/s E 3.91 | pld  272.5 tok/s E 6.34 | adapt  272.4 tok/s E 6.34
+                c4 n=  37 | base  154.1 tok/s E 3.27 | pld  199.2 tok/s E 5.00 | adapt  198.9 tok/s E 5.00
+                c5 n=  53 | base  177.6 tok/s E 3.93 | pld  285.6 tok/s E 7.00 | adapt  285.6 tok/s E 7.00
+                c6 n= 595 | base  189.3 tok/s E 4.00 | pld  294.2 tok/s E 6.89 | adapt  294.5 tok/s E 6.89
+                d1 n= 664 | base  106.2 tok/s E 2.25 | pld  104.5 tok/s E 2.25 | adapt  104.8 tok/s E 2.25
+                d2 n= 768 | base  105.5 tok/s E 2.23 | pld  108.7 tok/s E 2.32 | adapt  108.8 tok/s E 2.31
+                d3 n= 708 | base  106.5 tok/s E 2.23 | pld  103.6 tok/s E 2.18 | adapt  103.9 tok/s E 2.18
+                d4 n= 768 | base  110.5 tok/s E 2.31 | pld  106.8 tok/s E 2.24 | adapt  106.7 tok/s E 2.24
+                d5 n= 768 | base  114.9 tok/s E 2.40 | pld  119.4 tok/s E 2.51 | adapt  116.1 tok/s E 2.43
+                d6 n= 768 | base  115.9 tok/s E 2.42 | pld  127.5 tok/s E 2.69 | adapt  119.9 tok/s E 2.52
+                e1 n= 768 | base  163.2 tok/s E 3.42 | pld  174.6 tok/s E 3.74 | adapt  173.3 tok/s E 3.71
+                e2 n= 768 | base  158.4 tok/s E 3.31 | pld  174.5 tok/s E 3.77 | adapt  160.4 tok/s E 3.41
+                e3 n= 768 | base  167.1 tok/s E 3.49 | pld  171.5 tok/s E 3.71 | adapt  171.6 tok/s E 3.71
+                e4 n= 768 | base  161.3 tok/s E 3.36 | pld  172.2 tok/s E 3.70 | adapt  172.2 tok/s E 3.70
+                e5 n= 768 | base  168.6 tok/s E 3.52 | pld  177.5 tok/s E 3.86 | adapt  169.8 tok/s E 3.59
+                e6 n= 768 | base  181.0 tok/s E 3.78 | pld  202.7 tok/s E 4.46 | adapt  202.8 tok/s E 4.46
+
+per class (pooled tokens / pooled time; median over reps):
+class a: base 172.8 tok/s (E 3.70) | pld 240.1 tok/s (E 5.50) x1.389 | adapt 232.3 tok/s (E 5.30) x1.344 | tail cycles 0.63, T hist {4: 1074, 5: 0, 6: 0, 7: 0, 8: 1830}, host wait 22780 us + work 5 us per cycle
+class b: base 173.4 tok/s (E 3.71) | pld 230.5 tok/s (E 5.25) x1.329 | adapt 230.2 tok/s (E 5.24) x1.327 | tail cycles 0.63, T hist {4: 756, 5: 0, 6: 0, 7: 18, 8: 1251}, host wait 22709 us + work 5 us per cycle
+class c: base 185.8 tok/s (E 3.94) | pld 271.5 tok/s (E 6.31) x1.461 | adapt 270.4 tok/s (E 6.27) x1.455 | tail cycles 0.83, T hist {4: 174, 5: 0, 6: 0, 7: 0, 8: 849}, host wait 22949 us + work 5 us per cycle
+class d: base 109.9 tok/s (E 2.30) | pld 111.4 tok/s (E 2.36) x1.014 | adapt 110.0 tok/s (E 2.32) x1.001 | tail cycles 0.07, T hist {4: 5232, 5: 0, 6: 0, 7: 0, 8: 402}, host wait 21105 us + work 3 us per cycle
+class e: base 166.3 tok/s (E 3.48) | pld 178.2 tok/s (E 3.86) x1.072 | adapt 174.1 tok/s (E 3.74) x1.047 | tail cycles 0.32, T hist {4: 2442, 5: 0, 6: 0, 7: 0, 8: 1149}, host wait 21565 us + work 3 us per cycle

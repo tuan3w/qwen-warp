@@ -1,0 +1,226 @@
+[
+ {
+  "id": "a1_rename_full",
+  "cls": "a",
+  "kind": "rename, full file",
+  "n_prompt": 4958,
+  "sha256": "c47244c7626029a2600be9d05c02253f377cb7dff68a55298685c1303b1d56a1"
+ },
+ {
+  "id": "a2_types_full",
+  "cls": "a",
+  "kind": "add type hints, full file",
+  "n_prompt": 3711,
+  "sha256": "19dffff41d5050453185c13f32570298bb3cf0dc6916d135b6f963c0678fe903"
+ },
+ {
+  "id": "a3_logging_full",
+  "cls": "a",
+  "kind": "add logging, full file",
+  "n_prompt": 5565,
+  "sha256": "4aebd46001043c153900b1533f1dfa8c3f4488dad1059c6cf950f91c022840b6"
+ },
+ {
+  "id": "a4_bug_diff",
+  "cls": "a",
+  "kind": "injected bug, unified diff",
+  "n_prompt": 4360,
+  "sha256": "d8a57436283eddecb07748779f41746285de7cdc749f3eeac54e2ed607050043"
+ },
+ {
+  "id": "a5_bug_func",
+  "cls": "a",
+  "kind": "injected bug, corrected function",
+  "n_prompt": 3420,
+  "sha256": "6ed2359ee00fbc7e732b9f88d56b684025ce7c31436c7fa3d397e7605f345455"
+ },
+ {
+  "id": "a6_rename_diff",
+  "cls": "a",
+  "kind": "rename, unified diff",
+  "n_prompt": 5298,
+  "sha256": "5a3455d2788426da112ad474e704426d7befcbe41c87513b61094b8713189bb3"
+ },
+ {
+  "id": "a7_validate_funcs",
+  "cls": "a",
+  "kind": "validation + docstrings, two methods",
+  "n_prompt": 3614,
+  "sha256": "2a017858a2987b674a1ada41bba5dd8cdd6b8d22c308126b9ee723194df90b48"
+ },
+ {
+  "id": "a8_refactor_cfg",
+  "cls": "a",
+  "kind": "refactor into dataclass + call sites",
+  "n_prompt": 5645,
+  "sha256": "fdd209439a302bce637c5e130ae9b4edb6438febf8d4c3d29945900fbd634ebd"
+ },
+ {
+  "id": "b1_gitlog_table",
+  "cls": "b",
+  "kind": "git log --stat -> table",
+  "n_prompt": 4226,
+  "sha256": "2d1b72f727e4f77ccc6c1bc234788ca09d9a9a31805360f2b1ee5a286e10dabe"
+ },
+ {
+  "id": "b2_ptxas_table",
+  "cls": "b",
+  "kind": "nvcc/ptxas log -> table",
+  "n_prompt": 4261,
+  "sha256": "4776d2da4729af7265925534e2a0a93ace603e28177a640052b557fb7f856cb6"
+ },
+ {
+  "id": "b3_check_filter",
+  "cls": "b",
+  "kind": "numerical check log -> filtered list",
+  "n_prompt": 4242,
+  "sha256": "c392c9fe72398cdc78e77a8210188d5929c798a385c3d7196474282b46931cc3"
+ },
+ {
+  "id": "b4_harness_log",
+  "cls": "b",
+  "kind": "traceback / run log -> errors",
+  "n_prompt": 4262,
+  "sha256": "8cc3b9d014b19596fd13db1e0a9de68750f47781b9c17cdcb1a0e60d2cd4d92e"
+ },
+ {
+  "id": "b5_parity_table",
+  "cls": "b",
+  "kind": "test output -> table",
+  "n_prompt": 2448,
+  "sha256": "67bf528ab3f719908ddc6ff5d6d6b82bd074ea9ee0959705a009743821e1273b"
+ },
+ {
+  "id": "b6_prefill_parity",
+  "cls": "b",
+  "kind": "parity log -> table",
+  "n_prompt": 4365,
+  "sha256": "2292bc68b8d7ff22146562997289013b38f18c503976bc0fd2ec66bade238f9e"
+ },
+ {
+  "id": "c1_rename_edits",
+  "cls": "c",
+  "kind": "grep hits -> one edit_file call per hit",
+  "n_prompt": 1679,
+  "sha256": "e02b66d1e841d3fa05c10d499f9387f18e4e0411daab2790ae5277e7c99f607a"
+ },
+ {
+  "id": "c2_write_script",
+  "cls": "c",
+  "kind": "ls -R -> write_file shell script",
+  "n_prompt": 1736,
+  "sha256": "d3e79e6c43e650ca89f7f410a9b33ab8b242cbce1ef0a56868ecfaa4eab0477f"
+ },
+ {
+  "id": "c3_edit_anchor",
+  "cls": "c",
+  "kind": "read_file -> edit_file with quoted anchors",
+  "n_prompt": 3457,
+  "sha256": "4f28e1f801e0cbfdc7966ce0c2bdc8310c5ba4c6c41f1b503797baead2c27eb1"
+ },
+ {
+  "id": "c4_git_commit",
+  "cls": "c",
+  "kind": "git diff -> git add + commit command",
+  "n_prompt": 3744,
+  "sha256": "bf05c13b6a2d8f1aa23095d229442c478df42f84567a918ebc92cc06ee93c5f2"
+ },
+ {
+  "id": "c5_write_todo",
+  "cls": "c",
+  "kind": "grep TODO -> write_file report",
+  "n_prompt": 1288,
+  "sha256": "3a5582c076bda8844406742935458359ff604969246538a733d7927e644fd663"
+ },
+ {
+  "id": "c6_parallel_reads",
+  "cls": "c",
+  "kind": "find + read -> parallel read_file / bash calls",
+  "n_prompt": 1328,
+  "sha256": "c34bbdc7a3552851001525abb63ceab11d02ea338c129feb2f5b451032001bae"
+ },
+ {
+  "id": "d1_doc_oped",
+  "cls": "d",
+  "kind": "long doc + opinion piece",
+  "n_prompt": 3192,
+  "sha256": "b30fd489d960c4c4451668494fc98a0603865b908ddcbe46e4dfcd5878fea699"
+ },
+ {
+  "id": "d2_doc_dialogue",
+  "cls": "d",
+  "kind": "long doc + dialogue",
+  "n_prompt": 2147,
+  "sha256": "6704eda1682d09df393e81f769a5b17a81304493f1f5a7ba670457fe64fbd5ba"
+ },
+ {
+  "id": "d3_story",
+  "cls": "d",
+  "kind": "short story",
+  "n_prompt": 42,
+  "sha256": "84da4486b9094b043dc9fd67d4d16f7e5d0fc934a4d81da18ab99dfaf6824de0"
+ },
+ {
+  "id": "d4_itinerary",
+  "cls": "d",
+  "kind": "travel advice",
+  "n_prompt": 59,
+  "sha256": "5bc9c28b785baa795f218f2141923d3f598f93916f4e33a65b8c3727eb22ff12"
+ },
+ {
+  "id": "d5_explain",
+  "cls": "d",
+  "kind": "explanation",
+  "n_prompt": 49,
+  "sha256": "8d5c76be855caa390172b664cdf058f2fc566b558d733b2a4ff33b75af3e479f"
+ },
+ {
+  "id": "d6_advice",
+  "cls": "d",
+  "kind": "advice / QA",
+  "n_prompt": 55,
+  "sha256": "cc7bf7d8715cfcfd665903ec738d6f5e5bf572f4a71e0d32e060d5f8df6175f5"
+ },
+ {
+  "id": "e1_odd_sum",
+  "cls": "e",
+  "kind": "proof",
+  "n_prompt": 37,
+  "sha256": "ac956d15d4123d7cfafffa8d94285283d9a155055390e5270afb3d3119b322db"
+ },
+ {
+  "id": "e2_counting",
+  "cls": "e",
+  "kind": "combinatorics",
+  "n_prompt": 67,
+  "sha256": "d61ca2e85b70440973173669bc0e564d9090a300bf152b7b695789210dee7d6f"
+ },
+ {
+  "id": "e3_probability",
+  "cls": "e",
+  "kind": "probability",
+  "n_prompt": 75,
+  "sha256": "490337023d5923dc0478f453cf3ed71259603080851aabfad472184be552657b"
+ },
+ {
+  "id": "e4_recurrence",
+  "cls": "e",
+  "kind": "algorithm analysis",
+  "n_prompt": 82,
+  "sha256": "2aa3a4d06721979a9e1994f460f283a3a5797ca90e86d3207d556ed0506c8b4e"
+ },
+ {
+  "id": "e5_physics",
+  "cls": "e",
+  "kind": "physics word problem",
+  "n_prompt": 98,
+  "sha256": "993ed93fc8c47a1526d1be06289b9574ed01716a3f9e6407a7f595bee6a3cb51"
+ },
+ {
+  "id": "e6_linear",
+  "cls": "e",
+  "kind": "linear algebra",
+  "n_prompt": 77,
+  "sha256": "1f932b1bf320a32cabfaec4ffa46bd9974863785e956923cf443b4b351429d33"
+ }
+]

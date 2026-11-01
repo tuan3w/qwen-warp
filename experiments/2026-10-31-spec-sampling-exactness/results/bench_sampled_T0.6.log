@@ -1,0 +1,5 @@
+engine+MTP ready; sampling {'temperature': 0.6, 'top_k': 20, 'top_p': 0.95, 'draft_sample': 1, 'draft_temperature': 0.0, 'draft_top_k': 0, 'draft_top_p': 0.0, 'seed': 1}; prompts code:32, prose:34, math:33, long8k:8030
+code   k=3:  142.0 tok/s (reps [142.0, 142.2, 142.0])  tokens/cycle 3.28 pos-acc 0.86/0.75/0.68  ms: cycle 23.13 verify 21.60 catchup 0.32 drafts 1.29  sampling kernels: target rows 0.036 drafts 0.069
+prose  k=3:   88.8 tok/s (reps [88.9, 88.8, 88.7])  tokens/cycle 2.06 pos-acc 0.64/0.31/0.11  ms: cycle 23.26 verify 21.56 catchup 0.32 drafts 1.30  sampling kernels: target rows 0.042 drafts 0.070
+math   k=3:  144.1 tok/s (reps [144.2, 144.1, 144.1])  tokens/cycle 3.34 pos-acc 0.90/0.80/0.64  ms: cycle 23.22 verify 21.61 catchup 0.32 drafts 1.29  sampling kernels: target rows 0.038 drafts 0.052
+long8k k=3:  121.8 tok/s (reps [121.8])  tokens/cycle 2.92 pos-acc 0.83/0.63/0.46  ms: cycle 23.87 verify 22.37 catchup 0.36 drafts 1.38  sampling kernels: target rows 0.040 drafts 0.070

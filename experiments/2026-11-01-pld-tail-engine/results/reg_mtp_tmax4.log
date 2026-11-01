@@ -1,0 +1,25 @@
+- eos math: token 16 first at 10; spec stops with 11 tokens, prefix EQUAL
+### 4 speculative greedy == plain greedy (128 tokens)
+- greedy code k=1: EQUAL (128 tokens); mean tokens/cycle 1.97, natural accepted-drafts histogram m=0..3 [2, 70, 0, 0] (1.5s)
+- greedy code k=2: EQUAL (128 tokens); mean tokens/cycle 2.88, natural accepted-drafts histogram m=0..3 [2, 2, 44, 0] (1.1s)
+- greedy code k=3: EQUAL (128 tokens); mean tokens/cycle 3.65, natural accepted-drafts histogram m=0..3 [2, 2, 4, 32] (1.0s)
+- greedy prose k=1: NEAR-TIE divergence (accepted) at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.65, natural accepted-drafts histogram m=0..3 [28, 52, 0, 0] (2.4s)
+- greedy prose k=2: EQUAL (128 tokens); mean tokens/cycle 2.00, natural accepted-drafts histogram m=0..3 [25, 22, 25, 0] (1.6s)
+- greedy prose k=3: NEAR-TIE divergence (accepted) at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 2.06, natural accepted-drafts histogram m=0..3 [26, 16, 14, 8] (2.2s)
+- greedy math k=1: EQUAL (128 tokens); mean tokens/cycle 1.90, natural accepted-drafts histogram m=0..3 [7, 65, 0, 0] (1.5s)
+- greedy math k=2: EQUAL (128 tokens); mean tokens/cycle 2.67, natural accepted-drafts histogram m=0..3 [4, 8, 36, 0] (1.1s)
+- greedy math k=3: EQUAL (128 tokens); mean tokens/cycle 3.23, natural accepted-drafts histogram m=0..3 [2, 10, 5, 23] (1.0s)
+### 5 forced partial acceptance (rollback)
+force pattern [1]
+- rollback[1] code k=3: EQUAL (128 tokens); mean tokens/cycle 1.00, natural accepted-drafts histogram m=0..3 [3, 9, 12, 104] (2.8s)
+- rollback[1] prose k=3: NEAR-TIE divergence (accepted) at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.00, natural accepted-drafts histogram m=0..3 [38, 38, 29, 23] (3.5s)
+- rollback[1] math k=3: EQUAL (128 tokens); mean tokens/cycle 1.00, natural accepted-drafts histogram m=0..3 [10, 16, 22, 80] (2.9s)
+force pattern [2, 1, 3]
+- rollback[2, 1, 3] code k=3: EQUAL (128 tokens); mean tokens/cycle 1.97, natural accepted-drafts histogram m=0..3 [3, 3, 6, 60] (1.7s)
+- rollback[2, 1, 3] prose k=3: NEAR-TIE divergence (accepted) at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.56, natural accepted-drafts histogram m=0..3 [28, 25, 19, 16] (2.7s)
+- rollback[2, 1, 3] math k=3: EQUAL (128 tokens); mean tokens/cycle 1.88, natural accepted-drafts histogram m=0..3 [4, 11, 11, 46] (1.7s)
+force pattern [1, 4, 2, 3, 1]
+- rollback[1, 4, 2, 3, 1] code k=3: EQUAL (128 tokens); mean tokens/cycle 2.11, natural accepted-drafts histogram m=0..3 [1, 4, 6, 53] (1.5s)
+- rollback[1, 4, 2, 3, 1] prose k=3: NEAR-TIE divergence (accepted) at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.61, natural accepted-drafts histogram m=0..3 [25, 20, 22, 13] (2.5s)
+- rollback[1, 4, 2, 3, 1] math k=3: EQUAL (128 tokens); mean tokens/cycle 2.09, natural accepted-drafts histogram m=0..3 [4, 9, 12, 39] (1.5s)
+RESULT: drafts=OK eos=OK greedy=OK rollback=OK

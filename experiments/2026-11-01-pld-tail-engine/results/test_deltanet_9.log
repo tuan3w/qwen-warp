@@ -1,0 +1,25 @@
+  ok   y vs ORACLE taps gated_norm_out (fp32 inputs, loose)       max|err|/max|ref| = 5.205e-03 (tol 3.0e-02)
+[equiv] layer 2 dump math: T=8 vs 8x T=1 (cur0=3, wraps)
+  ok   y equal                                                    max|err|/max|ref| = 0.000e+00 (tol 0.0e+00)
+  ok   all 9 state slots equal                                    max|err|/max|ref| = 0.000e+00 (tol 0.0e+00)
+  ok   all 9 conv slots equal                                     max|err|/max|ref| = 0.000e+00 (tol 0.0e+00)
+[chain] layer 2 dump code: T=4/3/2 steps with partial acceptance, start cur=4
+  ok   T=8 accept 3: cur->7; max err y/states                     max|err|/max|ref| = 2.065e-03 (tol 6.0e-03)
+  ok   T=5 accept 5: cur->3; max err y/states                     max|err|/max|ref| = 2.065e-03 (tol 6.0e-03)
+  ok   T=7 accept 1: cur->4; max err y/states                     max|err|/max|ref| = 1.803e-03 (tol 6.0e-03)
+  ok   T=6 accept 2: cur->6; max err y/states                     max|err|/max|ref| = 1.875e-03 (tol 6.0e-03)
+  ok   T=8 accept 8: cur->5; max err y/states                     max|err|/max|ref| = 1.793e-03 (tol 6.0e-03)
+  ok   T=4 accept 2: cur->7; max err y/states                     max|err|/max|ref| = 1.867e-03 (tol 6.0e-03)
+  ok   committed state == ref after all accepted                  max|err|/max|ref| = 9.874e-08 (tol 2.0e-05)
+  ok   committed conv == ref                                      max|err|/max|ref| = 0.000e+00 (tol 0.0e+00)
+[random:scale3]
+  ok   y                                                          max|err|/max|ref| = 1.980e-03 (tol 6.0e-03)
+  ok   last state                                                 max|err|/max|ref| = 3.017e-07 (tol 2.0e-05)
+[random:softplus>20]
+  ok   y                                                          max|err|/max|ref| = 1.683e-03 (tol 6.0e-03)
+  ok   last state                                                 max|err|/max|ref| = 3.481e-07 (tol 2.0e-05)
+[random:b extreme]
+  ok   y                                                          max|err|/max|ref| = 2.426e-03 (tol 6.0e-03)
+  ok   last state                                                 max|err|/max|ref| = 4.371e-07 (tol 2.0e-05)
+
+ALL PASS

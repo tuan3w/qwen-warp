@@ -1,0 +1,67 @@
+{
+ "by_kind": {
+  ".md": {
+   "files": 3904,
+   "bytes": 25000090,
+   "tokens": 6824156
+  },
+  ".cu": {
+   "files": 172,
+   "bytes": 6009297,
+   "tokens": 2130392
+  },
+  ".py": {
+   "files": 3543,
+   "bytes": 40000052,
+   "tokens": 10313192
+  },
+  ".cuh": {
+   "files": 223,
+   "bytes": 2347799,
+   "tokens": 788858
+  },
+  ".h": {
+   "files": 472,
+   "bytes": 3537888,
+   "tokens": 1437946
+  },
+  ".ts": {
+   "files": 1615,
+   "bytes": 10040080,
+   "tokens": 2811869
+  },
+  ".c": {
+   "files": 63,
+   "bytes": 2044284,
+   "tokens": 774279
+  },
+  ".cpp": {
+   "files": 367,
+   "bytes": 8001329,
+   "tokens": 2401963
+  },
+  ".go": {
+   "files": 1,
+   "bytes": 772,
+   "tokens": 236
+  },
+  ".rs": {
+   "files": 651,
+   "bytes": 10010050,
+   "tokens": 2435690
+  },
+  "topics.md": {
+   "files": 10,
+   "bytes": 191208,
+   "tokens": 53469
+  }
+ },
+ "total_tokens": 29972050,
+ "distinct_tokens_seen": 68340,
+ "coverage_of_corpus_by_top_V": {
+  "8192": 0.9087,
+  "16384": 0.9622,
+  "32768": 0.9922,
+  "65536": 0.9999
+ }
+}

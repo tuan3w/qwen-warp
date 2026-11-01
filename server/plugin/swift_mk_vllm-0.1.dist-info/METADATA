@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: swift-mk-vllm
+Version: 0.1
+Summary: vLLM plugin: run the swift-mk CUDA-graph engine behind vllm serve (VLLM_SWIFT_MK=1)

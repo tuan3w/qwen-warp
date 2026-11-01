@@ -1,0 +1,15 @@
+### e2e-ref
+  packed layer 7 (1.3s)
+  packed layer 15 (1.5s)
+  packed layer 23 (1.8s)
+  packed layer 31 (2.0s)
+  packed layer 39 (2.2s)
+  packed layer 47 (2.4s)
+  packed layer 55 (2.6s)
+  packed layer 63 (2.9s)
+weights loaded in 2.9s; cuda mem 17.17 GiB
+MTP packed (int4clip, head int4, nv=65536): layer+fc 209 MiB, draft head 165 MiB
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+wrote <repo>/experiments/2026-10-31-lm-head-quant-engine/results/sampling/e2e_ref_A.json  (top-1 token mass p1 0.336, support 16; TV(T=1 step, T=4-row step) of p1 = 0.0071)
+ALL OK: True

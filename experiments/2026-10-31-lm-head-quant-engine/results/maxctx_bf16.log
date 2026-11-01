@@ -1,0 +1,2 @@
+OK ctx 40960 kv bf16: used 23.18 GiB of 23.56 (before the engine: 0.91); 40448-token prompt prefill 22.3 s = 1811 tok/s
+OK ctx 81920 kv fp8: used 23.49 GiB of 23.56 (before the engine: 0.91); 81408-token prompt prefill 52.5 s = 1549 tok/s

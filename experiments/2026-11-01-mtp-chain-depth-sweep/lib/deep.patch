@@ -1,0 +1,410 @@
+diff -r lib.orig/include/mtp.h lib/include/mtp.h
+--- lib.orig/include/mtp.h	2026-11-01 18:28:43.067017197 +0700
++++ lib/include/mtp.h	2026-11-01 18:30:19.531733770 +0700
+@@ -18,6 +18,7 @@
+ 
+ #define SMK_SPEC_KMAX 3     // MTP chain drafts
+ #define SMK_SPEC_PMAX 7     // K11: chain + prompt-lookup tail: verify rows 1 + k <= 8 (needs an engine with tmax = 8 for k > 3)
++#define SMK_DEEP_KC 7        // experiment mtp-chain-depth-sweep: chain depth (kc) and verify width (kv) up to 7 drafts
+ #define SMK_SPEC_RING 4096   // device output ring (tokens); the host must fetch at least every RING/2 tokens
+ #define SMK_SPEC_SS_N 64     // host-visible device state ints (see smk_spec_run)
+ 
+diff -r lib.orig/src/mtp.cu lib/src/mtp.cu
+--- lib.orig/src/mtp.cu	2026-11-01 18:28:43.067129638 +0700
++++ lib/src/mtp.cu	2026-11-01 21:18:30.191188135 +0700
+@@ -39,6 +39,18 @@
+   smk_pld* pld = nullptr;
+   int pld_on = 0, pld_seq = 0,  pld_d[SMK_SPEC_KMAX] = {};
+   smk_pld_opts opts = {};
++  // deep chain (experiment mtp-chain-depth-sweep): graphs [samp][which][kc][kv], confidence buffer, result mailbox, cycle log
++  cudaGraphExec_t g_deep[2][4][SMK_DEEP_KC + 1][SMK_DEEP_KC + 1] = {}, g_dstart[2][SMK_DEEP_KC + 1] = {};
++  float* cf = nullptr;            // device [16]: raw max softmax prob of the draft head (0..7), max prob of the processed proposal q (8..15), per chain depth j-1
++  int* nch_dev = nullptr;         // device scalar: chain drafts of the current cycle's verify rows (the rest are delta tail proposals)
++  struct DeepRes* dres = nullptr; // mapped mailbox
++  struct DeepRes* dres_dev = nullptr;
++  int dp_seq = 0, dp_nd = 0, dp_d[SMK_DEEP_KC] = {};
++  float dp_conf[16] = {};
++  std::vector<int> dlog_i;        // per cycle: a, nch, ln, nd (drafts available), kc_next, cycles tail-priority flag
++  std::vector<float> dlog_f;      // per cycle: the 16 confidences of the drafts used
++  float dp_ema = 3.0f;            // adapt_mode 3: EMA (alpha 0.6) of the accepted chain drafts of the previous cycles
++  long long dp_stat[8] = {};      // [0] host wait ns, [1] host work ns
+   long long pld_stat[16] = {};    // [0..7] cycles by k (index k), [8] tail tokens proposed, [9] tail cycles, [10] host wait ns, [11] host work ns (lookup + launch)
+   // test snapshot (smk_spec_snapshot / restore)
+   float* snap_dn = nullptr;
+@@ -128,6 +140,73 @@
+   }
+ }
+ 
++// deep-chain mailbox: emitted tokens, the new chain drafts d1..d7 and their confidences
++struct DeepRes {
++  volatile int seq;
++  int a;
++  int y[8];
++  int d[SMK_DEEP_KC];
++  float conf[16];
++  int pad;
++};
++__global__ void k_deep_report(const int* ds, int* ss, const float* cf, DeepRes* res) {
++  const int l = threadIdx.x;
++  const int a = ss[SS_A];
++  if (l < 8) res->y[l] = l < a ? ss[SS_MTOK + l] : -1;
++  if (l < SMK_DEEP_KC) res->d[l] = ds[DS_TOK + 1 + l];
++  if (l < 16) res->conf[l] = cf[l];
++  if (l == 0) res->a = a;
++  __threadfence_system();
++  __syncwarp();
++  if (l == 0) {
++    const int sq = ss[SS_PLDSEQ] + 1;
++    ss[SS_PLDSEQ] = sq;
++    res->seq = sq;
++    __threadfence_system();
++  }
++}
++// confidence of draft j (cf index j-1): raw softmax max-prob of the restricted-head logits (= 1 / sum exp(l - max)); cf[8 + j-1] = max prob of the processed proposal q (sampling) or the same value (greedy)
++__global__ void __launch_bounds__(1024) k_conf(const float* __restrict__ lg, int n, int j, const Dist* __restrict__ q, float* __restrict__ cf) {
++  __shared__ float red[32];
++  const int t = threadIdx.x;
++  float m = -3.0e38f;
++  for (int i = t; i < n; i += 1024) m = fmaxf(m, lg[i]);
++  m = warp_max(m);
++  if ((t & 31) == 0) red[t >> 5] = m;
++  __syncthreads();
++  if (t < 32) {
++    float v = red[t];
++    v = warp_max(v);
++    if (t == 0) red[0] = v;
++  }
++  __syncthreads();
++  const float M = red[0];
++  __syncthreads();
++  float sum = 0.f;
++  for (int i = t; i < n; i += 1024) sum += __expf(lg[i] - M);
++  sum = warp_sum(sum);
++  if ((t & 31) == 0) red[t >> 5] = sum;
++  __syncthreads();
++  if (t == 0) {
++    float tot = 0.f;
++    for (int i = 0; i < 32; i++) tot += red[i];
++    cf[j] = 1.0f / tot;
++    cf[8 + j] = q ? q->p[0] : 1.0f / tot;
++  }
++}
++// sampling, verify width kv with nch chain drafts: proposals t >= nch (the tail tokens) are deltas at their token
++__global__ void k_delta_q_dev(const int* toks, Dist* qd, const int* nch) {
++  const int t = blockIdx.x;
++  if (t < nch[0]) return;
++  Dist* o = qd + t;
++  const int i = threadIdx.x;
++  if (i == 0) o->n = 1;
++  if (i < SK_KMAX) {
++    o->ids[i] = i == 0 ? toks[t] : -1;
++    o->p[i] = i == 0 ? 1.f : 0.f;
++  }
++}
++
+ // Greedy acceptance + all device-side bookkeeping.  Rows: token d[t] = ds[TOK+t] (d[0] = anchor), argmax y[t] = ds[OUT+t].
+ __global__ void k_accept(int* ds, int* ss, int* ring, int k) {
+   int m = 0;
+@@ -140,8 +219,7 @@
+   ss[SS_A] = 1;
+   ss[SS_AM1] = 0;
+   ss[SS_DPOS] = ds[DS_POS] - 1;
+-  ss[SS_DPOS + 1] = ds[DS_POS];
+-  ss[SS_DPOS + 2] = ds[DS_POS] + 1;
++  for (int j = 1; j <= 8; j++) ss[SS_DPOS + j] = ds[DS_POS] + j - 1;  // deep chain
+   ss[SS_MTOK] = ds[DS_OUT];
+ }
+ 
+@@ -183,7 +261,7 @@
+ }
+ 
+ // draft j (1-based) = argmax of the draft head applied to hr[j-1]  -> ds[TOK + j];  samp: token sampled from q (top-k/top-p of the head logits; q kept in qd[j-1])
+-static cudaError_t mtp_head(smk_spec* s, int j, bool samp, cudaStream_t st) {
++static cudaError_t mtp_head(smk_spec* s, int j, bool samp, cudaStream_t st, bool conf = false) {
+   smk_engine* e = s->e;
+   const void* x = s->hr + (size_t)(j - 1) * H;
+   int* dst = e->ds + DS_TOK + j;
+@@ -193,6 +271,7 @@
+     ep.kind = SMK_EPI_F32; ep.out[0] = s->lg;
+     CKS(smk_w4_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
+     CKS(sk_topk(s->lg, 1, s->w.head_nv, s->w.head_nv, s->w.head_ids, s->sp, 1, s->ws_d, s->qd + (j - 1), st));
++    if (conf) { k_conf<<<1, 1024, 0, st>>>(s->lg, s->w.head_nv, j - 1, s->qd + (j - 1), s->cf); CKS(cudaGetLastError()); }
+     return sk_draft_pick(s->qd + (j - 1), s->sp, s->ss, j, dst, st);
+   }
+   if (s->head_mode == 1) {
+@@ -202,18 +281,19 @@
+   smk_epi ep = {};
+   ep.kind = SMK_EPI_F32; ep.out[0] = s->lg;
+   CKS(smk_w4_gemv(s->w.head_w, s->w.head_s, x, s->w.head_nv, H, 1, &ep, st));
++  if (conf) { k_conf<<<1, 1024, 0, st>>>(s->lg, s->w.head_nv, j - 1, nullptr, s->cf); CKS(cudaGetLastError()); }
+   CKS(smk_argmax(s->lg, 1, s->w.head_nv, s->ss + SS_IDX, nullptr, e->ws_am, st));
+   k_map_draft<<<1, 1, 0, st>>>(s->ss + SS_IDX, s->w.head_ids, dst);
+   return cudaGetLastError();
+ }
+ 
+ // Catch-up of Tcu rows (hidden from the engine's final-norm tap, tokens ss[MTOK], a = ss[A] valid) + ndraft drafts.
+-static cudaError_t mtp_stage(smk_spec* s, int Tcu, int ndraft, bool kv_only, bool samp, cudaStream_t st) {
++static cudaError_t mtp_stage(smk_spec* s, int Tcu, int ndraft, bool kv_only, bool samp, cudaStream_t st, bool conf = false) {
+   smk_engine* e = s->e;
+   const void* hid = e->dbg + (size_t)(NLAYER + 1) * TM * H;
+   CKS(mtp_layer(s, Tcu, hid, s->ss + SS_MTOK, s->ss + SS_DPOS, s->ss + SS_AM1, s->hr, kv_only, st));
+   for (int j = 1; j <= ndraft; j++) {
+-    CKS(mtp_head(s, j, samp, st));
++    CKS(mtp_head(s, j, samp, st, conf));
+     if (j < ndraft) CKS(mtp_layer(s, 1, s->hr + (size_t)(j - 1) * H, e->ds + DS_TOK + j, s->ss + SS_DPOS + j, s->ss + SS_ZERO, s->hr + (size_t)j * H, false, st));
+   }
+   return cudaSuccess;
+@@ -232,6 +312,10 @@
+   for (int m = 0; m < 2; m++)
+     for (auto* arr : {s->g_cycle[m], s->g_verify[m], s->g_stage[m], s->g_cu[m], s->g_start[m], s->g_pld[m]})
+       for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
++  for (int m = 0; m < 2; m++) {
++    for (int w = 0; w < 4; w++) for (int a = 0; a <= SMK_DEEP_KC; a++) for (int b = 0; b <= SMK_DEEP_KC; b++) if (s->g_deep[m][w][a][b]) { cudaGraphExecDestroy(s->g_deep[m][w][a][b]); s->g_deep[m][w][a][b] = nullptr; }
++    for (int a = 0; a <= SMK_DEEP_KC; a++) if (s->g_dstart[m][a]) { cudaGraphExecDestroy(s->g_dstart[m][a]); s->g_dstart[m][a] = nullptr; }
++  }
+   for (auto* arr : {s->g_smp_t, s->g_smp_d})
+     for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
+   for (int i = 0; i <= TM; i++) if (s->g_prefill[i]) { cudaGraphExecDestroy(s->g_prefill[i]); s->g_prefill[i] = nullptr; }
+@@ -272,6 +356,10 @@
+   s->qd = (Dist*)dalloc(e, sizeof(Dist) * SMK_SPEC_PMAX, true);
+   s->ws_t = (uint64_t*)dalloc(e, sizeof(uint64_t) * SK_WS_ENTRIES, true);
+   s->ws_d = (uint64_t*)dalloc(e, sizeof(uint64_t) * SK_WS_ENTRIES, true);
++  s->cf = (float*)dalloc(e, 16 * sizeof(float), true);
++  s->nch_dev = (int*)dalloc(e, 8 * sizeof(int), true);
++  if (cudaHostAlloc((void**)&s->dres, sizeof(DeepRes), cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer((void**)&s->dres_dev, s->dres, 0) != cudaSuccess) { smk_spec_destroy(s); return nullptr; }
++  memset((void*)s->dres, 0, sizeof(DeepRes));
+   if (cudaHostAlloc((void**)&s->res, sizeof(PldRes), cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer((void**)&s->res_dev, s->res, 0) != cudaSuccess) { smk_spec_destroy(s); return nullptr; }
+   memset((void*)s->res, 0, sizeof(PldRes));
+   cudaMallocHost((void**)&s->pin_tail, 8 * sizeof(int));
+@@ -293,6 +381,7 @@
+   if (s->draw_buf) cudaFree(s->draw_buf);
+   if (s->pinned_ss) cudaFreeHost(s->pinned_ss);
+   if (s->res) cudaFreeHost((void*)s->res);
++  if (s->dres) cudaFreeHost((void*)s->dres);
+   if (s->pin_tail) cudaFreeHost(s->pin_tail);
+   if (s->pld) smk_pld_destroy(s->pld);
+   if (s->pinned_ring) cudaFreeHost(s->pinned_ring);
+@@ -499,6 +588,210 @@
+ // MTP layer KV cache (bf16 [2][4][ctx_max][256]); used by the fast prefill (prefill.cu) to commit prompt pairs.
+ void* smk_spec_kv_ptr(smk_spec* s) { return s->kvbuf; }
+ 
++
++// ---------------------------------------------------------------------------------------------- deep chain (experiment mtp-chain-depth-sweep)
++// verify width kv (T = kv + 1 rows: anchor, nch chain drafts, kv - nch tail tokens), accept, MTP catch-up of kv + 1 rows, kc chain drafts (+ confidence), mailbox report
++static cudaError_t deep_verify_accept(smk_spec* s, int kv, bool samp, cudaStream_t c) {
++  smk_engine* e = s->e;
++  CKS(smk_run_step(e, 1 + kv, 1, 1, c, samp));
++  if (!samp) {
++    k_accept<<<1, 1, 0, c>>>(e->ds, s->ss, s->ring, kv);
++    return cudaGetLastError();
++  }
++  CKS(sk_topk(e->logits, 1 + kv, VOC, VOC, nullptr, s->sp, 0, s->ws_t, s->pd, c));
++  if (kv > 0) { k_delta_q_dev<<<kv, SK_KMAX, 0, c>>>(e->ds + DS_TOK + 1, s->qd, s->nch_dev); CKS(cudaGetLastError()); }
++  return sk_accept(e->ds, s->ss, s->ring, kv, s->pd, s->qd, s->sp, c);
++}
++// which: 0 full cycle, 1 verify + accept, 2 MTP stage (catch-up kv + 1 rows + kc drafts + conf), 3 full cycle without the confidence kernels' mailbox report
++static cudaError_t deep_part(smk_spec* s, int kc, int kv, int which, bool samp, cudaStream_t c) {
++  switch (which) {
++    case 0:
++      CKS(deep_verify_accept(s, kv, samp, c));
++      CKS(mtp_stage(s, kv + 1, kc, false, samp, c, true));
++      k_deep_report<<<1, 32, 0, c>>>(s->e->ds, s->ss, s->cf, s->dres_dev);
++      return cudaGetLastError();
++    case 1: return deep_verify_accept(s, kv, samp, c);
++    case 2: return mtp_stage(s, kv + 1, kc, false, samp, c, true);
++    case 3:
++      CKS(deep_verify_accept(s, kv, samp, c));
++      return mtp_stage(s, kv + 1, kc, false, samp, c, false);
++  }
++  return cudaErrorInvalidValue;
++}
++
++// Timing parts of the deep cycle graphs (async replays; state evolves, cost is state independent).  Needs an engine with tmax = 8.
++cudaError_t smk_spec_deep_launch(smk_spec* s, int kc, int kv, int which, int n, cudaStream_t st) {
++  if (kc < 1 || kc > SMK_DEEP_KC || kv < 0 || kv > SMK_DEEP_KC || kv + 1 > s->e->tmax || which < 0 || which > 3) return cudaErrorInvalidValue;
++  sync_epoch(s);
++  const bool samp = s->samp;
++  for (int i = 0; i < n; i++) CKS(smk_graph_launch(s->e, &s->g_deep[samp][which][kc][kv], [&](cudaStream_t c) { return deep_part(s, kc, kv, which, samp, c); }, st));
++  return cudaSuccess;
++}
++
++// Capture the cycle graphs kc in [kc_lo, kc_hi] x kv = 0..kv_max (greedy or sampling as configured) now.
++cudaError_t smk_spec_deep_prewarm(smk_spec* s, int kc_lo, int kc_hi, int kv_max) {
++  sync_epoch(s);
++  const bool samp = s->samp;
++  if (kc_lo < 1 || kc_hi > SMK_DEEP_KC || kv_max > SMK_DEEP_KC || kv_max + 1 > s->e->tmax) return cudaErrorInvalidValue;
++  for (int kc = kc_lo; kc <= kc_hi; kc++)
++    for (int kv = 0; kv <= kv_max; kv++) CKS(smk_graph_capture(s->e, &s->g_deep[samp][0][kc][kv], [&](cudaStream_t c) { return deep_part(s, kc, kv, 0, samp, c); }));
++  for (int kc = kc_lo; kc <= kc_hi; kc++)
++    CKS(smk_graph_capture(s->e, &s->g_dstart[samp][kc], [&](cudaStream_t c) {
++      k_start<<<1, 1, 0, c>>>(s->e->ds, s->ss);
++      CKS(cudaGetLastError());
++      return mtp_stage(s, 1, kc, false, samp, c, true);
++    }));
++  return cudaSuccess;
++}
++
++// After the prefill's last head step (smk_spec_prefill_chunk / first-token pick; NOT smk_spec_start): commit the first MTP pair, draft 1..kc with confidences, read them to the host.
++// ctx = prompt tokens + the first generated token (anchor last); resets the proposer (smk_spec_pld_config first if a tail is wanted) and the deep log.
++cudaError_t smk_spec_deep_begin(smk_spec* s, const int* ctx, int n, int kc, cudaStream_t st) {
++  if (kc < 1 || kc > SMK_DEEP_KC || n < 1) return cudaErrorInvalidValue;
++  sync_epoch(s);
++  const bool samp = s->samp;
++  CKS(smk_graph_launch(s->e, &s->g_dstart[samp][kc], [&](cudaStream_t c) {
++    k_start<<<1, 1, 0, c>>>(s->e->ds, s->ss);
++    CKS(cudaGetLastError());
++    return mtp_stage(s, 1, kc, false, samp, c, true);
++  }, st));
++  CKS(cudaStreamSynchronize(st));
++  int d[SMK_DEEP_KC];
++  CKS(cudaMemcpy(d, s->e->ds + DS_TOK + 1, sizeof(d), cudaMemcpyDeviceToHost));
++  CKS(cudaMemcpy(s->dp_conf, s->cf, sizeof(s->dp_conf), cudaMemcpyDeviceToHost));
++  for (int i = 0; i < SMK_DEEP_KC; i++) s->dp_d[i] = d[i];
++  s->dp_nd = kc;
++  if (s->pld) smk_pld_reset(s->pld, ctx, n);
++  const int zero = 0;
++  CKS(cudaMemcpy(s->ss + SS_PLDSEQ, &zero, sizeof(int), cudaMemcpyHostToDevice));
++  s->dres->seq = 0;
++  s->dp_seq = 0;
++  s->dlog_i.clear();
++  s->dlog_f.clear();
++  memset(s->dp_stat, 0, sizeof(s->dp_stat));
++  s->dp_ema = 3.0f;
++  return cudaSuccess;
++}
++
++// Run n cycles with one host round trip each.  Per cycle: nd chain drafts d1..d_nd (from the previous cycle) with confidences conf[0..15];
++// gate: nch = number of chain drafts verified (0..nd); tail (pld, if configured and o->tail): appended after the chain, <= 7 - nch tokens; then the graph (kc_next, kv = nch + ln).
++typedef struct smk_deep_opts {
++  int kc;          // chain depth drafted every cycle (kc_hi when adaptive)
++  int kc_lo;       // adaptive depth: next cycle drafts kc if the gate kept >= adapt_thr drafts this cycle, else kc_lo (kc_lo == kc: fixed)
++  int adapt_thr;
++  int gate;        // 0: verify all nd drafts; 1: include d_j iff conf_i >= tau[i-1] for all i <= j
++  int use_q;       // gate on the max prob of the processed proposal q (sampling) instead of the raw softmax
++  int tail;        // 0: no tail; 1: tail after the (gated) chain, <= 7 - nch; 2: tail priority: try nch = min(nd, tail_nch) first, use it if the proposer returns a tail
++  int tail_nch;
++  int fixed_kv;    // > 0: ignore the gate / tail: verify exactly min(fixed_kv, nd) drafts
++  float tau[8];
++  float adapt_rho; // adapt_mode 2: next cycle drafts kc iff the first adapt_thr confidences of this cycle are all >= adapt_rho (else kc_lo)
++  int adapt_mode;  // 0: adaptive depth iff kc_lo < kc with the gate's kept count (adapt_thr); 2: confidence rule above; 3: next cycle drafts kc iff EMA(accepted chain drafts, alpha 0.6) >= adapt_rho
++  int reserved[6];
++} smk_deep_opts;
++
++cudaError_t smk_spec_run_deep(smk_spec* s, const smk_deep_opts* o, int n, cudaStream_t st, int* host_ss, int* host_ring) {
++  smk_engine* e = s->e;
++  sync_epoch(s);
++  const bool samp = s->samp;
++  const bool use_tail = o->tail && s->pld_on;
++  for (int i = 0; i < n; i++) {
++    const long long t0 = now_ns();
++    const int nd = s->dp_nd;
++    const float* cf = s->dp_conf + (o->use_q ? 8 : 0);
++    int nch = nd;
++    if (o->gate) {
++      nch = 0;
++      while (nch < nd && cf[nch] >= o->tau[nch]) nch++;
++    }
++    const int kept = nch;
++    if (o->fixed_kv > 0 && o->fixed_kv < nch) nch = o->fixed_kv;
++    int tail[8] = {}, ln = 0, prio = 0;
++    if (use_tail && o->fixed_kv <= 0) {
++      if (o->tail == 2 && o->tail_nch < nch) {
++        const int n3 = o->tail_nch;
++        int l3 = 0;
++        ln = smk_pld_propose(s->pld, s->dp_d, n3, tail, &l3);
++        if (ln > 0) { nch = n3; prio = 1; }
++      }
++      if (ln == 0) {
++        ln = smk_pld_propose(s->pld, s->dp_d, nch, tail, nullptr);
++      }
++      if (s->opts.force_n > 0) { ln = s->opts.force_n < 4 ? s->opts.force_n : 4; for (int q = 0; q < ln; q++) tail[q] = s->opts.force_tok[q]; }  // TEST ONLY (make_pld(force_tail=...))
++      if (ln > SMK_DEEP_KC - nch) ln = SMK_DEEP_KC - nch;
++      if (ln < 0) ln = 0;
++    }
++    const int kv = nch + ln;
++    int kcn = o->kc;
++    if (o->kc_lo < o->kc) {
++      bool deep;
++      if (o->adapt_mode == 3) {
++        deep = s->dp_ema >= o->adapt_rho;
++      } else if (o->adapt_mode == 2) {
++        deep = true;
++        for (int q = 0; q < o->adapt_thr && q < nd; q++) if (cf[q] < o->adapt_rho) deep = false;
++      } else {
++        deep = (o->gate ? kept : nd) >= o->adapt_thr;
++      }
++      if (!deep) kcn = o->kc_lo;
++    }
++    if (ln > 0) {
++      memcpy(s->pin_tail, tail, ln * sizeof(int));
++      CKS(cudaMemcpyAsync(e->ds + DS_TOK + 1 + nch, s->pin_tail, ln * sizeof(int), cudaMemcpyHostToDevice, st));
++    }
++    if (samp) {
++      s->pin_tail[7] = nch;
++      CKS(cudaMemcpyAsync(s->nch_dev, s->pin_tail + 7, sizeof(int), cudaMemcpyHostToDevice, st));
++    }
++    s->dlog_f.insert(s->dlog_f.end(), s->dp_conf, s->dp_conf + 16);
++    const size_t li = s->dlog_i.size();
++    s->dlog_i.insert(s->dlog_i.end(), {0, nch, ln, nd, kcn, prio, 0, 0});
++    CKS(smk_graph_launch(e, &s->g_deep[samp][0][kcn][kv], [&](cudaStream_t c) { return deep_part(s, kcn, kv, 0, samp, c); }, st));
++    const long long t1 = now_ns();
++    const int want = ++s->dp_seq;
++    uint64_t spins = 0;
++    while (s->dres->seq != want) {
++      _mm_pause();
++      if ((++spins & 0xfffff) == 0) {
++        const cudaError_t q = cudaStreamQuery(st);
++        if (q != cudaSuccess && q != cudaErrorNotReady) return q;
++        if (now_ns() - t1 > 30000000000LL) return cudaErrorLaunchTimeout;
++      }
++    }
++    std::atomic_thread_fence(std::memory_order_acquire);
++    const long long t2 = now_ns();
++    const int a = s->dres->a;
++    int y[8];
++    for (int j = 0; j < 8; j++) y[j] = s->dres->y[j];
++    for (int j = 0; j < SMK_DEEP_KC; j++) s->dp_d[j] = s->dres->d[j];
++    for (int j = 0; j < 16; j++) s->dp_conf[j] = s->dres->conf[j];
++    s->dp_nd = kcn;
++    s->dlog_i[li] = a;
++    s->dp_ema = 0.6f * s->dp_ema + 0.4f * (float)((a - 1) < nch ? (a - 1) : nch);
++    if (s->pld) smk_pld_append(s->pld, y, a);
++    s->dp_stat[0] += t2 - t1;
++    s->dp_stat[1] += (t1 - t0) + (now_ns() - t2);
++  }
++  CKS(cudaMemcpyAsync(s->pinned_ss, s->ss, SS_N * sizeof(int), cudaMemcpyDeviceToHost, st));
++  CKS(cudaMemcpyAsync(s->pinned_ring, s->ring, RING * sizeof(int), cudaMemcpyDeviceToHost, st));
++  CKS(cudaStreamSynchronize(st));
++  memcpy(host_ss, s->pinned_ss, SS_N * sizeof(int));
++  memcpy(host_ring, s->pinned_ring, RING * sizeof(int));
++  return cudaSuccess;
++}
++
++// Cycle log since smk_spec_deep_begin: ints [n][8] = a, nch, ln, nd, kc_next, tail-priority flag, 0, 0; floats [n][16] = the confidences of the drafts the cycle used.  Returns n (<= cap); clear = 1 empties the log.
++int smk_spec_deep_log(smk_spec* s, int* oi, float* of, int cap, int clear) {
++  const int n = (int)(s->dlog_i.size() / 8);
++  const int m = n < cap ? n : cap;
++  memcpy(oi, s->dlog_i.data(), (size_t)m * 8 * sizeof(int));
++  memcpy(of, s->dlog_f.data(), (size_t)m * 16 * sizeof(float));
++  if (clear) { s->dlog_i.clear(); s->dlog_f.clear(); }
++  return m;
++}
++// host seconds: out[0] = wait for the GPU result (ns), out[1] = host proposer + launch work (ns)
++cudaError_t smk_spec_deep_stats(smk_spec* s, long long* out) { out[0] = s->dp_stat[0]; out[1] = s->dp_stat[1]; return cudaSuccess; }
++
+ // ---------------------------------------------------------------------------------------------- K7 sampling
+ cudaError_t smk_spec_set_sampling(smk_spec* s, const smk_sampling* cfg, cudaStream_t st) {
+   if (cfg->temperature == 0.f) {  // greedy graphs; the sampling config is left as it was
+diff -r lib.orig/src/mtp_sample.h lib/src/mtp_sample.h
+--- lib.orig/src/mtp_sample.h	2026-11-01 18:28:43.067224756 +0700
++++ lib/src/mtp_sample.h	2026-11-01 18:28:49.151674053 +0700
+@@ -79,8 +79,7 @@
+   ss[SS_A] = a;
+   ss[SS_AM1] = a - 1;
+   ss[SS_DPOS] = P;
+-  ss[SS_DPOS + 1] = P + a;
+-  ss[SS_DPOS + 2] = P + a + 1;
++  for (int j = 1; j <= 8; j++) ss[SS_DPOS + j] = P + a + j - 1;  // deep chain: position of chain pass j (ss[4..11])
+   ds[DS_POS] = P + a;
+   ds[DS_CUR] = (ds[DS_CUR] + a) % ds[DS_SLOTS];
+ }

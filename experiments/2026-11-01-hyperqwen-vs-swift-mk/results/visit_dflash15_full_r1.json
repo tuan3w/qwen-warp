@@ -1,0 +1,21 @@
+{
+ "server": "dflash15",
+ "suite": "full",
+ "round": 1,
+ "started": "2026-11-01T21:32:28",
+ "extra": [],
+ "boot_s": 175.63069653511047,
+ "error": "RuntimeError('no tokens')",
+ "gpu_phases": {
+  "boot_idle": {
+   "n": 2,
+   "sm_mhz_med": 1725.0,
+   "power_w_med": 121.3,
+   "power_w_max": 121.35,
+   "temp_c_max": 60.0,
+   "power_limit_w": 350.0
+  }
+ },
+ "vram_peak_mib": 23738.0,
+ "vram_after_stop_mib": 420
+}

@@ -1,0 +1,22 @@
+### trials-pld
+- **T=1.0 top_k 20 top_p .95, sampled chain drafts** (2000000 cycles, chain 3 + tail 4 (tokens [104057, 195080, 88535, 154094], pi_t = [0.857, 0.1, 0.163, 0.075]), 0.23 s; beta_t = [0.8048, 0.8373, 0.921], E[a] = 3.6939, observed 3.6932)
+  - emitted length a (k+1 = 8 cells): chi2 7.1 df 7 p = 0.417; y0 vs p_0: p = 0.851; (y0,y1 | a>=2): 72 cells p = 0.413 stray 0
+  - tail rejections y_t ~ p_t on x != d_t: t=3: n=177069 p = 1; t=4: n=957821 p = 0.685; t=5: n=88813 p = 0.484; t=6: n=16153 p = 0.391; d_t emitted at a rejection: 0; accepted tail token != d_t: 0; bonus y_k ~ p_k (n=1296): p = 0.401
+  - => PASS (threshold p > 1e-3 for every statistic, no stray tokens)
+- **T=0.6 top_k 20 top_p 1.0, sampled chain drafts** (2000000 cycles, chain 3 + tail 4 (tokens [104057, 195080, 88535, 154094], pi_t = [0.951, 0.04, 0.224, 0.023]), 0.02 s; beta_t = [0.8212, 0.9048, 0.986], E[a] = 4.0279, observed 4.0268)
+  - emitted length a (k+1 = 8 cells): chi2 8.1 df 7 p = 0.328; y0 vs p_0: p = 0.256; (y0,y1 | a>=2): 380 cells p = 0.369 stray 0
+  - tail rejections y_t ~ p_t on x != d_t: t=3: n=71967 p = 0.295; t=4: n=1337077 p = 0.219; t=5: n=43136 p = 0.808; t=6: n=12186 p = 0.475; d_t emitted at a rejection: 0; accepted tail token != d_t: 0; bonus y_k ~ p_k (n=321): p = 0.836
+  - => PASS (threshold p > 1e-3 for every statistic, no stray tokens)
+- **T=1.0 top_k 20 top_p .95, greedy chain drafts (q = delta)** (2000000 cycles, chain 3 + tail 4 (tokens [104057, 195080, 88535, 154094], pi_t = [0.857, 0.1, 0.163, 0.075]), 0.02 s; beta_t = [0.3562, 0.5168, 0.7346], E[a] = 1.8050, observed 1.8055)
+  - emitted length a (k+1 = 8 cells): chi2 6.7 df 7 p = 0.463; y0 vs p_0: p = 0.532; (y0,y1 | a>=2): 9 cells p = 0.989 stray 0
+  - tail rejections y_t ~ p_t on x != d_t: t=3: n=38368 p = 1; t=4: n=208887 p = 0.214; t=5: n=19525 p = 0.126; t=6: n=3595 p = 0.365; d_t emitted at a rejection: 0; accepted tail token != d_t: 0; bonus y_k ~ p_k (n=280): p = 0.803
+  - => PASS (threshold p > 1e-3 for every statistic, no stray tokens)
+- **T=1.0 top_k 20 top_p .95, sampled chain drafts, BROKEN (no residual)** (2000000 cycles, chain 3 + tail 4 (tokens [104057, 195080, 88535, 154094], pi_t = [0.857, 0.1, 0.163, 0.075]), 0.02 s; beta_t = [0.8048, 0.8373, 0.921], E[a] = 3.6939, observed 3.6943)
+  - emitted length a (k+1 = 8 cells): chi2 6.6 df 7 p = 0.469; y0 vs p_0: p = 0; (y0,y1 | a>=2): 72 cells p = 0 stray 0
+  - tail rejections y_t ~ p_t on x != d_t: t=3: n=176990 p = 1; t=4: n=957855 p = 0; t=5: n=89251 p = 0; t=6: n=16058 p = 1.23e-20; d_t emitted at a rejection: 263185; accepted tail token != d_t: 0; bonus y_k ~ p_k (n=1279): p = 0.982
+  - => FAIL (threshold p > 1e-3 for every statistic, no stray tokens) [expected FAIL: power check]
+- **T=1.0 top_k 20 top_p .95, greedy chain drafts, BROKEN (no residual)** (2000000 cycles, chain 3 + tail 4 (tokens [104057, 195080, 88535, 154094], pi_t = [0.857, 0.1, 0.163, 0.075]), 0.02 s; beta_t = [0.3562, 0.5168, 0.7346], E[a] = 1.8050, observed 1.8051)
+  - emitted length a (k+1 = 8 cells): chi2 6.7 df 7 p = 0.463; y0 vs p_0: p = 0; (y0,y1 | a>=2): 9 cells p = 0 stray 0
+  - tail rejections y_t ~ p_t on x != d_t: t=3: n=38659 p = 1; t=4: n=208371 p = 0; t=5: n=19436 p = 1.2e-106; t=6: n=3415 p = 2.36e-06; d_t emitted at a rejection: 57361; accepted tail token != d_t: 0; bonus y_k ~ p_k (n=291): p = 0.302
+  - => FAIL (threshold p > 1e-3 for every statistic, no stray tokens) [expected FAIL: power check]
+ALL OK: True

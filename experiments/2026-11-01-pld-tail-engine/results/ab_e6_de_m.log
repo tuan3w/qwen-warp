@@ -1,0 +1,19 @@
+W1101 07:18:15.622000 2389738 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 07:18:15.640000 2389738 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+suite e6, 12 tasks, modes ['base', 'pld3', 'pld4', 'pld6'], reps 3, T=0.0, tail gate m=3 Lt=4 adapt [0.2, 0.3, 8.0, 64.0], build build/k11
+                d1 n= 664 | base  106.2 tok/s E 2.25 | pld3  104.5 tok/s E 2.25 | pld4  104.3 tok/s E 2.23 | pld6  105.9 tok/s E 2.25
+                d2 n= 768 | base  105.6 tok/s E 2.23 | pld3  108.8 tok/s E 2.32 | pld4  109.4 tok/s E 2.31 | pld6  105.7 tok/s E 2.23
+                d3 n= 708 | base  106.7 tok/s E 2.23 | pld3  103.8 tok/s E 2.18 | pld4  105.2 tok/s E 2.20 | pld6  106.6 tok/s E 2.23
+                d4 n= 768 | base  110.6 tok/s E 2.31 | pld3  107.0 tok/s E 2.24 | pld4  107.4 tok/s E 2.25 | pld6  110.8 tok/s E 2.31
+                d5 n= 768 | base  115.0 tok/s E 2.40 | pld3  119.4 tok/s E 2.51 | pld4  123.3 tok/s E 2.59 | pld6  115.0 tok/s E 2.40
+                d6 n= 768 | base  116.1 tok/s E 2.42 | pld3  127.7 tok/s E 2.69 | pld4  116.9 tok/s E 2.45 | pld6  118.6 tok/s E 2.48
+                e1 n= 768 | base  163.7 tok/s E 3.42 | pld3  175.0 tok/s E 3.74 | pld4  171.9 tok/s E 3.64 | pld6  166.1 tok/s E 3.49
+                e2 n= 768 | base  158.7 tok/s E 3.31 | pld3  175.0 tok/s E 3.77 | pld4  169.5 tok/s E 3.60 | pld6  162.5 tok/s E 3.42
+                e3 n= 768 | base  167.3 tok/s E 3.49 | pld3  171.6 tok/s E 3.71 | pld4  171.6 tok/s E 3.66 | pld6  168.5 tok/s E 3.54
+                e4 n= 768 | base  161.4 tok/s E 3.36 | pld3  172.3 tok/s E 3.70 | pld4  167.2 tok/s E 3.53 | pld6  158.0 tok/s E 3.33
+                e5 n= 768 | base  168.9 tok/s E 3.52 | pld3  177.9 tok/s E 3.86 | pld4  175.2 tok/s E 3.71 | pld6  174.0 tok/s E 3.67
+                e6 n= 768 | base  181.4 tok/s E 3.78 | pld3  203.3 tok/s E 4.46 | pld4  202.5 tok/s E 4.39 | pld6  197.9 tok/s E 4.22
+
+per class (pooled tokens / pooled time; median over reps):
+class d: base 110.0 tok/s (E 2.30) | pld3 111.5 tok/s (E 2.36) x1.014 | pld4 110.9 tok/s (E 2.33) x1.008 | pld6 110.4 tok/s (E 2.32) x1.003
+class e: base 166.6 tok/s (E 3.48) | pld3 178.6 tok/s (E 3.86) x1.072 | pld4 175.6 tok/s (E 3.74) x1.054 | pld6 170.3 tok/s (E 3.59) x1.022

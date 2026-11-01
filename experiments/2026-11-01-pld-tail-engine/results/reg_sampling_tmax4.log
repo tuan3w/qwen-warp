@@ -1,0 +1,12 @@
+  - emitted length a: chi2 5.6 df 3 p = 0.131
+  - y0 vs p_0 (top-11 support): chi2 249267.3 df 10 p = 0, TV 0.1302 (noise floor ~0.0009), outside support 0
+  - (y0,y1 | a>=2) vs min(p0,q0) x p1: 81 cells, chi2 203809.7 df 81 p = 0, TV 0.1105, stray 0
+  - (y0,y1,y2 | a>=3) vs min(p0,q0) x min(p1,q1) x p2: 693 cells, chi2 79007.1 df 681 p = 0, stray 0
+  - => FAIL (threshold p > 1e-3 for every statistic, no stray tokens) [expected FAIL: power check]
+- **T=1.0 top_k 20 top_p .95, greedy drafts, BROKEN (no residual)** (2000000 cycles, k=3, 0.01 s; beta_t = sum min(p,q) = [0.2458, 0.5168, 0.7346], E[a] = 1.4662, observed 1.4663)
+  - emitted length a: chi2 1.1 df 3 p = 0.786
+  - y0 vs p_0 (top-11 support): chi2 371779.6 df 10 p = 0, TV 0.1856 (noise floor ~0.0009), outside support 0
+  - (y0,y1 | a>=2) vs min(p0,q0) x p1: 9 cells, chi2 122615.2 df 9 p = 0, TV 0.0614, stray 0
+  - (y0,y1,y2 | a>=3) vs min(p0,q0) x min(p1,q1) x p2: 11 cells, chi2 49612.0 df 11 p = 0, stray 0
+  - => FAIL (threshold p > 1e-3 for every statistic, no stray tokens) [expected FAIL: power check]
+ALL OK: True

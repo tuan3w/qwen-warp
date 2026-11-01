@@ -1,0 +1,32 @@
+direct engine reference ...
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+W1101 03:07:57.750000 2054976 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 03:07:57.769000 2054976 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+PASS  health + models  (started in 17.5 s)
+PASS  greedy chat == direct engine ids [code]  (64/64 ids, first difference at index None, prompt ids equal True)
+PASS  greedy chat == direct engine ids [prose]  (64/64 ids, first difference at index None, prompt ids equal True)
+PASS  greedy chat == direct engine ids [math]  (64/64 ids, first difference at index None, prompt ids equal True)
+PASS  greedy chat == direct engine ids [long]  (25/25 ids, first difference at index None, prompt ids equal True)
+PASS  streaming == non-streaming text, many chunks, usage  (10 chunks, median gap 41 ms, usage 64)
+PASS  stop string cuts the text before the match  (stop='Return' len 71/213)
+PASS  max_tokens -> finish_reason length  (length 5)
+PASS  EOS -> finish_reason stop
+PASS  abort on client disconnect frees the engine  (next request took 0.13 s)
+PASS  3 concurrent requests == sequential results (FIFO, state isolation)
+PASS  sampling: same seed reproducible (cold/cold and warm/warm), other seed differs  ('The lighthouse on Blackwood Point had a ' / 'Elias had kept the lighthouse on the jag')
+PASS  request without sampling params uses generation_config defaults (T=1, top_p .95, top_k 20)
+PASS  unsupported presence_penalty -> 400  (Error code: 400 - {'error': {'message': 'swift-mk engine does not support presence_penalty (supported sampling: temperat)
+PASS  unsupported logprobs -> 400  (Error code: 400 - {'error': {'message': 'swift-mk engine does not support logprobs (supported sampling: temperature, top)
+PASS  unsupported frequency_penalty -> 400  (Error code: 400 - {'error': {'message': 'swift-mk engine does not support frequency_penalty (supported sampling: tempera)
+PASS  tool call parsed (name + arguments)  (None [ChatCompletionMessageFunctionToolCall(id='chatcmpl-tool-8819e808b1b21f08', function=Function(arguments='{"city": "Hanoi"}', name='get_weather'), type='function')])
+PASS  tool result round trip: final answer uses the tool output  (The weather in Hanoi right now is **sunny** with a temperature of **31°C**.)
+PASS  /v1/completions  ( Paris.
+The capital of)
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+PASS  multi-turn: turns 2 and 3 resume from a snapshot  ((cached, prompt, total s) per turn: [(0, 28, 0.19123315811157227), (27, 72, 0.2017056941986084), (71, 125, 0.25147414207458496)])
+PASS  multi-turn: warm turn 3 answer == cold re-prefill answer (greedy)  (warm 'My previous answer stated that it was impossible to determin' / cold 'My previous answer stated that it was impossible to determin')
+PASS  cold re-prefill reports cached_tokens == 0
+
+22/22 checks passed

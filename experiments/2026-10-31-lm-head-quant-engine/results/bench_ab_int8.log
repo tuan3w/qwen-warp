@@ -1,0 +1,17 @@
+~/llm-lab/venv/lib/python3.12/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+W1101 01:36:15.559000 1927075 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1101 01:36:15.577000 1927075 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+engine ready (head int8); engine bytes 0.79 GiB, torch 18.11 GiB
+plain T=1 step (ctx 32): bf16 head 20.181 ms (49.6 tok/s) | int8+rescore 18.800 ms (53.2 tok/s)  => 1.382 ms, x1.073   reps bf16 [20.181, 20.193, 20.193, 20.167, 20.165] q [18.82, 18.81, 18.8, 18.796, 18.778]
+verify T=2 head step: bf16 20.657 ms | int8+rescore 19.260 ms  => 1.397 ms, x1.073
+verify T=3 head step: bf16 21.048 ms | int8+rescore 19.629 ms  => 1.419 ms, x1.072
+verify T=4 head step: bf16 21.524 ms | int8+rescore 20.146 ms  => 1.378 ms, x1.068
+spec k=3 greedy code  : bf16  152.2 tok/s | int8+rescore  162.0 tok/s  x1.065   tokens/cycle 3.50 vs 3.50   reps bf16 [152.1, 152.1, 152.2, 152.4, 152.4] q [161.7, 162.0, 162.1, 162.0, 162.3]
+spec k=3 greedy prose : bf16   97.5 tok/s | int8+rescore  103.9 tok/s  x1.065   tokens/cycle 2.24 vs 2.24   reps bf16 [97.4, 97.5, 97.5, 97.6, 97.6] q [103.8, 103.8, 103.9, 103.9, 103.9]
+spec k=3 greedy math  : bf16  150.1 tok/s | int8+rescore  159.8 tok/s  x1.065   tokens/cycle 3.45 vs 3.45   reps bf16 [150.2, 150.1, 150.0, 150.0, 150.1] q [159.8, 159.9, 159.9, 159.8, 159.8]
+spec k=3 greedy long8k: bf16  137.7 tok/s | int8+rescore  146.6 tok/s  x1.065   tokens/cycle 3.16 vs 3.16   reps bf16 [137.6, 137.7] q [146.6, 146.6]
+spec k=3 T1     code  : bf16  143.8 tok/s | int8+rescore  152.6 tok/s  x1.061   tokens/cycle 3.32 vs 3.32   reps bf16 [143.8, 143.8, 143.8, 143.9, 143.8] q [152.7, 152.6, 152.5, 152.7, 152.5]
+spec k=3 T1     prose : bf16   96.7 tok/s | int8+rescore  102.5 tok/s  x1.060   tokens/cycle 2.23 vs 2.23   reps bf16 [96.8, 96.7, 96.7, 96.6, 96.6] q [102.7, 102.6, 102.5, 102.5, 102.3]
+spec k=3 T1     math  : bf16  150.3 tok/s | int8+rescore  159.4 tok/s  x1.060   tokens/cycle 3.47 vs 3.47   reps bf16 [150.4, 150.3, 150.2, 150.4, 150.3] q [159.4, 159.3, 159.4, 159.7, 159.6]
+spec k=3 T1     long8k: bf16  123.8 tok/s | int8+rescore  131.4 tok/s  x1.062   tokens/cycle 2.86 vs 2.86   reps bf16 [123.8, 123.8] q [131.4, 131.4]

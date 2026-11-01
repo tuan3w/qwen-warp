@@ -1,0 +1,1332 @@
+{
+ "gateup/cc/ablfma/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1590.0,
+  "sm_mhz_max": 1635.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.18,
+  "power_w_max": 316.71,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/ablload/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1702.5,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.58,
+  "power_w_max": 307.17,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/e1/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1560.0,
+  "sm_mhz_min": 1500.0,
+  "sm_mhz_max": 1590.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 325.15,
+  "power_w_max": 325.65,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/naive/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1605.0,
+  "sm_mhz_min": 1575.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 330.86,
+  "power_w_max": 331.44,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/abl/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1567.5,
+  "sm_mhz_min": 1500.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.315,
+  "power_w_max": 316.83,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/ones/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1530.0,
+  "sm_mhz_min": 1470.0,
+  "sm_mhz_max": 1530.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.39,
+  "power_w_max": 319.95,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/sub/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1470.0,
+  "sm_mhz_min": 1380.0,
+  "sm_mhz_max": 1515.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.23,
+  "power_w_max": 319.94,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/read/read/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1702.5,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 308.55,
+  "power_w_max": 308.71,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/ablfma/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1590.0,
+  "sm_mhz_max": 1635.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.64,
+  "power_w_max": 317.17,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/ablload/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1710.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1725.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 307.1,
+  "power_w_max": 307.29,
+  "temp_c_max": 64.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/e1/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1567.5,
+  "sm_mhz_min": 1530.0,
+  "sm_mhz_max": 1590.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 325.6,
+  "power_w_max": 326.63,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/cc/naive/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1605.0,
+  "sm_mhz_min": 1575.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 330.85,
+  "power_w_max": 331.36,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/abl/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1500.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.01,
+  "power_w_max": 316.76,
+  "temp_c_max": 64.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/ones/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1500.0,
+  "sm_mhz_min": 1410.0,
+  "sm_mhz_max": 1560.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.345,
+  "power_w_max": 319.77,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/mma/sub/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1485.0,
+  "sm_mhz_min": 1380.0,
+  "sm_mhz_max": 1545.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.29499999999996,
+  "power_w_max": 320.68,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "gateup/read/read/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1695.0,
+  "sm_mhz_min": 1665.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 308.46000000000004,
+  "power_w_max": 308.82,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/ablfma/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1605.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.95,
+  "power_w_max": 321.28,
+  "temp_c_max": 63.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/ablload/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1732.5,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.885,
+  "power_w_max": 307.01,
+  "temp_c_max": 63.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/e1/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1515.0,
+  "sm_mhz_min": 1455.0,
+  "sm_mhz_max": 1545.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 328.61,
+  "power_w_max": 328.74,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/naive/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1545.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 329.24,
+  "power_w_max": 329.81,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/abl/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1725.0,
+  "sm_mhz_min": 1725.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.86,
+  "power_w_max": 317.01,
+  "temp_c_max": 63.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/ones/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1710.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1710.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.05,
+  "power_w_max": 319.38,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/sub/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1665.0,
+  "sm_mhz_min": 1665.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 321.43,
+  "power_w_max": 321.98,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/read/read/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1740.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.315,
+  "power_w_max": 306.62,
+  "temp_c_max": 63.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/ablfma/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1575.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.25,
+  "power_w_max": 321.2,
+  "temp_c_max": 64.0,
+  "util_median": 99.5,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/ablload/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1725.0,
+  "sm_mhz_min": 1695.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 305.79,
+  "power_w_max": 306.05,
+  "temp_c_max": 63.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/e1/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1522.5,
+  "sm_mhz_min": 1440.0,
+  "sm_mhz_max": 1545.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 326.69,
+  "power_w_max": 327.04,
+  "temp_c_max": 64.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/cc/naive/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1530.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 328.52,
+  "power_w_max": 329.17,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/abl/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1725.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.45,
+  "power_w_max": 316.74,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/ones/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1695.0,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1710.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.17,
+  "power_w_max": 319.77,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/mma/sub/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1665.0,
+  "sm_mhz_min": 1635.0,
+  "sm_mhz_max": 1680.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 321.49,
+  "power_w_max": 321.89,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "down/read/read/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1740.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.49,
+  "power_w_max": 306.81,
+  "temp_c_max": 65.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/ablfma/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1642.5,
+  "sm_mhz_min": 1620.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.47,
+  "power_w_max": 316.77,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/ablload/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1717.5,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 305.99,
+  "power_w_max": 306.37,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/e1/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1605.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1635.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 325.36,
+  "power_w_max": 326.16,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/naive/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1665.0,
+  "sm_mhz_min": 1650.0,
+  "sm_mhz_max": 1680.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 330.72,
+  "power_w_max": 331.54,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/abl/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1515.0,
+  "sm_mhz_max": 1605.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 315.115,
+  "power_w_max": 316.15,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/ones/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1575.0,
+  "sm_mhz_min": 1500.0,
+  "sm_mhz_max": 1590.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 318.12,
+  "power_w_max": 318.85,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/sub/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1545.0,
+  "sm_mhz_min": 1440.0,
+  "sm_mhz_max": 1575.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.735,
+  "power_w_max": 319.92,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/read/read/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1740.0,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.83,
+  "power_w_max": 307.4,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/ablfma/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1635.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 315.85,
+  "power_w_max": 316.13,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/ablload/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1695.0,
+  "sm_mhz_min": 1680.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.04,
+  "power_w_max": 306.55,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/e1/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 325.5,
+  "power_w_max": 326.95,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/cc/naive/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1665.0,
+  "sm_mhz_min": 1665.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 331.7,
+  "power_w_max": 332.15,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/abl/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1590.0,
+  "sm_mhz_min": 1575.0,
+  "sm_mhz_max": 1590.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 316.55,
+  "power_w_max": 317.14,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/ones/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1560.0,
+  "sm_mhz_min": 1545.0,
+  "sm_mhz_max": 1575.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 319.69,
+  "power_w_max": 320.21,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/mma/sub/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1500.0,
+  "sm_mhz_min": 1485.0,
+  "sm_mhz_max": 1560.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.87,
+  "power_w_max": 321.49,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "qkvz/read/read/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1725.0,
+  "sm_mhz_min": 1695.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 307.21500000000003,
+  "power_w_max": 307.59,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/ablfma/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1657.5,
+  "sm_mhz_min": 1635.0,
+  "sm_mhz_max": 1680.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.76,
+  "power_w_max": 321.23,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/ablload/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1770.0,
+  "sm_mhz_min": 1740.0,
+  "sm_mhz_max": 1785.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 307.2,
+  "power_w_max": 307.32,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/e1/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 329.75,
+  "power_w_max": 330.45,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/naive/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1635.0,
+  "sm_mhz_min": 1620.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 333.225,
+  "power_w_max": 333.66,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/abl/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1650.0,
+  "sm_mhz_min": 1620.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 314.84000000000003,
+  "power_w_max": 314.97,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/ones/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 317.93,
+  "power_w_max": 318.62,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/sub/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1597.5,
+  "sm_mhz_min": 1590.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 321.99,
+  "power_w_max": 322.2,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/read/read/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1770.0,
+  "sm_mhz_min": 1770.0,
+  "sm_mhz_max": 1800.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 305.22,
+  "power_w_max": 305.97,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/ablfma/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1650.0,
+  "sm_mhz_min": 1635.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 320.235,
+  "power_w_max": 320.61,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/ablload/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1755.0,
+  "sm_mhz_min": 1740.0,
+  "sm_mhz_max": 1770.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 306.57,
+  "power_w_max": 306.74,
+  "temp_c_max": 65.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/e1/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1620.0,
+  "sm_mhz_min": 1590.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 329.71500000000003,
+  "power_w_max": 330.49,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/cc/naive/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1635.0,
+  "sm_mhz_min": 1620.0,
+  "sm_mhz_max": 1650.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 332.165,
+  "power_w_max": 332.56,
+  "temp_c_max": 67.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/abl/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1635.0,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1665.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 314.54,
+  "power_w_max": 315.02,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/ones/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1612.5,
+  "sm_mhz_min": 1605.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 317.945,
+  "power_w_max": 318.47,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/mma/sub/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1605.0,
+  "sm_mhz_min": 1590.0,
+  "sm_mhz_max": 1620.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 321.91499999999996,
+  "power_w_max": 322.71,
+  "temp_c_max": 67.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "oproj/read/read/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1770.0,
+  "sm_mhz_min": 1755.0,
+  "sm_mhz_max": 1800.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 305.31,
+  "power_w_max": 305.59,
+  "temp_c_max": 66.0,
+  "util_median": 99.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/cc/bf16/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1755.0,
+  "sm_mhz_min": 1755.0,
+  "sm_mhz_max": 1770.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 309.95,
+  "power_w_max": 310.02,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/mma/bf16/r0": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1935.0,
+  "sm_mhz_min": 1920.0,
+  "sm_mhz_max": 1935.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 314.53,
+  "power_w_max": 316.29,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/read/read/r0": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1740.0,
+  "sm_mhz_min": 1695.0,
+  "sm_mhz_max": 1755.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 310.35,
+  "power_w_max": 310.82,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/cc/bf16/r1": {
+  "samples": 30,
+  "window_s": 3.0,
+  "sm_mhz_median": 1762.5,
+  "sm_mhz_min": 1740.0,
+  "sm_mhz_max": 1785.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 309.8,
+  "power_w_max": 310.09,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/mma/bf16/r1": {
+  "samples": 29,
+  "window_s": 3.0,
+  "sm_mhz_median": 1935.0,
+  "sm_mhz_min": 1935.0,
+  "sm_mhz_max": 1935.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 314.74,
+  "power_w_max": 314.94,
+  "temp_c_max": 67.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ },
+ "lmhead/read/read/r1": {
+  "samples": 30,
+  "window_s": 3.01,
+  "sm_mhz_median": 1740.0,
+  "sm_mhz_min": 1710.0,
+  "sm_mhz_max": 1740.0,
+  "mem_mhz_median": 9501.0,
+  "power_w_median": 310.61,
+  "power_w_max": 310.75,
+  "temp_c_max": 66.0,
+  "util_median": 100.0,
+  "swcap_frac": 1.0,
+  "hw_slowdown_frac": 0.0,
+  "thermal_frac": 0.0,
+  "power_limit_w": 350.0,
+  "masks": [
+   "0x0000000000000004"
+  ]
+ }
+}

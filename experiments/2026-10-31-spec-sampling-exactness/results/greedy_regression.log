@@ -1,0 +1,14 @@
+- greedy code k=3: EQUAL (128 tokens); mean tokens/cycle 3.65, natural accepted-drafts histogram m=0..3 [2, 2, 4, 32] (1.1s)
+- greedy prose k=1: DIVERGES at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.65, natural accepted-drafts histogram m=0..3 [28, 52, 0, 0] (2.6s)
+- greedy prose k=3: DIVERGES at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 2.06, natural accepted-drafts histogram m=0..3 [26, 16, 14, 8] (2.3s)
+### 5 forced partial acceptance (rollback)
+force pattern [1]
+- rollback[1] code k=3: EQUAL (128 tokens); mean tokens/cycle 1.00, natural accepted-drafts histogram m=0..3 [3, 9, 12, 104] (3.1s)
+- rollback[1] prose k=3: DIVERGES at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.00, natural accepted-drafts histogram m=0..3 [38, 38, 29, 23] (3.8s)
+force pattern [2, 1, 3]
+- rollback[2, 1, 3] code k=3: EQUAL (128 tokens); mean tokens/cycle 1.97, natural accepted-drafts histogram m=0..3 [3, 3, 6, 60] (1.8s)
+- rollback[2, 1, 3] prose k=3: DIVERGES at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.56, natural accepted-drafts histogram m=0..3 [28, 25, 19, 16] (2.9s)
+force pattern [1, 4, 2, 3, 1]
+- rollback[1, 4, 2, 3, 1] code k=3: EQUAL (128 tokens); mean tokens/cycle 2.11, natural accepted-drafts histogram m=0..3 [1, 4, 6, 53] (1.7s)
+- rollback[1, 4, 2, 3, 1] prose k=3: DIVERGES at generated index 104 (plain 1049, spec 1216); plain-engine (prefix-prefill) logits top1 1049=22.8925 top2 1216=22.8271, margin 0.0655; mean tokens/cycle 1.61, natural accepted-drafts histogram m=0..3 [25, 20, 22, 13] (2.7s)
+RESULT: greedy=FAIL rollback=FAIL

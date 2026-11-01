@@ -1,0 +1,167 @@
+{
+ "8192": {
+  "allowed": 8192,
+  "code": {
+   "tokens": 6912,
+   "oov": 0.1314,
+   "oov_after_ctx": 0.1091
+  },
+  "math": {
+   "tokens": 6912,
+   "oov": 0.1894,
+   "oov_after_ctx": 0.1648
+  },
+  "prose": {
+   "tokens": 6866,
+   "oov": 0.3414,
+   "oov_after_ctx": 0.3178
+  },
+  "agent": {
+   "tokens": 3968,
+   "oov": 0.1237,
+   "oov_after_ctx": 0.091
+  },
+  "long": {
+   "tokens": 2917,
+   "oov": 0.2585,
+   "oov_after_ctx": 0.0895
+  },
+  "all": {
+   "tokens": 27575,
+   "oov": 0.2106,
+   "oov_after_ctx": 0.1703
+  }
+ },
+ "16384": {
+  "allowed": 16384,
+  "code": {
+   "tokens": 6912,
+   "oov": 0.078,
+   "oov_after_ctx": 0.0635
+  },
+  "math": {
+   "tokens": 6912,
+   "oov": 0.1419,
+   "oov_after_ctx": 0.1202
+  },
+  "prose": {
+   "tokens": 6866,
+   "oov": 0.2508,
+   "oov_after_ctx": 0.231
+  },
+  "agent": {
+   "tokens": 3968,
+   "oov": 0.0711,
+   "oov_after_ctx": 0.0539
+  },
+  "long": {
+   "tokens": 2917,
+   "oov": 0.1611,
+   "oov_after_ctx": 0.0597
+  },
+  "all": {
+   "tokens": 27575,
+   "oov": 0.1448,
+   "oov_after_ctx": 0.1176
+  }
+ },
+ "32768": {
+  "allowed": 32768,
+  "code": {
+   "tokens": 6912,
+   "oov": 0.0276,
+   "oov_after_ctx": 0.0216
+  },
+  "math": {
+   "tokens": 6912,
+   "oov": 0.069,
+   "oov_after_ctx": 0.0528
+  },
+  "prose": {
+   "tokens": 6866,
+   "oov": 0.1539,
+   "oov_after_ctx": 0.1439
+  },
+  "agent": {
+   "tokens": 3968,
+   "oov": 0.0343,
+   "oov_after_ctx": 0.026
+  },
+  "long": {
+   "tokens": 2917,
+   "oov": 0.06,
+   "oov_after_ctx": 0.0213
+  },
+  "all": {
+   "tokens": 27575,
+   "oov": 0.0738,
+   "oov_after_ctx": 0.0605
+  }
+ },
+ "49152": {
+  "allowed": 49152,
+  "code": {
+   "tokens": 6912,
+   "oov": 0.0091,
+   "oov_after_ctx": 0.0087
+  },
+  "math": {
+   "tokens": 6912,
+   "oov": 0.0286,
+   "oov_after_ctx": 0.02
+  },
+  "prose": {
+   "tokens": 6866,
+   "oov": 0.0872,
+   "oov_after_ctx": 0.0811
+  },
+  "agent": {
+   "tokens": 3968,
+   "oov": 0.0146,
+   "oov_after_ctx": 0.0103
+  },
+  "long": {
+   "tokens": 2917,
+   "oov": 0.0154,
+   "oov_after_ctx": 0.0034
+  },
+  "all": {
+   "tokens": 27575,
+   "oov": 0.0349,
+   "oov_after_ctx": 0.0292
+  }
+ },
+ "65536": {
+  "allowed": 65536,
+  "code": {
+   "tokens": 6912,
+   "oov": 0.0025,
+   "oov_after_ctx": 0.002
+  },
+  "math": {
+   "tokens": 6912,
+   "oov": 0.0054,
+   "oov_after_ctx": 0.0045
+  },
+  "prose": {
+   "tokens": 6866,
+   "oov": 0.0428,
+   "oov_after_ctx": 0.0387
+  },
+  "agent": {
+   "tokens": 3968,
+   "oov": 0.0048,
+   "oov_after_ctx": 0.0038
+  },
+  "long": {
+   "tokens": 2917,
+   "oov": 0.0024,
+   "oov_after_ctx": 0.0007
+  },
+  "all": {
+   "tokens": 27575,
+   "oov": 0.0136,
+   "oov_after_ctx": 0.0119
+  }
+ }
+}

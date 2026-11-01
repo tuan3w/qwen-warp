@@ -1,0 +1,6 @@
+code   k=3:  142.1 tok/s (reps [142.1, 142.0])  tokens/cycle 3.28 pos-acc 0.92/0.76/0.61
+prose  k=3:   95.9 tok/s (reps [95.9, 95.8])  tokens/cycle 2.22 pos-acc 0.63/0.39/0.20
+math   k=3:  148.4 tok/s (reps [148.4, 148.3])  tokens/cycle 3.43 pos-acc 0.92/0.81/0.71
+code   k=3:  141.8 tok/s (reps [141.8, 141.8])  tokens/cycle 3.28 pos-acc 0.90/0.73/0.65
+prose  k=3:   95.7 tok/s (reps [95.8, 95.7])  tokens/cycle 2.22 pos-acc 0.71/0.37/0.14
+math   k=3:  146.4 tok/s (reps [146.4, 146.4])  tokens/cycle 3.39 pos-acc 0.94/0.78/0.67

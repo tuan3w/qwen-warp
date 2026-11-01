@@ -1,0 +1,24 @@
+device NVIDIA GeForce RTX 3090, 82 SMs
+int8 T=1  rel-L2 vs naive double: 7.619e-08
+int8 T=2  rel-L2 vs naive double: 7.511e-08
+int8 T=3  rel-L2 vs naive double: 7.514e-08
+int8 T=4  rel-L2 vs naive double: 7.528e-08
+
+L2-cold (256 MB memset between calls), median of 40, ms (GB/s of weight+scale bytes)
+kernel                                  T=1      T=2      T=3      T=4
+bf16 smk_bf16_gemv_f32 (shipped)   2.875(884) 2.945(863) 2.969(857) 2.985(852)
+int8 per-row CUDA-core (this)      1.445(881) 1.464(869) 1.507(844) 1.546(823)
+int4 g128 smk_w4_gemv EPI_F32 (def) 0.778(842) 0.785(835) 0.798(822) 0.824(795)
+int4 g128 smk_w4_gemv_cfg 0        0.794(826) 0.813(806) 0.822(797) 0.810(809)
+int4 g128 smk_w4_gemv_cfg 1        0.775(846) 0.779(841) 0.783(837) 0.786(834)
+int4 g128 smk_w4_gemv_cfg 2        1.030(636) 1.054(622) 1.065(616) 1.074(610)
+int4 g128 smk_w4_gemv_cfg 3        0.812(807) 0.831(788) 0.825(794) 0.822(797)
+int4 g128 smk_w4_gemv_cfg 4        0.776(845) 0.781(839) 0.783(837) 0.787(833)
+int4 g128 smk_w4_gemv_cfg 5        1.276(514) 1.284(511) 1.292(507) 1.297(505)
+
+exact-rescore overhead, M=16 candidates/row (top-M select over fp32 logits + exact bf16 dots), L2-cold weights, ms
+T=1  select+rescore 0.0532 ms   (select only 0.0492 ms)
+      select check: 16/16 match host top-M order
+T=2  select+rescore 0.0556 ms   (select only 0.0522 ms)
+T=3  select+rescore 0.0594 ms   (select only 0.0553 ms)
+T=4  select+rescore 0.0645 ms   (select only 0.0604 ms)
