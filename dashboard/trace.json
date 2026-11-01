@@ -1,11 +1,6 @@
 {
  "commits": [
   {
-   "hash": "0c1b8a5",
-   "date": "2026-10-30 22:40",
-   "msg": "experiment: pre-register dataflow-fused-phases prediction (E2) before any code"
-  },
-  {
    "hash": "9b007df",
    "date": "2026-10-31 07:18",
    "msg": "experiment: E0 vLLM Swift INT4 bs1 baseline done"

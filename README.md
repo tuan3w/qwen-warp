@@ -2,10 +2,12 @@
 
 A fast single-sequence decode engine for **Swift-1.5-Qwen3.8-27B INT4** (W4A16 g128 + the checkpoint's MTP head) on **one RTX 3090** (sm_86, batch size 1), with an OpenAI-compatible server, a CPU reference oracle, a harness-gated autonomous optimisation campaign and a log of every pre-registered experiment, including the negative ones.
 
-> Engine as of research-repo commit 5186017 (research repo `5186017a1e30ceb55d586a7b7fadac85be721480`). Generated pages `docs/infographic.html` and `docs/history.html` may be present in this tree; open them locally if they are.
+> Engine as of research-repo commit e59f394 (research repo `e59f3948b4dd913d7edccfb339c2bb89d471e5b5`). Program poster: [docs/infographic.svg](docs/infographic.svg) (PNG: [docs/infographic.png](docs/infographic.png)); interactive history of the program: [docs/history.html](docs/history.html) (open locally; needs `infographic.svg` and `data.json` next to it).
 > **Unofficial.** Not affiliated with, endorsed by or derived from work of Alibaba or the Qwen team. The model weights are **not** included (see [Requirements](#how-to-run)).
 > Most of this work was done by AI coding agents under human direction. Every experiment froze a written prediction before its first measurement; misses and dead ends are kept in the logs.
 > Pointers such as `topics/...`, `papers/...` or `vendor/...` inside `docs/` and `experiments/` refer to the private research workspace this repo was exported from; they are not part of this release.
+
+![qwen-warp](docs/infographic.svg)
 
 ## What it is
 
