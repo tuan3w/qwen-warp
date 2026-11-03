@@ -6,8 +6,9 @@ A CUDA decode engine with a 4-bit KV cache and MTP speculative decoding, behind 
 262,144-token context in 24 GB, and on the same card it decodes 1.3x to 1.5x faster than HyperQwen's `mtp-long` and 2.1x to 3.5x faster than its
 long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, caveats in [Performance](#performance)).
 
-> **RTX 3090 only.** Tuned and tested on one RTX 3090 (24 GB); no other GPU has been tried and other cards may fail to build or run.
-> One model, one stream at a time, text only.
+> **Goal:** push the performance of Qwen3.8-27B (Swift-1.5) on one RTX 3090. The code is shared as a reference to learn from and borrow ideas from, not as a general
+> inference stack: there are no plans to support other models or other GPUs.
+> Tuned and tested on one RTX 3090 (24 GB) only. One stream at a time, text only.
 
 ## Contents
 
@@ -17,6 +18,7 @@ long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, cave
 - [Performance](#performance)
 - [How it works](#how-it-works)
 - [Limits](#limits)
+- [Roadmap](#roadmap)
 - [Development](#development)
 - [Credits and license](#credits-and-license)
 
@@ -127,6 +129,33 @@ Details and file-level pointers: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - Unsupported sampling parameters (`presence_penalty`, `frequency_penalty`, `logprobs`) return HTTP 400.
 - Long prompts are slow to prefill (see Performance).
 - The 4-bit cache is lossy: output text drifts from bf16's earlier (67% token-identical on HumanEval+ against 88% for fp8) even though task accuracy held.
+
+## Roadmap
+
+The engine is built around one model, and the next gains are in quantization: a better quantized model is expected, and two quantization ideas are prototyped but not in this engine yet.
+
+Done:
+
+- [x] 4-bit KV cache: 262,144-token context in 24 GB
+- [x] Host-pinned embedding and head tables (4.7 GiB of VRAM back)
+- [x] MTP speculative decoding with an n-gram prompt-lookup tail
+- [x] OpenAI-compatible server with multi-turn prefix reuse
+
+To do:
+
+- [ ] Move to the better quantized model when it is released. The W4 kernels assume uniform symmetric int4 with group size 128, so a different format means kernel work.
+- [ ] Rotated 4-bit KV cache (Hadamard rotation plus a calibrated per-channel mean, same 4.125 bits). On a Qwen3.5-2B proxy it cut the perplexity cost about 10x (+2.0% to +0.19%).
+  Not yet checked on the 27B, and the rotation's kernel cost is unmeasured.
+- [ ] Non-uniform weight codebook (16 levels per group): +2.8 points top-1 fidelity over round-to-nearest on Qwen3-4B, unconfirmed on the 27B.
+  The fused kernel built so far is about 2x slower than uniform int4 at decode.
+- [ ] Measure multi-turn agentic task success (tool calls, edit-and-test loops) for each KV dtype.
+- [ ] Int4 KV for the MTP layer (about 3 KiB per token saved).
+- [ ] Faster long prefill (about 960 tok/s at 262k context).
+- [ ] Prompt lookup beyond 196,608 context with the 4-bit cache, and an explanation for why decode at 262k costs the same as at 196k.
+- [ ] Understand the needle miss at 100k with the 4-bit cache.
+- [ ] Repeat the HyperQwen comparison (repeats, a 250 W run) and add its DFlash2 preset if it can be started.
+
+Not planned: other models, other GPUs, batching.
 
 ## Development
 
