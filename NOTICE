@@ -4,9 +4,7 @@ Copyright (c) 2026 Tuan Nguyen
 A single-sequence decode engine (CUDA, W4A16 g128 + MTP speculative decoding, optional 4-bit
 KV cache) for the Swift-1.5-Qwen3.8-27B INT4 checkpoint on one RTX 3090, with an
 OpenAI-compatible server.
-Unofficial: not affiliated with, endorsed by or sponsored by Alibaba or the Qwen team, or by
-UkisAI. "Qwen" is a trademark of its owners.  Most of the code was written by AI coding agents
-under human direction and verified with the tests and measurements described in docs/.
+"Qwen" is a trademark of its owners; this project is not affiliated with them or with UkisAI.
 
 This project's own code and text are released under the MIT License (see LICENSE).
 

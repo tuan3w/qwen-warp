@@ -7,7 +7,7 @@ A CUDA decode engine with a 4-bit KV cache and MTP speculative decoding, behind 
 long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, caveats in [Performance](#performance)).
 
 > **RTX 3090 only.** Tuned and tested on one RTX 3090 (24 GB); no other GPU has been tried and other cards may fail to build or run.
-> One model, one stream at a time, text only. Unofficial; not affiliated with Alibaba, the Qwen team or UkisAI.
+> One model, one stream at a time, text only.
 
 ## Contents
 
@@ -143,6 +143,5 @@ tests/     checkpoint-only tests         docs/  architecture and performance not
 
 ## Credits and license
 
-MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. Most of the code was written by AI coding agents under human direction, so trust the
-tests and [measurements](docs/PERFORMANCE.md) rather than the authorship. Third-party credits and what was and was not taken from each: [NOTICE](NOTICE).
+MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. Third-party credits and what was and was not taken from each: [NOTICE](NOTICE).
 It was compared against [HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware.
