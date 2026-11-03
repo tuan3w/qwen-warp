@@ -3,6 +3,20 @@
 A single-stream CUDA decode engine and OpenAI-compatible server for **Swift-1.5-Qwen3.8-27B (INT4)** on **one RTX 3090**, with a **4-bit KV cache** that
 fits the model's full 262,144-token context in 24 GB. Built for long agentic-coding sessions: one user, long prompts, fast decode.
 
+## Contents
+
+- [Highlights](#highlights)
+- [Scope](#scope)
+- [Performance at a glance](#performance-at-a-glance)
+- [Requirements](#requirements)
+- [Run](#run)
+- [Tests](#tests)
+- [Layout](#layout)
+- [Status and credits](#status-and-credits)
+- More: [Performance, methods and caveats](docs/PERFORMANCE.md) | [Architecture](docs/ARCHITECTURE.md) | [Third-party credits](NOTICE)
+
+## Highlights
+
 - 17-19 ms/token plain decode (53-59 tok/s without speculation), 105-166 tok/s with MTP speculative decoding on short prompts (code is fastest).
 - 91-128 tok/s decode at 32k-190k tokens of context (int4 KV, MTP + prompt lookup).
 - 262,144-token context in 22.4 GiB with `--profile long`; 4-bit KV changed coding pass@1 by -1.1 points (not significant) and perplexity by about +0.26% at 98k.
@@ -10,7 +24,9 @@ fits the model's full 262,144-token context in 24 GB. Built for long agentic-cod
 
 Numbers, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-**Scope, stated plainly.** Optimized for the **RTX 3090 only** and not tested on any other GPU: the kernels are compiled for sm_86 and tuned (tile shapes, memory budgets,
+## Scope
+
+Optimized for the **RTX 3090 only** and not tested on any other GPU: the kernels are compiled for sm_86 and tuned (tile shapes, memory budgets,
 the measured context limits) on a 24 GB 3090. Other cards may fail to build or run, or run slowly; no other chip was tried. One model (Swift-1.5-Qwen3.8-27B INT4), batch size 1,
 text only. It is not a general inference server. Speed and quality figures are single runs on one machine at a 350 W power limit. Multi-turn agentic task success has **not** been measured.
 

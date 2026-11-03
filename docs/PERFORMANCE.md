@@ -1,5 +1,8 @@
 # Performance and quality: what was measured, and how far to trust it
 
+Contents: [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) |
+[4. Comparison with HyperQwen](#4-comparison-with-hyperqwen) | [5. Reproducing](#5-reproducing) | [Back to README](../README.md)
+
 Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
 the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
 Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 (plus the prompt-lookup tail where stated), greedy.
