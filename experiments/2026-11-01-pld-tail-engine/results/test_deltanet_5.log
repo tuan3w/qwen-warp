@@ -1,8 +1,0 @@
-[random:softplus>20]
-  ok   y                                                          max|err|/max|ref| = 2.759e-03 (tol 6.0e-03)
-  ok   last state                                                 max|err|/max|ref| = 2.549e-07 (tol 2.0e-05)
-[random:b extreme]
-  ok   y                                                          max|err|/max|ref| = 1.955e-03 (tol 6.0e-03)
-  ok   last state                                                 max|err|/max|ref| = 2.703e-07 (tol 2.0e-05)
-
-ALL PASS

@@ -1,5 +1,5 @@
 // swift-mk K1: fused gated-DeltaNet decode step (conv1d+silu, l2norm, gating, recurrence with per-row ring snapshots, gated RMSNorm).
-// Clean-room; algorithm per HF qwen3_5 torch_recurrent_gated_delta_rule (semantics in oracle/NOTES.md §2).
+// Clean-room; algorithm per HF qwen3_5 torch_recurrent_gated_delta_rule (semantics: the reference gated delta rule).
 //
 // Parallelisation: grid = 48 v-heads x NS V-slices.  Every V row of the state is independent in the recurrence
 // (kv[v] = sum_k S[v][k] k[k] ...), so a block owns VR = 128/NS V rows x 128 K of its head, keeps them in registers across
@@ -9,7 +9,7 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-// V-slices per head (grid = 48*NS blocks), tuned per T on the 3090 (BENCH.md): T<=2 NS=16 (more bytes in flight), T>=3 NS=8 (fewer shuffles/regs; T=5..8: K11).
+// V-slices per head (grid = 48*NS blocks), tuned per T on the 3090: T<=2 NS=16 (more bytes in flight), T>=3 NS=8 (fewer shuffles/regs; T=5..8: K11).
 #ifndef DN_NS_SMALL_T
 #define DN_NS_SMALL_T 16
 #endif

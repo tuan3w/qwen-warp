@@ -1,7 +1,7 @@
-"""swift-mk engine driver: loads the packed weights to the GPU, owns the C engine, prefill-by-decode + greedy decode.
+"""qwen-warp engine driver: loads the packed weights to the GPU, owns the C engine, prefill-by-decode + greedy decode.
 
   from engine import Engine;  e = Engine(ctx_max=4096);  e.reset();  first = e.prefill(prompt_ids);  toks = e.decode(32)
-Run with the lab venv (~/llm-lab/venv/bin/python); needs the GPU lease.
+Checkpoint: $SWIFT_MODEL (default ~/models/swift-1.5-int4).  Needs an RTX 3090 (sm_86; no other GPU has been tested) and the built libswiftmk.so (make -C engine).
 """
 import ctypes as C
 import os
@@ -14,7 +14,6 @@ import torch
 HERE = Path(__file__).resolve().parent
 HEADQ_I4R = 3  # include/head_q.h SMK_HEADQ_I4R: int4 head in the repacked layout
 DEFAULT_HEAD = "int4"  # K9: lm_head path: "int8" | "int4" (quantised head + exact BF16 rescoring) | "bf16" (the plain BF16 head); env SMK_HEAD overrides
-sys.path.insert(0, str(HERE / "tests"))
 sys.path.insert(0, str(HERE))
 import smk  # noqa: E402
 import pack  # noqa: E402
@@ -22,7 +21,7 @@ from weights import Checkpoint  # noqa: E402
 
 
 class Engine:
-    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None):
+    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None):
         assert layers == pack.NL
         self.lib = smk.load(lib)
         smk.setup_engine_api(self.lib)
@@ -40,6 +39,19 @@ class Engine:
             self.hq_kind = HEADQ_I4R
         elif G.hq is not None:
             self.hq_kind = G.hq.kind
+        # Long context: the bf16 embedding and lm_head tables (2 x 2.37 GiB) are only gathered by row when the quantised head is on (embedding of the step's tokens, exact rescoring
+        # of the top-R candidates), so they can live in pinned host memory: decode is unchanged (tests/test_host_tables.py) and ~4.7 GiB of VRAM becomes KV cache.  Done before the C engine
+        # allocates its KV cache.  The plain BF16 head (set_head('bf16'), MTP head_mode 1) scans a whole table per step and would stream it over PCIe, so it is refused.
+        self.tables_on_host = False
+        if (os.environ.get("SMK_HOST_TABLES", "0") == "1") if host_tables is None else bool(host_tables):
+            assert G.hq is not None, "host tables need the quantised head (Engine(head='int4'|'int8'))"
+            emb = torch.empty(G.embed.shape, dtype=G.embed.dtype, pin_memory=True)
+            emb.copy_(G.embed)
+            lmh = torch.empty(G.lm_head.shape, dtype=G.lm_head.dtype, pin_memory=True)
+            lmh.copy_(G.lm_head)
+            G.embed, G.lm_head = emb, lmh  # the C engine holds raw pointers into these: they live as long as G
+            self.tables_on_host = True
+        torch.cuda.empty_cache()  # weight packing leaves ~1.5 GiB of idle blocks in torch's pool (and the GPU tables just freed): hand them to the driver before the engine's cudaMallocs
         self.load_s = time.time() - t0
         m = smk.ModelW()
         p = smk.ptr
@@ -69,6 +81,7 @@ class Engine:
 
     def set_head(self, head):
         """'bf16' = plain BF16 head + argmax (the pre-K9 path), 'q' = quantised head + exact top-R rescoring (needs Engine(head='int8'|'int4'))."""
+        assert not (head == "bf16" and self.tables_on_host), "the plain BF16 head needs the lm_head table on the GPU (Engine(host_tables=False))"
         smk.check(self.lib.smk_engine_set_head(self.h, 0 if head == "bf16" else 1), "set_head")
 
     # ---- state

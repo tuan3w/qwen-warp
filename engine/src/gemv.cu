@@ -1,6 +1,6 @@
 // swift-mk K3: W4A16 mma GEMV (T<=8 rows), BF16 lm_head GEMV (CUDA-core T=1 / mma T>1), small BF16 GEMV, gate|up interleave.
 // Clean-room; the mma tile design, dequant trick (lop3 -> bf16x2 128+n, exact fma -136) and persistent flat (tile,group) stream are from
-// experiments/2026-10-30-w4-multirow-verify-and-power/kernels.cuh (same author).
+// an earlier W4 multi-row verify prototype (same author).
 //
 // mma: A operand = weights (16 output rows per tile), B operand = activations (n8 tile = up to 8 tokens), fp32 accumulate per 128-k group,
 // fp32 scale after.  One thread (g=lane>>2, t=lane&3) owns rows g and g+8 of the tile and per 128-k group one 16 B chunk of each row:
@@ -417,7 +417,7 @@ static cudaError_t w4_gemv(const void* w, const void* s, const void* x, int N, i
 
 extern "C" {
 
-// config table for tuning (bench) -- ids match experiments/..w4-multirow..: 0 w8k4u2, 1 w8k8u2, 2 w8k2u3, 3 w4k4u3, 4 w16k8u2, 5 w8k1u3
+// config table for tuning (bench) -- ids: 0 w8k4u2, 1 w8k8u2, 2 w8k2u3, 3 w4k4u3, 4 w16k8u2, 5 w8k1u3
 cudaError_t smk_w4_gemv_cfg(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
   return w4_cfg<0>(w, s, x, N, K, T, epi, cfg, st);
 }

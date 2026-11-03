@@ -1,6 +1,6 @@
 """swift-mk runner: one bs=1 sequence at a time on the C engine, with exact stops, streaming-sized syncs and multi-turn prefix reuse.
 
-No vLLM imports here (the vLLM glue is smk_core_client.py).  Run with the lab venv (~/llm-lab/venv/bin/python); needs the GPU lease.
+No vLLM imports here (the vLLM glue is smk_core_client.py).  Needs an RTX 3090 (sm_86; no other GPU has been tested).
 
   r = Runner(ctx_max=8192, kv_fp8=0, k=3, group=2)
   for toks, finish, stop_reason in r.run(prompt_ids, GenParams(max_tokens=64, eos=248046), cancelled=lambda: False): ...
@@ -26,7 +26,6 @@ import torch
 
 ENGINE = Path(__file__).resolve().parent.parent / "engine"
 sys.path.insert(0, str(ENGINE))
-sys.path.insert(0, str(ENGINE / "tests"))
 from spec import SpecEngine, make_pld, smk  # noqa: E402
 from prefill import FastPrefill  # noqa: E402
 
@@ -64,7 +63,7 @@ class Stats:
 
 
 class Runner:
-    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False):
+    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.62 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
@@ -72,7 +71,7 @@ class Runner:
         self.pld = (make_pld() if pld is True else pld) or None
         t0 = time.time()
         try:
-            self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4)
+            self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)
         except AttributeError as ex:  # ctypes: symbol missing in an old libswiftmk.so
             raise RuntimeError(f"libswiftmk.so is older than the sources ({ex}): run `make -C engine` (or point SMK_BUILD at a current build dir)") from ex
         self.fp = FastPrefill(self.e, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))

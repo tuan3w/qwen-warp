@@ -232,8 +232,8 @@ static void drop_graphs(smk_spec* s) {
   for (int m = 0; m < 2; m++)
     for (auto* arr : {s->g_cycle[m], s->g_verify[m], s->g_stage[m], s->g_cu[m], s->g_start[m], s->g_pld[m]})
       for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
-  for (auto* arr : {s->g_smp_t, s->g_smp_d})
-    for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
+  for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (s->g_smp_t[i]) { cudaGraphExecDestroy(s->g_smp_t[i]); s->g_smp_t[i] = nullptr; }
+  for (int i = 0; i <= SMK_SPEC_KMAX; i++) if (s->g_smp_d[i]) { cudaGraphExecDestroy(s->g_smp_d[i]); s->g_smp_d[i] = nullptr; }  // g_smp_d has KMAX + 1 entries (the old shared PMAX loop ran past it into res / res_dev / pin_tail / pld)
   for (int i = 0; i <= TM; i++) if (s->g_prefill[i]) { cudaGraphExecDestroy(s->g_prefill[i]); s->g_prefill[i] = nullptr; }
   if (s->g_first) { cudaGraphExecDestroy(s->g_first); s->g_first = nullptr; }
   if (s->g_plain) { cudaGraphExecDestroy(s->g_plain); s->g_plain = nullptr; }

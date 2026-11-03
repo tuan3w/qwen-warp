@@ -1,11 +1,10 @@
-"""swift-mk MTP draft-path packer: BF16 MTP head -> int4 g128 engine W4 format + restricted-vocab int4 draft head.
+"""qwen-warp MTP draft-path packer: BF16 MTP head -> int4 g128 engine W4 format + restricted-vocab int4 draft head.
 
-  W4 quantiser (E4 'int4' / 'int4clip', experiments/2026-10-31-mtp-draft-head-ablation/run.py:80-130): symmetric g128 along K, q in [-8, 7],
-  scale = amax / 7.5 (clip: per-group MSE-optimal ratio in {1.0, 0.95, .. 0.5}); here the scale is rounded to bf16 *before* quantising so the
-  engine dequant (nibble - 8) * bf16_scale reproduces exactly what was optimised.  Output layout = the checkpoint's: uint32 [N][K/8], nibble e of
-  word j = column 8j+e, bf16 scale [N][K/128].
-  Draft vocab: the 65536 most frequent tokens of the E4 corpus (freq.npy) + forced ids (special/added tokens, the 256 byte tokens, every token of
-  the chat templates), ascending ids (so argmax ties resolve to the lowest full id like the full head).  Cached in draft_vocab_64k.npy (committed).
+  W4 quantiser: symmetric g128 along K, q in [-8, 7], scale = amax / 7.5 (clip: per-group MSE-optimal ratio in {1.0, 0.95, .. 0.5}); the scale is rounded to
+  bf16 *before* quantising so the engine dequant (nibble - 8) * bf16_scale reproduces exactly what was optimised.  Output layout = the checkpoint's: uint32
+  [N][K/8], nibble e of word j = column 8j+e, bf16 scale [N][K/128].
+  Draft vocab: the shipped ascending token-id lists draft_vocab_ext_68864.npy (default) and draft_vocab_64k.npy (65536 rows); the lowest full id wins argmax
+  ties like the full head.
 """
 import os
 import sys
@@ -20,7 +19,7 @@ import pack  # noqa: E402
 from pack import H, I  # noqa: E402
 
 MODEL = Path(os.environ.get("SWIFT_MODEL", os.path.expanduser("~/models/swift-1.5-int4")))
-FREQ = Path.home() / "llm-lab" / "mtp-ablation" / "freq.npy"
+# (the draft-vocab lists are built offline and shipped as .npy files next to this module)
 VOCAB_NPY = HERE / "draft_vocab_64k.npy"                  # legacy English/code list (65536 rows), nv=65536
 VOCAB_EXT_NPY = HERE / "draft_vocab_ext_68864.npy"        # shipped default: legacy list + 3314 extension tokens + 14 pad, 68864 rows
 GROUP = 128
@@ -74,43 +73,13 @@ class W4t:
 
 
 def draft_vocab(nv=None):
-    """Ascending int64 numpy array of the draft-vocab token ids.  nv=None (default): the shipped list VOCAB_EXT_NPY (68864 rows: the 65536-row list + 3314 extension tokens + 14 pad).
-    nv=65536: the legacy English/code list (cached in VOCAB_NPY).  Other nv: frequency list built from FREQ."""
+    """Ascending int64 numpy array of the draft-vocab token ids.  nv=None (default): VOCAB_EXT_NPY (68864 rows: the 65536-row list + 3314 extension tokens + 14 pad).
+    nv=65536: the legacy English/code list (VOCAB_NPY).  Other sizes need a frequency list that is not part of this repository."""
     if nv is None:
         return np.load(VOCAB_EXT_NPY)
-    if nv == 65536 and VOCAB_NPY.exists():
-        return np.load(VOCAB_NPY)
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(str(MODEL))
-    ids = set(tok.all_special_ids) | set(tok.get_added_vocab().values()) | set(range(256))
-    convos = [
-        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello"},
-         {"role": "assistant", "content": "Hi! How can I help?"}, {"role": "user", "content": "Call a tool."}],
-        [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "tool_calls": [
-            {"type": "function", "function": {"name": "f", "arguments": {"x": 1}}}]}, {"role": "tool", "content": "r"}],
-    ]
-    for c in convos:
-        for think in (False, True):
-            try:
-                txt = tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=think)
-                ids |= set(tok(txt, add_special_tokens=False)["input_ids"])
-            except Exception:  # noqa: BLE001 - a template may reject a role layout; the others still cover it
-                pass
-    ids |= set(tok((MODEL / "chat_template.jinja").read_text(), add_special_tokens=False)["input_ids"])
-    keep = {i for i in ids if i < pack.V}
-    forced = len(keep)
-    freq = np.load(FREQ)
-    for i in np.argsort(-freq, kind="stable"):
-        if len(keep) >= nv:
-            break
-        keep.add(int(i))
-    arr = np.array(sorted(keep), dtype=np.int64)
-    assert len(arr) == nv, len(arr)
-    print(f"draft vocab: {nv} ids ({forced} forced)")
     if nv == 65536:
-        np.save(VOCAB_NPY, arr)
-    return arr
+        return np.load(VOCAB_NPY)
+    raise ValueError(f"draft vocab size {nv}: only the shipped lists (None = 68864, 65536) are available")
 
 
 class MtpPack:
@@ -146,7 +115,7 @@ def load_mtp(G, ck=None, quant="int4clip", head_quant="int4", nv=None, verbose=T
     M.down = W4t(*quant_w4(g(L + "mlp.down_proj.weight"), clip))
     ids = draft_vocab(nv)
     M.ids_t = torch.from_numpy(ids.astype(np.int32)).to(d)
-    M.head = W4t(*quant_w4(G.lm_head[torch.from_numpy(ids).to(d)], hclip))
+    M.head = W4t(*quant_w4(G.lm_head[torch.from_numpy(ids).to(G.lm_head.device)].to(d), hclip))  # lm_head may be a pinned-host table (Engine host_tables)
     M.nv = len(ids)
     torch.cuda.synchronize()
     if verbose:

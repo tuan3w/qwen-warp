@@ -1,7 +1,7 @@
 """swift-mk speculative driver: Engine + packed int4 MTP head + on-device draft / verify / accept cycle graph (include/mtp.h).
 
   from spec import SpecEngine;  e = SpecEngine(ctx_max=4096);  toks = e.generate(ids, 128, k=3)
-Run with the lab venv (~/llm-lab/venv/bin/python); needs the GPU lease.
+Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import ctypes as C
 import time
@@ -82,6 +82,8 @@ def setup_spec_api(lib):
 
 class SpecEngine(Engine):
     def __init__(self, ctx_max=4096, kv_fp8=0, quant="int4clip", head_quant="int4", head_mode=0, nv=None, verbose=True, **kw):
+        if head_mode == 1:  # the MTP draft head is the full BF16 lm_head: it must stay on the GPU
+            kw["host_tables"] = False
         super().__init__(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=verbose, **kw)
         setup_spec_api(self.lib)
         t0 = time.time()

@@ -1,4 +1,4 @@
-// swift-mk K4: on-device MTP speculative decoding (greedy) for the 64-layer engine.  Contract: docs/ENGINE.md + oracle/NOTES.md §14.
+// swift-mk K4: on-device MTP speculative decoding (greedy) for the 64-layer engine.  Contract: docs/ARCHITECTURE.md.
 //
 // One captured CUDA graph per cycle (k = 1..3 drafts):
 //   verify : T = 1+k rows [anchor, d1..dk] through the main model (engine step, final norm + lm_head + argmax for every row: the full BF16 head, or by default the K9 quantised head + exact rescoring of the top-R candidates, include/head_q.h)

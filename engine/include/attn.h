@@ -1,4 +1,4 @@
-// swift-mk K2: full-attention decode (T = 1..8 rows) for one full-attention layer (or the MTP layer's attention).  See ENGINE.md for the contract.
+// swift-mk K2: full-attention decode (T = 1..8 rows) for one full-attention layer (or the MTP layer's attention).  See docs/ARCHITECTURE.md for the contract.
 //
 // Three launches per layer (all graph-capturable, no host sync, no allocation):
 //   1. prep   : per-head q/k RMSNorm (zero-centred, eps 1e-6) + partial rope (first 64 of 256 dims, rotate_half, theta 1e7, angle in fp64),

@@ -1,5 +1,5 @@
 // swift-mk K9: quantised lm_head GEMV (int8 per-row CUDA-core kernel; int4 g128 = smk_w4_gemv / smk_w4r_gemv) + top-R select + exact BF16 rescoring.  See include/head_q.h.
-// The int8 kernel is the E5 prototype (experiments/2026-10-31-lm-head-quantisation-quality/bench_head.cu, same author): one warp = two rows, lane l reads a uint4
+// The int8 kernel: one warp = two rows, lane l reads a uint4
 // (16 columns) per 512-column step, int8 -> fp32 by the magic-number trick (xor 0x80 per byte, PRMT into the mantissa of 2^23, subtract 2^23 + 128), x in smem in a
 // lane-permuted fp32 layout (conflict-free LDS.128), persistent grid (smem filled once per CTA).
 #include "head_q.h"

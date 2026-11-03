@@ -1,6 +1,0 @@
-{
-  "nvcc": "Build cuda_13.0.r13.0/compiler.36424714_0",
-  "sm_86_returncode": 255,
-  "sm_86_stderr": "ptxas /tmp/tmpxft_00241f92_00000000-6_pdl_probe.ptx, line 26; error   : Modifier '.wait' requires .target sm_90 or higher\nptxas /tmp/tmpxft_00241f92_00000000-6_pdl_probe.ptx, line 26; error   : Instruction 'griddepcontrol' requires .target sm_90 or higher\nptxas /tmp/tmpxft_00241f92_00000000-6_pdl_probe.ptx, line 29; error   : Modifier '.launch_dependents' requires .target sm_90 or higher\nptxas /tmp/tmpxft_00241f92_00000000-6_pdl_probe.ptx, line 29; error   : Instruction 'griddepcontrol' requires .target sm_90 or higher\nptxas fatal   : Ptx assembly aborted due to errors",
-  "sm_90_returncode": 0
-}

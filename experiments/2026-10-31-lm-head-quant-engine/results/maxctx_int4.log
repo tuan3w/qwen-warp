@@ -1,6 +1,0 @@
-OK ctx 32768 kv bf16: used 23.22 GiB of 23.56 (before the engine: 0.91); 32256-token prompt prefill 17.1 s = 1885 tok/s
-OK ctx 36864 kv bf16: used 23.50 GiB of 23.56 (before the engine: 0.91); 36352-token prompt prefill 19.9 s = 1829 tok/s
-FAIL ctx 40960 kv bf16: OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 38.75 MiB is free. Process 7406 has 59.35 MiB memory
-OK ctx 65536 kv fp8: used 23.47 GiB of 23.56 (before the engine: 0.91); 65024-token prompt prefill 39.6 s = 1643 tok/s
-FAIL ctx 73728 kv fp8: OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 38.75 MiB is free. Process 7406 has 59.35 MiB memory
-FAIL ctx 81920 kv fp8: OutOfMemoryError: CUDA out of memory. Tried to allocate 162.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 134.75 MiB is free. Process 7406 has 59.35 MiB memo

@@ -1,2 +1,0 @@
-FAIL ctx 32768 kv bf16: OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 28.75 MiB is free. Process 7406 has 59.35 MiB memory
-FAIL ctx 65536 kv fp8: RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`

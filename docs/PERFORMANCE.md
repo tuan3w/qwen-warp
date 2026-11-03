@@ -1,0 +1,90 @@
+# Performance and quality: what was measured, and how far to trust it
+
+Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
+the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
+Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 (plus the prompt-lookup tail where stated), greedy.
+
+## 1. Memory: how much context fits
+
+The KV cache is the only thing that grows with context. Per token, for the 16 full-attention layers (4 KV heads x 256 dims):
+
+| KV dtype | bytes / token | 262,144 tokens |
+|---|---|---|
+| bf16 | 64 KiB | 16 GiB |
+| fp8 (e4m3, checkpoint scales) | 32 KiB | 8 GiB |
+| int4 (per token+head, asymmetric) | 16.5 KiB | 4.1 GiB |
+
+Largest `--max-model-len` that was **measured to start and serve** with the full stack (MTP + fast prefill) on this card:
+
+- bf16 KV: about 74,000 (the server test used 74,000; 100k does not fit)
+- fp8 KV: 65k with the embedding/head tables on the GPU; 131k with `--host-tables`
+- int4 KV: 98k with the tables on the GPU; **262,144 with `--host-tables`** (22.4 GiB used, 22.44 ms/token decode, 964 tok/s prefill at that length, engine-level measurement)
+- Server-level check of the 262k configuration (`--profile long --max-model-len 262144 --prompt-lookup 0`, one request): a 250,055-token prompt was prefilled in 268 s
+  and a code word planted at its very start was returned correctly. One request with one needle shows the length works end to end; it is not a retrieval benchmark.
+
+`--host-tables` moves the bf16 embedding and the rescoring lm_head (4.7 GiB) to pinned host memory. It is bit-identical (greedy ids and logits
+equal, `tests/test_host_tables.py`) and cost 0 to 2% of decode speed (two runs: 17.25 vs 17.27 ms/token, and 18.89 vs 19.23 ms/token). The plain bf16 head and the MTP `head_mode 1` are
+refused in this mode because they would stream a whole table over PCIe every step.
+
+## 2. Quality of the 4-bit KV cache
+
+Perplexity on code text, teacher-forced, same engine and head, bf16 KV as reference:
+
+- 32k tokens: int4 +0.27%
+- 98k tokens: int4 **+0.26% (+-0.05)**, no growth with position. fp8: +0.03%.
+
+Task accuracy (greedy, pass@1, 283 coding tasks = HumanEval+ (163, with HumanEval/32 excluded for a dataset bug) + MBPP+ (120)):
+
+- bf16 244, fp8 243, **int4 241** (-1.1 points vs bf16, p = 0.45: not distinguishable from noise at this sample size, and not proof of equality)
+- HumanEval+ alone: int4 142 vs bf16 146 (p = 0.22)
+- Token-identical to bf16 on HumanEval+: fp8 88%, int4 67%. Greedy outputs under a lossy cache drift from bf16's; whether a drifted answer is still correct is what the pass@1 rows measure.
+- Repo question-answering over a real code base: every arm 82/86 at <= 64k context. At 100k: fp8 36/36, int4 34/36.
+- Needle-in-a-haystack at ~100k, 8 prompts: fp8 8/8, int4 7/8. The miss is a real int4 failure mode to know about: in the separate speed sweep this engine's int4 arm also missed the needle at 100k (and found it at 32k, 64k, 130k and 190k), while fp8 and both HyperQwen presets found it at 100k.
+
+**Not measured:** multi-turn agentic task success (tool calls, edit-and-test loops), which is the use case this cache is aimed at. The numbers above
+are single-shot coding and retrieval proxies. Treat int4 as "no measurable loss on these proxies", not as "validated for agents".
+`tests/test_kv_dtypes.py` is a regression guard for the cache (a broken cache shows up as tens of percent), not a replacement for these measurements.
+
+## 3. Speed
+
+Decode tokens/s at the given prompt length (single run, 350 W):
+
+| context | 32k | 64k | 100k | 130k | 190k |
+|---|---|---|---|---|---|
+| int4 KV + prompt lookup | 122 | 117 | 107 | 102 | 94 |
+| int4 KV | 120 | 128 | 103 | 101 | 91 |
+| fp8 KV | 117 | 117 | 108 | 98 | not served in this run |
+
+Short prompts, int4 KV, greedy: 166 tok/s on code, 105 on prose, 156 on math (speculative decoding gain depends on the text; the cause of the prose gap was not isolated).
+Cold prefill: 1,830 tok/s at 16k, falling to 964 tok/s at 262k (178 s for a 190k prompt). Attention kernel time with int4 is 0.55 to 0.9 of fp8 at every length measured.
+
+Decode slows from 120 to 91 tok/s between 32k and 190k. [INFERENCE] This is the attention scan over a longer cache, since the weight reads are the same at every length; no profile was taken to separate it.
+
+## 4. Comparison with HyperQwen
+
+[HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) was run unmodified from its public image `ghcr.io/syv-ai/hyperqwen:latest` on the same card, power limit,
+checkpoint, client and prompts. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
+
+- this engine, int4 KV: 120 / 128 / 103 / 101 / 91
+- HyperQwen `mtp-long` (fp8/int8 KV): 94 / 88 / 80 / 68 / not served at 190k
+- HyperQwen `mtp-huge` (4/2-bit KVarN, its long-context preset): 58 / 53 / 39 / 31 / 27
+
+Cold prefill was within about 10% of each other. On the short-prompt control this engine measured 166 / 105 / 156 tok/s (code / prose / math)
+against 118 / 79 / 121 for `mtp-long`.
+
+Quality, same coding tasks: `mtp-long` 244, `mtp-huge` 242, this engine's int4 241 (all within noise of each other).
+
+Caveats, all of which matter:
+
+- **Single run each, one machine, one power limit.** No repeat, no 250 W comparison.
+- HyperQwen's default memory setting (`GPU_UTIL=0.93`) runs out of memory on this desktop card; it was run with `GPU_UTIL=0.88 KV_MEM=` (its own documented workaround).
+  `mtp-huge` was run at its default memory settings.
+- HyperQwen's `dflash2-long` preset failed to start here and is **not compared**. The cause was not captured, so this is not evidence about that preset.
+- HyperQwen is a different design; this engine is hard-wired to one model on sm_86. The comparison is for this one
+  workload, a single stream on a 3090. It says nothing about batching or other GPUs.
+
+## 5. Reproducing
+
+`uv run tests/test_kv_dtypes.py`, `tests/test_host_tables.py` and `tests/test_server_smoke.py` check the cache, the host tables and the server end-to-end with only the
+checkpoint. The long-context sweeps above were done with throwaway harnesses against this engine and the HyperQwen container; they are not part of this
+repository, so the tables in sections 2 to 4 are reported results, not something `make test` regenerates.

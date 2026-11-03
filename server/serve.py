@@ -1,12 +1,14 @@
 #!/usr/bin/env python
-"""`vllm serve` for the swift-mk engine: vLLM 0.30's own OpenAI frontend (run_server) on top of the swift-mk CUDA-graph engine.
+"""qwen-warp server: vLLM 0.30's own OpenAI frontend (run_server) on top of the swift-mk CUDA-graph decode engine (RTX 3090, Swift-1.5-Qwen3.8-27B INT4).
 
-  ~/llm-lab/venv/bin/python server/serve.py --port 8000          # defaults below
-  ~/llm-lab/venv/bin/python server/serve.py --model ~/models/swift-1.5-int4 --max-model-len 32768 --kv-cache-dtype fp8 --num-speculative-tokens 3
+  python server/serve.py --port 8000                          # default: bf16 KV, 28k context, MTP k=3 + prompt lookup
+  python server/serve.py --profile long --port 8000           # int4 KV + host-pinned tables: 196k context (up to 262144 with --max-model-len 262144)
+  python server/serve.py --kv-cache-dtype fp8 --max-model-len 53248 --num-speculative-tokens 3
 
 Every stock `vllm serve` frontend flag works (--served-model-name, --host/--port, --api-key, --chat-template, --reasoning-parser, --tool-call-parser, ...).
-Engine flags that map onto swift-mk (read from vLLM's config in smk_core_client.engine_cfg): --max-model-len, --kv-cache-dtype {auto,bfloat16 -> bf16 | fp8},
---num-speculative-tokens (k, 0..3; sugar for --speculative-config '{"method":"mtp","num_speculative_tokens":k}'), and swift-mk's own --stream-cycles / --snapshots.  Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto tool choice, language-model only.
+Engine flags that map onto the engine (read from vLLM's config in smk_core_client.engine_cfg): --max-model-len, --kv-cache-dtype {auto,bfloat16 -> bf16 | fp8 |
+int4_per_token_head}, --num-speculative-tokens (k, 0..3; sugar for --speculative-config '{"method":"mtp","num_speculative_tokens":k}'), and the engine's own
+--profile / --host-tables / --prompt-lookup / --stream-cycles / --snapshots.  Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto tool choice, language-model only.
 """
 import os
 import sys
@@ -16,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 DEFAULT_MODEL = os.path.expanduser("~/models/swift-1.5-int4")
 DEFAULT_MAX_MODEL_LEN = 32768
-DEFAULT_MAX_MODEL_LEN_PLD = 28672  # the K11 prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.62 GiB, measured limit with bf16 KV
+DEFAULT_MAX_MODEL_LEN_PLD = 28672  # the prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.62 GiB, measured limit with bf16 KV
+LONG_MAX_MODEL_LEN = 196608  # --profile long: measured to start and serve with the prompt-lookup tail on a 24 GB card (262144 works with --prompt-lookup 0)
 
 
 def parse_args(argv=None):
@@ -30,10 +33,18 @@ def parse_args(argv=None):
     g.add_argument("--snapshots", type=int, default=4, help="DeltaNet state snapshots kept for multi-turn prefix reuse (151 MB pinned host RAM each; 0 = off)")
     g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.62 GiB for the 9-slot DeltaNet ring: "
                    "--max-model-len <= 28672 with bf16 KV / 53248 with fp8 KV).  auto (default) = on iff --max-model-len fits; the default --max-model-len is 28672 (32768 with --prompt-lookup 0)")
+    g.add_argument("--host-tables", action="store_true", help="keep the bf16 embedding + rescoring lm_head (4.7 GiB) in pinned host memory (bit-identical decode, ~free): VRAM for ~190k more KV tokens with int4 KV")
+    g.add_argument("--profile", default="default", choices=["default", "long"], help="long = --kv-cache-dtype int4_per_token_head --host-tables and a default --max-model-len of 196608 (explicit flags win)")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
                         language_model_only=True, disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
     args = parser.parse_args(argv)
     validate_parsed_serve_args(args)
+    if args.profile == "long":
+        if args.kv_cache_dtype in (None, "auto"):
+            args.kv_cache_dtype = "int4_per_token_head"
+        args.host_tables = True
+        if args.max_model_len is None:
+            args.max_model_len = LONG_MAX_MODEL_LEN
     if args.max_model_len is None:
         args.max_model_len = DEFAULT_MAX_MODEL_LEN if args.prompt_lookup == "0" else DEFAULT_MAX_MODEL_LEN_PLD
     if args.num_speculative_tokens is None and args.speculative_config is None:
@@ -49,7 +60,7 @@ def main(argv=None):
     args = parse_args(argv)
     import smk_core_client
 
-    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"))
+    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables)
     from vllm.entrypoints.launchers.api_server.entry import run_server
 
     uvloop.run(run_server(args))

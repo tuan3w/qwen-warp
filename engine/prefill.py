@@ -5,7 +5,7 @@
   first = fp.prefill(ids)                   # == Engine.prefill(ids): returns the first generated token, engine state ready for decode()
   first = fp.prefill_spec(ids, k=3)         # == SpecEngine.prefill_spec(ids, k): MTP KV + drafts, ready for cycles()
 
-Design (all numbers: BENCH.md "K6 prefill"):
+Design (numbers: docs/PERFORMANCE.md):
   * Per layer, W4 weights are dequantised ((nibble-8)*bf16 scale -> bf16, src/prefill.cu) into a 0.5 GB scratch and multiplied with the activations of a
     whole segment (<= `seg` tokens) by cuBLAS (torch.mm, fp32 accumulate, bf16 out).  The MLP runs in row blocks of `rows` tokens (dequant once per layer).
   * DeltaNet layers: conv1d+SiLU kernel (src/prefill.cu, same maths as the decode kernel, 3-token conv state in/out of ring slot `cur`), then fla's chunked
@@ -16,7 +16,7 @@ Design (all numbers: BENCH.md "K6 prefill"):
   * MTP (SpecEngine): the final-norm hidden of every prompt position + the next prompt token go through the int4 MTP fc / K,V projections; K,V (k_norm + rope) are
     written positionally into the MTP KV cache, exactly what SpecEngine.prefill_spec's smk_spec_prefill_chunk loop does.
   * The last prompt token is run as a normal decode step (head=1): logits, first token, device scalars, and smk_spec_start work unchanged.
-Run with the lab venv (~/llm-lab/venv/bin/python); needs the GPU lease.
+Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import ctypes as C
 import time
@@ -159,7 +159,7 @@ class FastPrefill:
         with self._t("gemm"):
             torch.mm(x, w.t(), out=out)
 
-    # ms of one weight pass (qkvz + o + gu + down, 64 layers) of the W4 kernel at 8 * NT rows, tests/test_w4mm.py --bench (default configs): the cheapest way to cover T rows
+    # ms of one weight pass (qkvz + o + gu + down, 64 layers) of the W4 kernel at 8 * NT rows (default configs): the cheapest way to cover T rows
     # with passes of <= 8 NT rows (a pass costs the weight stream whatever its row count: 14 GB / ~0.9 TB/s = 16 ms floor)
     W4_PASS_MS = (16.2, 19.5, 23.2, 29.1, 33.9, 40.5, 48.3, 66.0)
     _plans = {}

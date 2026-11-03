@@ -1,4 +1,4 @@
-// swift-mk K9: quantised lm_head + exact BF16 rescoring.  Contract: docs/ENGINE.md, evidence experiments/2026-10-31-lm-head-quantisation-quality/.
+// swift-mk K9: quantised lm_head + exact BF16 rescoring.  Contract: docs/ARCHITECTURE.md.
 //
 //   1. approximate logits  logits[t][n] (fp32, all N = 248320 rows, T <= 8 rows; kind 1: T <= 4) from a quantised copy of the lm_head
 //        kind 1: int8 per-row   wq int8 [N][K], sq fp32 [N]    (logit = sq[n] * sum_k wq[n][k] * x[k]),  CUDA-core kernel written here

@@ -1,24 +1,25 @@
 qwen-warp
 Copyright (c) 2026 Tuan Nguyen
 
-A single-sequence decode engine (CUDA, W4A16 g128 + MTP speculative decoding) for the
-Swift-1.5-Qwen3.8-27B INT4 checkpoint on one RTX 3090, with an OpenAI-compatible server,
-a CPU reference, an optimisation-campaign harness and the experiments behind it.
-Unofficial: not affiliated with, endorsed by or sponsored by Alibaba or the Qwen team.
-"Qwen" is a trademark of its owners.
+A single-sequence decode engine (CUDA, W4A16 g128 + MTP speculative decoding, optional 4-bit
+KV cache) for the Swift-1.5-Qwen3.8-27B INT4 checkpoint on one RTX 3090, with an
+OpenAI-compatible server.
+Unofficial: not affiliated with, endorsed by or sponsored by Alibaba or the Qwen team, or by
+UkisAI. "Qwen" is a trademark of its owners.  Most of the code was written by AI coding agents
+under human direction and verified with the tests and measurements described in docs/.
 
 This project's own code and text are released under the MIT License (see LICENSE).
 
 Model weights (not included)
   No weights, tokenizer files or chat templates are distributed here. The engine reads a
-  local copy of the Hugging Face checkpoint ukisai/Swift-1.5-Qwen3.8-27b (INT4
-  compressed-tensors build), which is under its own licence (swift-open-license-1.0, see its
-  model card). Obtain it from its owner and follow its terms; this repository's MIT licence
-  does not cover it.
+  local copy of the Hugging Face checkpoint ukisai/Swift-1.5-Qwen3.8-27b-INT4 (compressed-tensors
+  W4A16 build of ukisai/Swift-1.5-Qwen3.8-27b), which is under its own licence
+  (swift-open-license-1.0, see its model card). Obtain it from its owner and follow its terms;
+  this repository's MIT licence does not cover it.
 
 Third-party projects: credits and what was taken
-  Provenance was audited by comparing this tree with local clones of the upstream
-  repositories (identifiers, comment text, code lines, token sequences). The audit is
+  Provenance was audited by comparing an earlier version of this tree with local clones of the
+  upstream repositories (identifiers, comment text, code lines, token sequences). The audit is
   mechanical and cannot exclude a paraphrased idea; it found no copied code.
 
   bonsai-turbo (RightNow-AI, Apache-2.0): ideas only. Read as prior art for fused decode
@@ -47,19 +48,19 @@ Third-party projects: credits and what was taken
     modified or redistributed. engine/prefill.py calls vLLM's bundled FlashAttention-2
     binding and flash-linear-attention ("fla", MIT) at run time.
 
-  Hugging Face transformers (Apache-2.0) and compressed-tensors (Apache-2.0): oracle/ is a CPU
-    PyTorch re-implementation of the Qwen3.5 hybrid text path and its MTP head. Its
-    semantics (operation order, shapes, rounding points) were transcribed from transformers'
-    qwen3_5 modeling code and vLLM's qwen3_5_mtp model, with file:line pointers in
-    oracle/NOTES.md; the code is not a copy of that source (about 3 % of its tokens lie in
-    short shared runs). transformers is a run-time comparison target; the compressed-tensors
-    pack-quantized layout is implemented independently and only cross-checked against the
-    library.
+  Hugging Face transformers (Apache-2.0) and compressed-tensors (Apache-2.0): the semantics of
+    the Qwen3.5 hybrid text path and its MTP head (operation order, shapes, rounding points)
+    were transcribed from transformers' qwen3_5 modeling code and vLLM's qwen3_5_mtp model;
+    the code is not a copy of that source. engine/weights.py (a safetensors reader for the
+    compressed-tensors pack-quantized layout) is implemented independently and was only
+    cross-checked against the library. transformers is used at run time for the tokenizer.
 
   Read for ideas only (nothing taken, nothing redistributed): megakernels-vs-cuda-graphs
     (msaroufim), tpu-megakernels (Inferact, Apache-2.0), pdl-megakernel-reconstruction (MIT),
-    MegaQwen (Infatoshi, MIT), Megakernels (HazyResearch, MIT). The related-work notes here
-    are our own summaries with file:line pointers and contain no code blocks.
+    MegaQwen (Infatoshi, MIT), Megakernels (HazyResearch, MIT).
+
+KV-cache format: the 4-bit per-token, per-head asymmetric (scale + minimum) layout and its
+attention kernels are our own design; asymmetric integer KV quantisation is a standard technique.
 
 Shared idioms: the mma.sync and cp.async inline-asm wrappers and the warp-shuffle reductions
 in engine/ are the standard forms prescribed by the NVIDIA PTX ISA, and the lop3 magic-number

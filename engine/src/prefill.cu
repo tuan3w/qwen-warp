@@ -5,7 +5,7 @@
 //   * attention: per-head q/k RMSNorm + partial rope (fp64 angle, as src/attn.cu), KV-cache write (bf16 or fp8 e4m3 with the checkpoint scales)
 //     into the engine layout, token-major bf16 K/V for flash-attn, history gather (cache -> bf16), * sigmoid(gate),
 //   * SiLU*mul on the interleaved gate|up GEMM output, MTP input concat.
-// Layouts: include/engine.h, include/attn.h, include/deltanet.h, oracle/NOTES.md.  All launches are async on the given stream.
+// Layouts: include/engine.h, include/attn.h, include/deltanet.h.  All launches are async on the given stream.
 #include <cuda_fp8.h>
 #include <math.h>
 
@@ -137,7 +137,17 @@ __global__ void __launch_bounds__(128) k_gnorm(const uint16_t* __restrict__ o, c
 // q_proj layout (ldq); k, v rows have strides ldk, ldv.  Row t is absolute position pos0 + t.
 //   qout [T][24][256] bf16 (normed + roped q);  k_all/v_all (nullable) bf16 token-major [pos][4][256] at index pos;
 //   kv = engine KV cache of this layer ([2][4][ctx_max][256], bf16 or fp8 e4m3 = x / scale) written at pos.
-template <bool FP8>
+__device__ __forceinline__ float warp_min32(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+__device__ __forceinline__ float warp_max32(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16_t* __restrict__ q, int ldq, const uint16_t* __restrict__ kk, int ldk,
                                                    const uint16_t* __restrict__ vv, int ldv, const uint16_t* __restrict__ q_norm, const uint16_t* __restrict__ k_norm,
                                                    void* kv, int ctx_max, float k_scale, float v_scale, uint16_t* __restrict__ qout,
@@ -194,6 +204,27 @@ __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16
       uint8_t* dst = reinterpret_cast<uint8_t*>(kv) + row;
 #pragma unroll
       for (int i = 0; i < 8; i++) dst[lane + 32 * i] = (uint8_t)__nv_cvt_float_to_fp8(x[i] * is, __NV_SATFINITE, __NV_E4M3);
+    } else if constexpr (I4) {
+      // per token+head asymmetric 4-bit, identical to attn.cu's decode-time writer: x ~ code*s + lo (fp16 s, lo), 2 codes/byte (low nibble = even d), codes
+      // [2][NKV][ctx][128] then u32 meta (s | lo << 16) [2][NKV][ctx].
+      float lo = x[0], hi = x[0];
+#pragma unroll
+      for (int i = 1; i < 8; i++) { lo = fminf(lo, x[i]); hi = fmaxf(hi, x[i]); }
+      lo = warp_min32(lo); hi = warp_max32(hi);
+      const __half sh = __float2half_rn(fmaxf(hi - lo, 1e-3f) * (1.f / 15.f)), lh = __float2half_rn(lo);
+      const float sf = __half2float(sh), lf = __half2float(lh), inv = 1.f / sf;
+      uint8_t* dst = reinterpret_cast<uint8_t*>(kv) + (row >> 1);
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        int code = (int)rintf((x[i] - lf) * inv);
+        code = code < 0 ? 0 : (code > 15 ? 15 : code);
+        const int hi_c = __shfl_xor_sync(0xffffffffu, code, 1);
+        if (!(lane & 1)) dst[16 * i + (lane >> 1)] = (uint8_t)((hi_c << 4) | code);
+      }
+      if (lane == 0) {
+        uint32_t* meta = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2));
+        meta[(size_t)(isv * NKV + kvh) * ctx_max + pos] = (uint32_t)__half_as_ushort(sh) | ((uint32_t)__half_as_ushort(lh) << 16);
+      }
     } else {
       uint16_t* dst = reinterpret_cast<uint16_t*>(kv) + row;
 #pragma unroll
@@ -203,7 +234,7 @@ __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16
 }
 
 // history gather: cache [2][4][ctx_max][256] (bf16 / fp8*scale) positions [0, npos) -> k_all / v_all bf16 [pos][4][256].  One thread = 8 elements.
-template <bool FP8>
+template <bool FP8, bool I4>
 __global__ void k_gather_kv(const void* __restrict__ kv, int ctx_max, int npos, float k_scale, float v_scale, uint16_t* __restrict__ k_all, uint16_t* __restrict__ v_all) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const long long n = (long long)npos * NKV * (HD / 8);
@@ -226,6 +257,15 @@ __global__ void k_gather_kv(const void* __restrict__ kv, int ctx_max, int npos, 
         const __nv_fp8_storage_t s8 = (__nv_fp8_storage_t)((rr[b >> 2] >> (8 * (b & 3))) & 0xffu);
         f[b] = __half2float(__half(__nv_cvt_fp8_to_halfraw(s8, __NV_E4M3))) * sc;
       }
+      *reinterpret_cast<uint4*>(dst) = make_uint4(pack_bf16x2(f[0], f[1]), pack_bf16x2(f[2], f[3]), pack_bf16x2(f[4], f[5]), pack_bf16x2(f[6], f[7]));
+    } else if constexpr (I4) {
+      const size_t rowi = (size_t)(isv * NKV + kvh) * ctx_max + pos;
+      const uint32_t cw = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(kv) + rowi * (HD / 2) + d8 * 4);  // 8 codes
+      const uint32_t m = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2) + rowi * 4);
+      const float s = __half2float(__ushort_as_half((unsigned short)(m & 0xffffu))), l = __half2float(__ushort_as_half((unsigned short)(m >> 16)));
+      float f[8];
+#pragma unroll
+      for (int b = 0; b < 8; b++) f[b] = (float)((cw >> (4 * b)) & 0xfu) * s + l;
       *reinterpret_cast<uint4*>(dst) = make_uint4(pack_bf16x2(f[0], f[1]), pack_bf16x2(f[2], f[3]), pack_bf16x2(f[4], f[5]), pack_bf16x2(f[6], f[7]));
     } else {
       *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(kv) + src);
@@ -382,23 +422,24 @@ cudaError_t smkp_gnorm(const void* o, const void* z, int ldz, const void* norm_w
 
 // q may be NULL (MTP K/V only).  k_all / v_all may be NULL.
 cudaError_t smkp_attn_prep(int T, int pos0, const void* q, int ldq, const void* k, int ldk, const void* v, int ldv, const void* q_norm, const void* k_norm, void* kv,
-                           int ctx_max, int kv_fp8, float k_scale, float v_scale, void* qout, void* k_all, void* v_all, cudaStream_t st) {
+                           int ctx_max, int kv_dtype, float k_scale, float v_scale, void* qout, void* k_all, void* v_all, cudaStream_t st) {  // kv_dtype 0 bf16, 1 fp8, 2 int4
   if (T < 1) return cudaErrorInvalidValue;
   const unsigned grid = cdiv((long long)T * 32, 4);
-  if (kv_fp8)
-    k_attn_prep<true><<<grid, 128, 0, st>>>(T, pos0, (const uint16_t*)q, ldq, (const uint16_t*)k, ldk, (const uint16_t*)v, ldv, (const uint16_t*)q_norm, (const uint16_t*)k_norm, kv,
-                                            ctx_max, k_scale, v_scale, (uint16_t*)qout, (uint16_t*)k_all, (uint16_t*)v_all);
-  else
-    k_attn_prep<false><<<grid, 128, 0, st>>>(T, pos0, (const uint16_t*)q, ldq, (const uint16_t*)k, ldk, (const uint16_t*)v, ldv, (const uint16_t*)q_norm, (const uint16_t*)k_norm, kv,
-                                             ctx_max, k_scale, v_scale, (uint16_t*)qout, (uint16_t*)k_all, (uint16_t*)v_all);
+#define SMKP_PREP_ARGS (T, pos0, (const uint16_t*)q, ldq, (const uint16_t*)k, ldk, (const uint16_t*)v, ldv, (const uint16_t*)q_norm, (const uint16_t*)k_norm, kv, \
+                        ctx_max, k_scale, v_scale, (uint16_t*)qout, (uint16_t*)k_all, (uint16_t*)v_all)
+  if (kv_dtype == 1) k_attn_prep<true, false><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;
+  else if (kv_dtype == 2) k_attn_prep<false, true><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;
+  else k_attn_prep<false, false><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;
+#undef SMKP_PREP_ARGS
   return cudaGetLastError();
 }
 
-cudaError_t smkp_gather_kv(const void* kv, int ctx_max, int kv_fp8, int npos, float k_scale, float v_scale, void* k_all, void* v_all, cudaStream_t st) {
+cudaError_t smkp_gather_kv(const void* kv, int ctx_max, int kv_dtype, int npos, float k_scale, float v_scale, void* k_all, void* v_all, cudaStream_t st) {
   if (npos < 1) return cudaSuccess;
   const unsigned grid = cdiv((long long)npos * NKV * 32, 256);
-  if (kv_fp8) k_gather_kv<true><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
-  else k_gather_kv<false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
+  if (kv_dtype == 1) k_gather_kv<true, false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
+  else if (kv_dtype == 2) k_gather_kv<false, true><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
+  else k_gather_kv<false, false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
   return cudaGetLastError();
 }
 

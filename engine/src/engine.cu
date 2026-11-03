@@ -61,7 +61,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 12288; ep.end[1] = 13312; ep.end[2] = 14336; ep.out[0] = e->qb; ep.out[1] = e->kb; ep.out[2] = e->vb;
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
-      CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_fp8,
+      CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_dtype,
                            L.k_scale, L.v_scale, ds + DS_POS, e->y6, e->ws_attn, st));
     }
     {
@@ -106,7 +106,7 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   e->slots = tmax + 1;
   e->w = *w;
   e->ctx_max = ctx_max;
-  e->kv_fp8 = kv_fp8;
+  e->kv_dtype = kv_fp8;  // 0=bf16 1=fp8 2=int4
   int nd = 0, na = 0;
   for (int l = 0; l < NLAYER; l++) { e->dn_idx[l] = w->layers[l].kind == 0 ? nd++ : -1; e->at_idx[l] = w->layers[l].kind == 1 ? na++ : -1; }
   auto B = [&](size_t n) { return dalloc(e, n); };

@@ -1,4 +1,0 @@
-swift-mk-pld1 code    prompt    32: decode  167.2 tok/s [167.2, 167.3, 167.1]  TTFT      47 ms [47, 46, 46]  chunk gap p50/p95 42/46 ms, 55 chunks
-swift-mk-pld1 prose   prompt    34: decode  106.5 tok/s [107.6, 106.5, 106.4]  TTFT      49 ms [50, 48, 48]  chunk gap p50/p95 42/44 ms, 87 chunks
-swift-mk-pld1 math    prompt    33: decode  166.6 tok/s [165.6, 166.7, 166.6]  TTFT      48 ms [48, 47, 47]  chunk gap p50/p95 42/46 ms, 55 chunks
-swift-mk-pld1 long8k  prompt  8030: decode  132.0 tok/s [131.7, 132.4]  TTFT    3909 ms [3904, 3912]  chunk gap p50/p95 43/46 ms, 67 chunks

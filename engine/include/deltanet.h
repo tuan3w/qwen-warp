@@ -1,4 +1,4 @@
-// swift-mk K1: gated DeltaNet decode (T = 1..8 rows) for one linear-attention layer.  See ENGINE.md for the contract.
+// swift-mk K1: gated DeltaNet decode (T = 1..8 rows) for one linear-attention layer.  See docs/ARCHITECTURE.md for the contract.
 //
 // One launch fuses: causal conv1d(k=4) + SiLU on q|k|v, L2-norm q,k (eps 1e-6 inside rsqrt), q *= 128^-0.5,
 // g = -exp(A_log)*softplus(a+dt_bias), beta = sigmoid(b), delta-rule update S = exp(g) S; d = (v - S k) beta; S += d (x) k; o = S q,

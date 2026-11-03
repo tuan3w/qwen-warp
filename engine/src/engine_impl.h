@@ -33,7 +33,7 @@ __device__ __forceinline__ void dn_pend_after(int* ds, int a, int T) {
 
 struct smk_engine {
   smk_model_w w;
-  int ctx_max = 0, kv_fp8 = 0;
+  int ctx_max = 0, kv_dtype = 0;  // 0=bf16 1=fp8 2=int4
   int tmax = 4, slots = 5;  // K11: largest step (rows) and DeltaNet ring slots = tmax + 1
   size_t bytes = 0;
   bool failed = false;

@@ -1,9 +1,0 @@
-### e2e-analyze
-e2e A: prompt prose, anchor 279, cfg {'temperature': 1.0, 'top_k': 20, 'top_p': 0.95, 'draft_sample': 1}, spec samples 20000 (4 files), plain reference samples 20000
-- tokens outside the target support: first 0, second 0
-- first emitted token vs analytic p1 (top-16): chi2 6.6 df 15 p = 0.967, TV 0.0056; vs plain sampling (two-sample): chi2 11.8 df 15 p = 0.696
-- numerics floor: TV between the T=1 engine step and the verify-row step distributions: first token 0.0270, joint 0.0234; spec first token vs the T=1-step analytic p1: chi2 277.4 df 15 p = 2.73e-50
-- reference sampler (device philox draws) vs its analytic p1: chi2 20.9 df 15 p = 0.141
-- joint (first, second) vs analytic p1 x p2(.|first) (101 cells): chi2 86.6 df 81 p = 0.315, TV 0.0163 (plain sampler vs analytic TV 0.0196); vs plain sampling two-sample: chi2 84.1 df 81 p = 0.384
-- => PASS (threshold p > 1e-3 for every statistic, no stray tokens)
-ALL OK: True

@@ -1,4 +1,4 @@
-// swift-mk K3 shared device helpers (clean-room; mma/dequant tricks adapted from experiments/2026-10-30-w4-multirow-verify-and-power/kernels.cuh).
+// swift-mk K3 shared device helpers (clean-room; mma/dequant tricks adapted from an earlier prototype by the same author).
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

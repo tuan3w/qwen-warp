@@ -1,5 +1,5 @@
 // swift-mk K3: engine core ops + the 64-layer step.  Pure C API, raw device pointers, every call takes a cudaStream_t and is graph-capturable.
-// Contract: docs/ENGINE.md.   bf16 = __nv_bfloat16 passed as void*.
+// Contract: docs/ARCHITECTURE.md.   bf16 = __nv_bfloat16 passed as void*.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

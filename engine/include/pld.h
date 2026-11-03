@@ -1,6 +1,6 @@
 // swift-mk E6: host-side prompt-lookup (PLD) tail proposer for the hybrid draft policy "MTP chain + PLD tail".
 // The MTP head drafts d1..d3; this pure-CPU component appends up to max_tail (<= 7) tokens copied from earlier in the context.
-// Reference: experiments/2026-10-31-ngram-draft-potential/analyze.py (build_index / lookup / prep ext[(2,'longest')] / pol_ext, E3 cell: n=2 longest, l>=3, Lt=4).
+// Reference algorithm: n-gram prompt lookup, longest suffix match (n = 2), agreement >= 3, tail <= 4.
 // Incremental hash index (n-gram -> ascending end positions), n-grams of the history are indexed only up to the current anchor; drafts are never indexed.
 // No CUDA calls: plain C++17 (src/pld.cu is compiled by the Makefile glob src/pld*.cu only because it lives next to the other sources).
 #pragma once

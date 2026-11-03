@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "oracle"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from weights import Checkpoint  # noqa: E402
 
 LM = "model.language_model."

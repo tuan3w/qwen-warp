@@ -2,7 +2,7 @@
 // Same tile design / numerics as src/gemv.cu k_w4 (weights are the A operand straight from global memory, dequantised in registers, fp32 accumulate per
 // 128-k group then the fp32 group scale, one bf16 rounding in the epilogue), generalised to NT n8 activation tiles (T <= 8*NT): the dequantised weight
 // fragments of a 16 x 32 k slab are reused by NT x 2 mma.  Every column of the result depends only on its own activation row, so for equal (NW, KS) the output is
-// bit-identical to smk_w4_gemv on the same rows (tests/test_w4mm.py).  Replaces the K6 dequant-to-bf16 + cuBLAS path where that path is dominated by its fixed
+// bit-identical to smk_w4_gemv on the same rows (checked by the engine tests).  Replaces the K6 dequant-to-bf16 + cuBLAS path where that path is dominated by its fixed
 // 64 x 0.75 GB of bf16 weight traffic (prompts < ~400 tokens).
 // Epilogues as in engine.h (SMK_EPI_SEGS / SMK_EPI_SILU / SMK_EPI_F32); activations bf16 [T][K] row-major, any T <= 64.
 #include "common.cuh"
@@ -288,7 +288,7 @@ cudaError_t w4_gemm_cfg(const void* w, const void* scale, const void* x, int N, 
 
 extern "C" {
 // out = W4(w, scale)[N][K] x X[T][K]^T, T in 1..64, epilogue `epi` (engine.h).  cfg < 0: the config measured fastest for this number of n8 tiles
-// (tests/test_w4mm.py --bench, sum of the qkvz+o+gu+down GEMMs at T = 8*NT; cfg >= 100: two weight tiles per warp share the activation fragments).
+// (W4 GEMM bench, sum of the qkvz+o+gu+down GEMMs at T = 8*NT; cfg >= 100: two weight tiles per warp share the activation fragments).
 cudaError_t smkp_w4_gemm_cfg(const void* w, const void* scale, const void* x, int N, int K, int T, const smk_epi* epi, int cfg, cudaStream_t st) {
   return w4_gemm_cfg<0>(w, scale, x, N, K, T, epi, cfg, st);
 }

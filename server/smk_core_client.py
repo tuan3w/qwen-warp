@@ -66,9 +66,13 @@ def to_gen_params(sp) -> GenParams:
                      temperature=0.0 if greedy else sp.temperature, top_k=sp.top_k, top_p=sp.top_p, seed=sp.seed)
 
 
-OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto")
-# K11 prompt-lookup tail needs the 9-slot DeltaNet ring (+0.62 GiB): largest measured --max-model-len that still starts (maxctx.py ... pld, 23.56 GiB card): bf16 KV 28672 (30720 OOM), fp8 KV 53248 (57344 OOM)
-PLD_MAX_LEN = {0: 28672, 1: 53248}  # swift-mk's own knobs (serve.py flags / VLLM_SWIFT_MK_* env of the plugin)
+OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False)
+# The prompt-lookup tail needs the 9-slot DeltaNet ring (+0.62 GiB).  Largest --max-model-len measured to start AND serve on a 23.56 GiB card, keyed by (kv dtype, host tables):
+# bf16 KV 28672 (30720 OOM), fp8 KV 53248 (57344 OOM), int4 KV + host tables 196608 (a 190k prompt served).  Combinations not listed are unmeasured: "auto" then
+# leaves the tail off (pass --prompt-lookup 1 to force it).
+PLD_MAX_LEN = {(0, False): 28672, (1, False): 53248, (2, True): 196608}
+KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
+KV_NAMES = ("bf16", "fp8", "int4")
 
 
 def engine_cfg(vllm_config):
@@ -78,15 +82,16 @@ def engine_cfg(vllm_config):
     if not 0 <= k <= 3:
         raise ValueError(f"swift-mk supports 0..3 speculative tokens (the MTP head drafts at most 3), got {k}")
     kv = vllm_config.cache_config.cache_dtype
-    if kv not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
-        raise ValueError(f"--kv-cache-dtype {kv}: swift-mk supports auto/bfloat16 (bf16 KV) and fp8 (e4m3 with the checkpoint k/v scales)")
+    if kv not in KV_DTYPES:
+        raise ValueError(f"--kv-cache-dtype {kv}: swift-mk supports auto/bfloat16 (bf16 KV), fp8 (e4m3 with the checkpoint k/v scales) and int4_per_token_head (4-bit codes + fp16 scale/min per token and head)")
     g = OPTIONS["stream_cycles"]
     pl = OPTIONS["prompt_lookup"]  # K11 hybrid draft (MTP chain + prompt-lookup tail, 9-slot ring): True / False / "auto" = on iff k == 3 and --max-model-len fits next to the ring
-    fp8 = int(kv.startswith("fp8"))
-    pld = k == 3 and (mc.max_model_len <= PLD_MAX_LEN[fp8] if pl == "auto" else bool(pl))
+    dt, ht = KV_DTYPES[kv], bool(OPTIONS["host_tables"])
+    lim = PLD_MAX_LEN.get((dt, ht))
+    pld = k == 3 and ((lim is not None and mc.max_model_len <= lim) if pl == "auto" else bool(pl))
     if pl == "auto" and k == 3 and not pld:
-        logger.info("swift-mk: prompt-lookup tail off: --max-model-len %d > %d (the 9-slot DeltaNet ring costs +0.62 GiB); pass --prompt-lookup 1 with a smaller --max-model-len to enable it", mc.max_model_len, PLD_MAX_LEN[fp8])
-    return SimpleNamespace(ctx_max=mc.max_model_len + Runner.slack(g, k, pld), kv_fp8=fp8, k=k, group=g, snapshots=OPTIONS["snapshots"], pld=pld)
+        logger.info("swift-mk: prompt-lookup tail off: --max-model-len %d vs measured limit %s for kv %s%s (the 9-slot DeltaNet ring costs +0.62 GiB); pass --prompt-lookup 1 to force it", mc.max_model_len, lim, KV_NAMES[dt], " + host tables" if ht else "")
+    return SimpleNamespace(ctx_max=mc.max_model_len + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], pld=pld)
 
 
 class SwiftCoreClient(EngineCoreClient):
@@ -103,14 +108,14 @@ class SwiftCoreClient(EngineCoreClient):
         self.resources = SimpleNamespace(engine_dead=False)
         t0 = time.time()
         try:
-            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld)
+            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "older than the sources" in str(e):
                 raise
-            raise RuntimeError(f"swift-mk engine does not fit at --max-model-len {vllm_config.model_config.max_model_len} with {'fp8' if cfg.kv_fp8 else 'bf16'} KV on this GPU "
-                               f"(measured on a 24 GB 3090: bf16 KV up to ~40K, fp8 KV up to ~80K tokens; defaults 32768): {e}") from e
-        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s, %d snapshots, prompt-lookup tail %s",
-                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, "fp8" if cfg.kv_fp8 else "bf16", cfg.snapshots, "on" if cfg.pld else "off")
+            raise RuntimeError(f"swift-mk engine does not fit at --max-model-len {vllm_config.model_config.max_model_len} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''} on this GPU "
+                               f"(measured on a 24 GB 3090: bf16 KV up to ~40K, fp8 KV up to ~80K, int4 KV up to ~98K, int4 KV + host tables to 262K tokens; defaults 32768): {e}") from e
+        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, prompt-lookup tail %s",
+                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, "on" if cfg.pld else "off")
         self.thread = threading.Thread(target=self._worker, name="swift-mk-engine", daemon=True)
         self.thread.start()
 

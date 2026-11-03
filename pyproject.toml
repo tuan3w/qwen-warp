@@ -1,0 +1,40 @@
+[project]
+name = "qwen-warp"
+version = "0.2.0"
+description = "Single-stream CUDA decode engine + OpenAI server for Swift-1.5-Qwen3.8-27B INT4 on one RTX 3090, with a 4-bit KV cache for 262k-token contexts"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = "==3.12.*"
+# Versions the engine and server were built and measured with (CUDA 13.0 toolkit, driver >= 580).
+# torch / torchvision / torchaudio come from PyTorch's own cu130 index (see [tool.uv.sources]) so the CUDA runtime matches the nvcc 13.0 the engine is built with.
+dependencies = [
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "torchaudio==2.11.0",
+    "vllm==0.30.0",
+    "flash-linear-attention==0.5.2",
+    "transformers==5.18.0",
+    "numpy==2.3.5",
+    "safetensors==0.8.0",
+    "uvloop==0.23.0",
+    "httpx==0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "openai==3.24.0",       # tests/test_server_smoke.py
+    "huggingface-hub",      # scripts/fetch_model.sh
+]
+
+[tool.uv]
+package = false             # not a Python package: engine/ and server/ are run in place
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

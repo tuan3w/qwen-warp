@@ -1,5 +1,0 @@
-engine+MTP ready; sampling greedy; prompts code:32, prose:34, math:33, long8k:8030
-code   k=3:  151.6 tok/s (reps [151.5, 151.6, 151.7])  tokens/cycle 3.50 pos-acc 0.92/0.86/0.72  ms: cycle 23.10 verify 21.52 catchup 0.32 drafts 1.24
-prose  k=3:   95.3 tok/s (reps [95.3, 95.3, 95.2])  tokens/cycle 2.20 pos-acc 0.66/0.39/0.15  ms: cycle 23.14 verify 21.53 catchup 0.32 drafts 1.24
-math   k=3:  148.5 tok/s (reps [148.5, 148.5, 148.5])  tokens/cycle 3.43 pos-acc 0.95/0.78/0.71  ms: cycle 23.13 verify 21.52 catchup 0.32 drafts 1.24
-long8k k=3:  121.6 tok/s (reps [121.6])  tokens/cycle 2.90 pos-acc 0.83/0.60/0.46  ms: cycle 23.77 verify 22.20 catchup 0.36 drafts 1.33
