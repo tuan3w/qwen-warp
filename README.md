@@ -101,7 +101,7 @@ Cold prefill is 1,830 tok/s at 16k falling to about 960 tok/s at 262k, so a 190k
 
 Read the numbers with these caveats:
 
-- One run per cell on one machine, no repeats, no 250 W run.
+- One run per cell on one machine at one power limit (350 W), no repeats.
 - HyperQwen `mtp-long` needed `GPU_UTIL=0.88` because its default runs out of memory on this desktop card (it also drives a monitor). `mtp-huge` ran at its defaults.
 - HyperQwen's `dflash2-long` preset failed to start here and is not compared.
 - Our 4-bit arm missed a planted needle at 100k in the speed sweep; fp8 and both HyperQwen presets found it.
@@ -132,28 +132,16 @@ Details and file-level pointers: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Roadmap
 
-The engine is built around one model, and the next gains are in quantization: a better quantized model is expected, and two quantization ideas are prototyped but not in this engine yet.
-
-Done:
-
-- [x] 4-bit KV cache: 262,144-token context in 24 GB
-- [x] Host-pinned embedding and head tables (4.7 GiB of VRAM back)
-- [x] MTP speculative decoding with an n-gram prompt-lookup tail
-- [x] OpenAI-compatible server with multi-turn prefix reuse
+Done: 4-bit KV cache (262,144 tokens in 24 GB), host-pinned tables, MTP speculative decoding with prompt lookup, the OpenAI server with prefix reuse.
 
 To do:
 
-- [ ] Move to the better quantized model when it is released. The W4 kernels assume uniform symmetric int4 with group size 128, so a different format means kernel work.
-- [ ] Rotated 4-bit KV cache (Hadamard rotation plus a calibrated per-channel mean, same 4.125 bits). On a Qwen3.5-2B proxy it cut the perplexity cost about 10x (+2.0% to +0.19%).
-  Not yet checked on the 27B, and the rotation's kernel cost is unmeasured.
-- [ ] Non-uniform weight codebook (16 levels per group): +2.8 points top-1 fidelity over round-to-nearest on Qwen3-4B, unconfirmed on the 27B.
-  The fused kernel built so far is about 2x slower than uniform int4 at decode.
-- [ ] Measure multi-turn agentic task success (tool calls, edit-and-test loops) for each KV dtype.
-- [ ] Int4 KV for the MTP layer (about 3 KiB per token saved).
-- [ ] Faster long prefill (about 960 tok/s at 262k context).
-- [ ] Prompt lookup beyond 196,608 context with the 4-bit cache, and an explanation for why decode at 262k costs the same as at 196k.
-- [ ] Understand the needle miss at 100k with the 4-bit cache.
-- [ ] Repeat the HyperQwen comparison (repeats, a 250 W run) and add its DFlash2 preset if it can be started.
+- [ ] **Better quantized model.** Move to it when it is released. The W4 kernels assume uniform symmetric int4, group size 128; a different format means kernel work.
+- [ ] Rotated 4-bit KV cache: about 10x lower perplexity cost on a Qwen3.5-2B proxy (+2.0% to +0.19%); check on the 27B.
+- [ ] Non-uniform weight codebook: +2.8 points top-1 fidelity on Qwen3-4B; check on the 27B (our fused kernel is about 2x slower than int4).
+- [ ] Multi-turn agentic task success for each KV dtype.
+- [ ] Faster long prefill (about 960 tok/s at 262k).
+- [ ] Repeat the HyperQwen comparison, and add its DFlash2 preset if it starts.
 
 Not planned: other models, other GPUs, batching.
 
