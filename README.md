@@ -1,38 +1,76 @@
 # qwen-warp
 
-A single-stream CUDA decode engine and OpenAI-compatible server for **Swift-1.5-Qwen3.8-27B (INT4)** on **one RTX 3090**, with a **4-bit KV cache** that
-fits the model's full 262,144-token context in 24 GB. Built for long agentic-coding sessions: one user, long prompts, fast decode.
+**Fast long-context inference for Swift-1.5-Qwen3.8-27B on a single RTX 3090.**
+
+A CUDA decode engine with a 4-bit KV cache and MTP speculative decoding, behind an OpenAI-compatible API. It holds the model's full
+262,144-token context in 24 GB, and on the same card it decodes 1.3x to 1.5x faster than HyperQwen's `mtp-long` and 2.1x to 3.5x faster than its
+long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, caveats in [Performance](#performance)).
+
+> **RTX 3090 only.** Tuned and tested on one RTX 3090 (24 GB); no other GPU has been tried and other cards may fail to build or run.
+> One model, one stream at a time, text only. Unofficial; not affiliated with Alibaba, the Qwen team or UkisAI.
 
 ## Contents
 
-- [Highlights](#highlights)
-- [Scope](#scope)
-- [Performance at a glance](#performance-at-a-glance)
-- [Requirements](#requirements)
-- [Run](#run)
-- [Tests](#tests)
-- [Layout](#layout)
-- [Status and credits](#status-and-credits)
-- More: [Performance, methods and caveats](docs/PERFORMANCE.md) | [Architecture](docs/ARCHITECTURE.md) | [Third-party credits](NOTICE)
+- [What you get](#what-you-get)
+- [Quick start](#quick-start)
+- [Choosing a mode](#choosing-a-mode)
+- [Performance](#performance)
+- [How it works](#how-it-works)
+- [Limits](#limits)
+- [Development](#development)
+- [Credits and license](#credits-and-license)
 
-## Highlights
+## What you get
 
-- 17-19 ms/token plain decode (53-59 tok/s without speculation), 105-166 tok/s with MTP speculative decoding on short prompts (code is fastest).
-- 91-128 tok/s decode at 32k-190k tokens of context (int4 KV, MTP + prompt lookup).
-- 262,144-token context in 22.4 GiB with `--profile long`; 4-bit KV changed coding pass@1 by -1.1 points (not significant) and perplexity by about +0.26% at 98k.
-- vLLM's own OpenAI frontend (chat, completions, streaming, tool calls, reasoning parser) on top of the engine.
+- **Long context on one card.** 262,144 tokens fit in 22.4 GiB. The 4-bit cache costs 16.5 KiB per token where bf16 costs 64 KiB.
+- **Fast decode, also when the context is long.** 105 to 166 tok/s on short prompts, 91 to 128 tok/s from 32k to 190k tokens of context.
+- **Small quality cost.** The 4-bit cache changed coding pass@1 by -1.1 points (244 to 241 of 283 tasks, not significant) and perplexity by about +0.26% at 98k tokens.
+- **A normal API.** vLLM's own OpenAI frontend: chat and text completions, streaming, tool calls, reasoning output, stop strings, seeds.
 
-Numbers, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Quick start
 
-## Scope
+You need Linux, an RTX 3090 (24 GB) with driver 580 or newer, the CUDA 13.0 toolkit (`nvcc`; only 13.0 was tested), [uv](https://docs.astral.sh/uv/),
+about 19 GB of disk for the weights and about 5 GiB of pinned host RAM for the long-context mode. The checkpoint
+[`ukisai/Swift-1.5-Qwen3.8-27b-INT4`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4) is gated and has its own licence; it is not included here.
 
-Optimized for the **RTX 3090 only** and not tested on any other GPU: the kernels are compiled for sm_86 and tuned (tile shapes, memory budgets,
-the measured context limits) on a 24 GB 3090. Other cards may fail to build or run, or run slowly; no other chip was tried. One model (Swift-1.5-Qwen3.8-27B INT4), batch size 1,
-text only. It is not a general inference server. Speed and quality figures are single runs on one machine at a 350 W power limit. Multi-turn agentic task success has **not** been measured.
+```bash
+make setup                      # uv sync from uv.lock, then build engine/build/libswiftmk.so
+uv run hf auth login            # accept the checkpoint's licence on Hugging Face first
+scripts/fetch_model.sh          # downloads to ~/models/swift-1.5-int4 (or pass a directory and set $SWIFT_MODEL)
 
-## Performance at a glance
+uv run server/serve.py --profile long --port 8000
+```
 
-Same RTX 3090 at 350 W, same checkpoint, client and prompts; single runs; `n/s` = not served in that run. Details, caveats and more tables: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+The server is ready 23 to 40 s after start. Then:
+
+```bash
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"swift","messages":[{"role":"user","content":"Write a binary search in Go."}],"max_tokens":300}'
+```
+
+torch, torchvision and torchaudio are locked to the `+cu130` builds from PyTorch's own index (configured in `pyproject.toml`); everything else comes from PyPI.
+`uv.lock` pins all of it.
+
+## Choosing a mode
+
+```
+Goal                       Flags                                                       Context
+Fastest at short context   (defaults: bf16 KV)                                          28,672
+fp8 KV cache               --kv-cache-dtype fp8 --max-model-len 53248                   53,248
+Long context               --profile long                                              196,608
+Full model context         --profile long --max-model-len 262144 --prompt-lookup 0     262,144
+```
+
+`--profile long` means 4-bit KV cache (`--kv-cache-dtype int4_per_token_head`) plus `--host-tables`, which keeps the 4.7 GiB embedding and head tables in
+pinned host memory (bit-identical decode) so that VRAM goes to the cache. Explicit flags win over the profile. Other knobs:
+
+- `--prompt-lookup {0,1,auto}`: an n-gram draft tail that needs 0.62 GiB more VRAM. `auto` turns it on only where that combination was measured to fit,
+  which is why 262,144 needs `--prompt-lookup 0`.
+- `--num-speculative-tokens {0..3}` (default 3), `--snapshots N` (multi-turn prefix reuse), and every stock `vllm serve` frontend flag.
+
+## Performance
+
+Same RTX 3090 at 350 W, same checkpoint, client and prompts, batch size 1, greedy decoding. Single runs; `n/s` = not served in that run.
 
 ```
 Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
@@ -41,10 +79,13 @@ ours int4 KV, --prompt-lookup 0             120   128   103   101    91
 ours fp8 KV                                 117   117   108    98   n/s
 HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
 HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
+Speedup, --profile long vs mtp-long       1.30x 1.33x 1.34x 1.50x   n/s
+Speedup, --profile long vs mtp-huge       2.10x 2.21x 2.74x 3.29x 3.48x
 
 Short prompts, tokens/s                    code prose  math
 ours int4 KV, --prompt-lookup 0             166   105   156
 HyperQwen mtp-long                          118    79   121
+Speedup, int4 vs mtp-long                 1.41x 1.33x 1.29x
 
 Coding pass@1, 283 tasks                 passed
 bf16 reference                              244
@@ -53,69 +94,55 @@ HyperQwen mtp-long                          244
 HyperQwen mtp-huge                          242
 ```
 
-Prefill speed is within about 10% of HyperQwen (no win there). Caveats: no repeats and no 250 W run; HyperQwen `mtp-long` needed `GPU_UTIL=0.88` because its default runs out of memory on this
-desktop card; its `dflash2-long` preset failed to start here and is not compared; our int4 arm missed a planted needle at 100k in the speed sweep (fp8 and both HyperQwen presets found it).
+"Faster" here means single-stream decode speed. Prefill is within about 10% of HyperQwen (no win), and coding accuracy is within noise across all arms.
+Cold prefill is 1,830 tok/s at 16k falling to about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes; later turns reuse the cached prefix.
 
-## Requirements
+Read the numbers with these caveats:
 
-- Linux, one NVIDIA **RTX 3090** (24 GB), driver >= 580. Other GPUs are untested.
-- CUDA 13.0 toolkit (`nvcc` in `/usr/local/cuda/bin`; override with `CUDA_HOME`). Only 13.0 was tested.
-- [uv](https://docs.astral.sh/uv/), Python 3.12 (uv fetches it). torch, torchvision and torchaudio are locked to the `+cu130` builds from PyTorch's own index
-  (`download.pytorch.org/whl/cu130`, configured in `pyproject.toml`), everything else comes from PyPI; `uv.lock` pins all of it.
-- About 19 GB disk for the weights, and about 5 GiB of pinned host RAM with `--profile long`
-- The checkpoint [`ukisai/Swift-1.5-Qwen3.8-27b-INT4`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4) (gated, its own licence; not included here)
+- One run per cell on one machine, no repeats, no 250 W run.
+- HyperQwen `mtp-long` needed `GPU_UTIL=0.88` because its default runs out of memory on this desktop card (it also drives a monitor). `mtp-huge` ran at its defaults.
+- HyperQwen's `dflash2-long` preset failed to start here and is not compared.
+- Our 4-bit arm missed a planted needle at 100k in the speed sweep; fp8 and both HyperQwen presets found it.
+- Multi-turn agentic task success (tool calls, edit-and-test loops) has **not** been measured.
 
-## Run
+More tables (memory limits, cold prefill, perplexity by length) and the methods: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-```bash
-make setup                      # uv sync (pyproject.toml / uv.lock) + build engine/build/libswiftmk.so
-uv run hf auth login            # the checkpoint is gated: accept its licence on Hugging Face first
-scripts/fetch_model.sh          # -> ~/models/swift-1.5-int4  (or set $SWIFT_MODEL and pass a directory)
+## How it works
 
-uv run server/serve.py --profile long --port 8000    # int4 KV + host tables, 196,608-token context
-uv run server/serve.py --port 8000                   # bf16 KV, 28,672-token context (the bf16 baseline)
+- **One CUDA graph per step.** Decode is a graph of fused kernels over W4A16 weights, not a persistent kernel; 16 full-attention layers plus gated-DeltaNet layers.
+- **Speculative decoding.** The checkpoint's own MTP head drafts up to 3 tokens per step, and an optional n-gram prompt-lookup tail adds more drafts.
+  Sampling uses exact speculative sampling, so drafts change the speed, not the output distribution.
+- **4-bit KV cache.** Per token and per KV head, asymmetric int4 with an fp16 scale and minimum: 4.125 bits per element, 16.5 KiB per token, no rotation.
+- **Host-pinned tables.** The bf16 embedding and rescoring head live in pinned host memory; only the few candidate rows a step needs cross PCIe.
+- **Server.** vLLM's OpenAI frontend on an in-process engine client. One request decodes at a time and the rest queue in order.
+  DeltaNet state snapshots let follow-up turns resume from the cached prefix.
+
+Details and file-level pointers: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Limits
+
+- RTX 3090 only (sm_86 kernels); no other GPU was tested.
+- One model: Swift-1.5-Qwen3.8-27B INT4. Text only, no vision input.
+- Batch size 1. Concurrent requests queue.
+- Unsupported sampling parameters (`presence_penalty`, `frequency_penalty`, `logprobs`) return HTTP 400.
+- Long prompts are slow to prefill (see Performance).
+- The 4-bit cache is lossy: output text drifts from bf16's earlier (67% token-identical on HumanEval+ against 88% for fp8) even though task accuracy held.
+
+## Development
+
+`make test` runs three tests that need only the checkpoint and the GPU: `tests/test_kv_dtypes.py` (perplexity with bf16, fp8 and int4 KV),
+`tests/test_host_tables.py` (host tables are bit-identical, VRAM drops 4.7 GiB) and `tests/test_server_smoke.py` (the server end to end, run with the default and
+`--profile long`).
+
+```
+engine/    CUDA kernels (src/), C headers (include/), Python drivers (engine.py, spec.py, prefill.py, pack*.py, weights.py).
+           Internally named swift-mk: libswiftmk.so, smk_* symbols.
+server/    serve.py (entry point), the vLLM engine-core client, the engine driver, a small vLLM plugin
+tests/     checkpoint-only tests         docs/  architecture and performance notes         scripts/  model download
 ```
 
-```bash
-curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"swift","messages":[{"role":"user","content":"Write a binary search in Go."}],"max_tokens":300}'
-```
+## Credits and license
 
-Context and memory knobs (any stock `vllm serve` frontend flag also works):
-
-- `--max-model-len N`: up to 262144 with `--profile long --prompt-lookup 0`. The prompt-lookup tail (on by default where measured to fit) needs 0.62 GiB more,
-  so `--profile long` defaults to 196,608 with it on.
-- `--kv-cache-dtype {auto,bfloat16,fp8,int4_per_token_head}`: `auto` is bf16.
-- `--host-tables`: keeps the 4.7 GiB embedding and head tables in pinned host memory (bit-identical decode).
-- `--num-speculative-tokens {0..3}` (default 3), `--prompt-lookup {0,1,auto}`, `--snapshots N`.
-
-| goal | flags |
-|---|---|
-| fastest short context | defaults |
-| 53k context, fp8 KV | `--kv-cache-dtype fp8 --max-model-len 53248` |
-| long context (up to 196k) | `--profile long` |
-| full 262k context | `--profile long --max-model-len 262144 --prompt-lookup 0` |
-
-The server is ready 23-40 s after start (measured 23-26 s default, 27-38 s with `--profile long`, which also loads the tables into pinned memory).
-
-Prompt processing is slow at long lengths (about 1,800 tok/s at 16k falling to about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes);
-follow-up turns reuse the cached prefix.
-
-## Tests
-
-`make test` runs `tests/test_kv_dtypes.py` (perplexity bf16 / fp8 / int4), `tests/test_host_tables.py` (host tables are bit-identical) and
-`tests/test_server_smoke.py` (the server end to end, default and `--profile long`). They need the checkpoint and the GPU, and nothing else.
-
-## Layout
-
-- `engine/`: CUDA kernels (`src/`), C headers (`include/`), Python drivers (`engine.py`, `spec.py`, `prefill.py`, `pack*.py`, `weights.py`). The engine is internally named
-  *swift-mk* (`libswiftmk.so`, `smk_*`).
-- `server/`: `serve.py` (entry point), the vLLM engine-core client and the engine driver, and a small vLLM plugin.
-- `tests/`, `docs/`, `scripts/`.
-
-## Status and credits
-
-Unofficial: not affiliated with Alibaba, the Qwen team or UkisAI. Most of the code was written by AI coding agents under human direction; the tests and
-[measurements](docs/PERFORMANCE.md) are what to trust, not the authorship. MIT licensed (see [LICENSE](LICENSE)); the model weights are not covered by it.
-Provenance and third-party credits: [NOTICE](NOTICE). It builds on the ideas in several open projects (see NOTICE) and was compared against
-[HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware.
+MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. Most of the code was written by AI coding agents under human direction, so trust the
+tests and [measurements](docs/PERFORMANCE.md) rather than the authorship. Third-party credits and what was and was not taken from each: [NOTICE](NOTICE).
+It was compared against [HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware.

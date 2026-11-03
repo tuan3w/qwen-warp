@@ -75,6 +75,8 @@ ours int4 KV, --prompt-lookup 0             120   128   103   101    91
 ours fp8 KV                                 117   117   108    98   n/s
 HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
 HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
+Speedup, --profile long vs mtp-long       1.30x 1.33x 1.34x 1.50x   n/s
+Speedup, --profile long vs mtp-huge       2.10x 2.21x 2.74x 3.29x 3.48x
 
 Short prompts (385 tokens), tokens/s       code prose  math
 ours int4 KV, --prompt-lookup 0             166   105   156
@@ -82,6 +84,8 @@ ours int4 KV + prompt lookup                170   105   173
 ours fp8 KV                                 164   101   163
 HyperQwen mtp-long                          118    79   121
 HyperQwen mtp-huge                          122    82   128
+Speedup, int4 vs mtp-long                 1.41x 1.33x 1.29x
+Speedup, int4 vs mtp-huge                 1.36x 1.28x 1.22x
 
 Cold prefill, seconds to first token        32k   64k  100k  130k  190k
 ours int4 KV                                 18    41    73   104   178
@@ -97,8 +101,9 @@ HyperQwen mtp-huge                             242       -2
 ours int4 KV, --prompt-lookup 0                241       -3   (-1.1 pts, p = 0.45, not significant)
 ```
 
-`n/s` = not served in that run. Reading it: at 32k to 130k this engine's decode is about 1.3x to 1.5x `mtp-long`, and at 190k it holds 91 tok/s where `mtp-huge`,
-the only HyperQwen preset served there, reaches 27. Prefill is within about 10%, so there is no real prefill win. Quality is within noise across all arms.
+`n/s` = not served in that run. Speedups are our decode tok/s divided by HyperQwen's in the same column. **What "faster" covers:** single-stream decode speed on this card.
+Against `mtp-long` it is 1.3x to 1.5x at 32k to 130k (that preset was not served at 190k); against `mtp-huge`, the only HyperQwen preset served at 190k, it is 2.1x to 3.5x across
+32k to 190k (91 to 94 tok/s against 27). On short prompts it is 1.2x to 1.4x. **What it does not cover:** prefill (within about 10%, no real win) and quality (within noise across all arms).
 
 Caveats, all of which matter:
 
