@@ -14,6 +14,32 @@ Numbers, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Design
 the measured context limits) on a 24 GB 3090. Other cards may fail to build or run, or run slowly; no other chip was tried. One model (Swift-1.5-Qwen3.8-27B INT4), batch size 1,
 text only. It is not a general inference server. Speed and quality figures are single runs on one machine at a 350 W power limit. Multi-turn agentic task success has **not** been measured.
 
+## Performance at a glance
+
+Same RTX 3090 at 350 W, same checkpoint, client and prompts; single runs; `n/s` = not served in that run. Details, caveats and more tables: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+```
+Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
+ours int4 KV, --profile long (+ lookup)     122   117   107   102    94
+ours int4 KV, --prompt-lookup 0             120   128   103   101    91
+ours fp8 KV                                 117   117   108    98   n/s
+HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
+HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
+
+Short prompts, tokens/s                    code prose  math
+ours int4 KV, --prompt-lookup 0             166   105   156
+HyperQwen mtp-long                          118    79   121
+
+Coding pass@1, 283 tasks                 passed
+bf16 reference                              244
+ours int4 KV, --prompt-lookup 0             241   (-1.1 pts vs bf16, p = 0.45, not significant)
+HyperQwen mtp-long                          244
+HyperQwen mtp-huge                          242
+```
+
+Prefill speed is within about 10% of HyperQwen (no win there). Caveats: no repeats and no 250 W run; HyperQwen `mtp-long` needed `GPU_UTIL=0.88` because its default runs out of memory on this
+desktop card; its `dflash2-long` preset failed to start here and is not compared; our int4 arm missed a planted needle at 100k in the speed sweep (fp8 and both HyperQwen presets found it).
+
 ## Requirements
 
 - Linux, one NVIDIA **RTX 3090** (24 GB), driver >= 580. Other GPUs are untested.

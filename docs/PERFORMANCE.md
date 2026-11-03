@@ -65,14 +65,37 @@ Decode slows from 120 to 91 tok/s between 32k and 190k. [INFERENCE] This is the 
 [HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) was run unmodified from its public image `ghcr.io/syv-ai/hyperqwen:latest` on the same card, power limit,
 checkpoint, client and prompts. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
 
-- this engine, int4 KV: 120 / 128 / 103 / 101 / 91
-- HyperQwen `mtp-long` (fp8/int8 KV): 94 / 88 / 80 / 68 / not served at 190k
-- HyperQwen `mtp-huge` (4/2-bit KVarN, its long-context preset): 58 / 53 / 39 / 31 / 27
+```
+Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
+ours int4 KV, --profile long (+ lookup)     122   117   107   102    94
+ours int4 KV, --prompt-lookup 0             120   128   103   101    91
+ours fp8 KV                                 117   117   108    98   n/s
+HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
+HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
 
-Cold prefill was within about 10% of each other. On the short-prompt control this engine measured 166 / 105 / 156 tok/s (code / prose / math)
-against 118 / 79 / 121 for `mtp-long`.
+Short prompts (385 tokens), tokens/s       code prose  math
+ours int4 KV, --prompt-lookup 0             166   105   156
+ours int4 KV + prompt lookup                170   105   173
+ours fp8 KV                                 164   101   163
+HyperQwen mtp-long                          118    79   121
+HyperQwen mtp-huge                          122    82   128
 
-Quality, same coding tasks: `mtp-long` 244, `mtp-huge` 242, this engine's int4 241 (all within noise of each other).
+Cold prefill, seconds to first token        32k   64k  100k  130k  190k
+ours int4 KV                                 18    41    73   104   178
+ours fp8 KV                                  18    41    73   104   n/s
+HyperQwen mtp-long                           21    48    79   113   n/s
+HyperQwen mtp-huge                           20    45    73    99   168
+
+Coding pass@1, 283 tasks                    passed  vs bf16
+bf16 reference                                 244        -
+HyperQwen mtp-long                             244        0
+ours fp8 KV                                    243       -1
+HyperQwen mtp-huge                             242       -2
+ours int4 KV, --prompt-lookup 0                241       -3   (-1.1 pts, p = 0.45, not significant)
+```
+
+`n/s` = not served in that run. Reading it: at 32k to 130k this engine's decode is about 1.3x to 1.5x `mtp-long`, and at 190k it holds 91 tok/s where `mtp-huge`,
+the only HyperQwen preset served there, reaches 27. Prefill is within about 10%, so there is no real prefill win. Quality is within noise across all arms.
 
 Caveats, all of which matter:
 
