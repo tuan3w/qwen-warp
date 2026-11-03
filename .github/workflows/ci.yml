@@ -1,0 +1,14 @@
+name: ci
+# No GPU and no checkpoint on GitHub runners: this only checks that the sources compile, uv.lock matches pyproject.toml, markdown links resolve and no
+# personal paths or keys are committed.  The engine tests (make test) need an RTX 3090 and the gated checkpoint and are run by hand before a release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  repo-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: scripts/check_repo.sh
