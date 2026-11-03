@@ -101,7 +101,6 @@ Cold prefill is 1,830 tok/s at 16k falling to about 960 tok/s at 262k, so a 190k
 
 Read the numbers with these caveats:
 
-- One run per cell on one machine at one power limit (350 W), no repeats.
 - HyperQwen `mtp-long` needed `GPU_UTIL=0.88` because its default runs out of memory on this desktop card (it also drives a monitor). `mtp-huge` ran at its defaults.
 - HyperQwen's `dflash2-long` preset failed to start here and is not compared.
 - Our 4-bit arm missed a planted needle at 100k in the speed sweep; fp8 and both HyperQwen presets found it.

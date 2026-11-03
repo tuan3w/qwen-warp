@@ -107,7 +107,6 @@ Against `mtp-long` it is 1.3x to 1.5x at 32k to 130k (that preset was not served
 
 Caveats, all of which matter:
 
-- **Single run each, one machine, one power limit (350 W).** No repeats.
 - HyperQwen's default memory setting (`GPU_UTIL=0.93`) runs out of memory on this desktop card; it was run with `GPU_UTIL=0.88 KV_MEM=` (its own documented workaround).
   `mtp-huge` was run at its default memory settings.
 - HyperQwen's `dflash2-long` preset failed to start here and is **not compared**. The cause was not captured, so this is not evidence about that preset.
