@@ -48,6 +48,16 @@ Third-party projects: credits and what was taken
     modified or redistributed. engine/prefill.py calls vLLM's bundled FlashAttention-2
     binding and flash-linear-attention ("fla", MIT) at run time.
 
+  vLLM, SGLang (Apache-2.0), llama.cpp (MIT) and Hugging Face transformers (Apache-2.0), read for
+    the sampling parameters (presence / frequency / repetition penalty, min_p, logit_bias,
+    min_tokens, allowed_token_ids): the order of operations and the semantics follow vLLM's v1
+    sampler (vllm/v1/sample), and the reference tests in tests/test_logit_procs.py reuse the
+    inputs and expected values of cases in vLLM's tests/v1/sample, SGLang's penaltylib tests and
+    llama.cpp's tests/test-sampling.cpp, rewritten for this engine's kernels. The start-up
+    memory check follows the idea of vLLM's determine_available_memory (gpu_worker.py) and
+    SGLang's kv_cache_configurator. No source file of these projects is included; the
+    reference tests call vLLM's own apply_penalties at run time.
+
   Hugging Face transformers (Apache-2.0) and compressed-tensors (Apache-2.0): the semantics of
     the Qwen3.5 hybrid text path and its MTP head (operation order, shapes, rounding points)
     were transcribed from transformers' qwen3_5 modeling code and vLLM's qwen3_5_mtp model;
