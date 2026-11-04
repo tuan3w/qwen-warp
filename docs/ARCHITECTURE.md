@@ -2,7 +2,7 @@
 
 How the engine is put together and where to read the code. Back to the [README](../README.md); to run it, see [Getting started](GETTING_STARTED.md).
 
-Contents: [In one paragraph](#in-one-paragraph) | [Where to start reading](#where-to-start-reading) | [Layers and files](#layers-and-files) | [Conventions the kernels share](#conventions-the-kernels-share) |
+Contents: [In one paragraph](#in-one-paragraph) | [Where to start reading](#where-to-start-reading) | [Repository layout](#repository-layout) | [Layers and files](#layers-and-files) | [Conventions the kernels share](#conventions-the-kernels-share) |
 [Speculative decoding](#speculative-decoding) | [The 4-bit KV cache](#the-4-bit-kv-cache) | [Host-pinned tables](#host-pinned-tables) | [Server behaviour](#server-behaviour) | [Design choices](#design-choices-and-what-they-cost)
 
 ## In one paragraph
@@ -23,6 +23,20 @@ make room for a 262,144-token context.
 | How a request becomes tokens | `server/serve.py` | `server/smk_core_client.py`, `server/smk_runner.py` |
 | Fast prefill | `engine/prefill.py` | vLLM's FlashAttention-2 binding and flash-linear-attention, called at run time |
 | What is checked and how | `tests/` | `scripts/check_repo.sh` |
+
+## Repository layout
+
+| Path | What is in it |
+|---|---|
+| `engine/` | the CUDA kernels (`src/`), C headers (`include/`), Python drivers, the draft-vocabulary lists, and its own `Makefile` |
+| `server/` | `serve.py` (entry point), the vLLM engine-core client, the engine driver, a small vLLM plugin |
+| `tests/` | three tests that need only the checkpoint and the GPU ([what they check](GETTING_STARTED.md#4-verify-it-works)) |
+| `scripts/` | `fetch_model.sh` (weights download), `check_repo.sh` (checks that need no GPU, run by CI) |
+| `docs/` | this documentation |
+| `Dockerfile`, `docker-compose.yml`, `docker/`, `.env.example` | the container image, its compose file, its entrypoint and its settings |
+| `Makefile`, `pyproject.toml`, `uv.lock` | `make setup` and `make test`; the pinned Python environment |
+| `.github/` | CI (runs `scripts/check_repo.sh`) and the issue template |
+| `LICENSE`, `NOTICE`, `CHANGELOG.md`, `CONTRIBUTING.md` | licence, third-party credits, version history, contribution guide |
 
 ## Layers and files
 
