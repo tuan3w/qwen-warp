@@ -38,7 +38,7 @@ def render(tok, messages, **kw):
 
 
 def long_doc(tok, n):
-    raw = (ENGINE / "spec.py").read_text() + "\n\n" + (ENGINE / "prefill.py").read_text()  # real, deterministic text that ships with the repo
+    raw = (ENGINE / "weights.py").read_text() + "\n\n" + (ENGINE / "prefill.py").read_text()  # real text that ships with the repo (files the sampling work does not edit: a changed prompt can hit a different near-tie between the server and the direct-engine segmentation)
     return tok.decode(tok(raw, add_special_tokens=False)["input_ids"][:n])
 
 
