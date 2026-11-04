@@ -1,134 +1,96 @@
 # qwen-warp
 
-**Run Swift-1.5-Qwen3.8-27B with a 262,144-token context on one RTX 3090.**
+**Fast Qwen3.8-27B on one RTX 3090, with a 200k-token context.**
 
-A single-purpose CUDA decode engine behind an OpenAI-compatible API. A 4-bit KV cache and host-pinned tables fit the model's full context in 24 GB, and MTP
-speculative decoding keeps decoding at 91 to 128 tok/s even with 32k to 190k tokens in the prompt. Point any OpenAI client, or a coding agent, at it.
+I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt** and fits the model's full 262,144-token context in 24 GB.
+I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them.
+One GPU (RTX 3090), one request at a time, text only.
 
-> **Scope, stated up front.** One model, one GPU (RTX 3090, tested only there), one request decoded at a time, text only. The code is shared as a reference to learn
-> from and borrow ideas from, not as a general inference stack.
+## Numbers
 
-## Why try it
+Same card at 350 W, greedy, batch size 1, one run per cell. Re-measured on this code on 2026-11-04 (client and prompts: [method](docs/PERFORMANCE.md#3-speed)).
 
-| If you want to... | What you get | Evidence |
-|---|---|---|
-| Keep a whole repository or a long document in context on a 24 GB card | 262,144 tokens fit: 22.7 GiB in use on the card with the desktop included (23.3 GiB with the default prompt-lookup tail); the 4-bit cache costs 16.5 KiB per token against 64 KiB for bf16 | [Memory](docs/PERFORMANCE.md#1-memory-how-much-context-fits) |
-| Stay fast when the prompt is long | 91 to 128 tok/s from 32k to 190k tokens, 105 to 166 tok/s on short prompts | [Speed](#numbers-at-a-glance) |
-| Know what the 4-bit cache costs in quality | Single-shot proxies: coding pass@1 244 -> 241 of 283 tasks (not significant); perplexity +0.26% at 98k tokens. Tool calls are more sensitive to it: [what was measured](docs/USAGE.md#tool-calls) | [Quality](docs/PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) |
-| Plug in what you already use | vLLM's own OpenAI frontend: chat and text completions, streaming, tool calls, reasoning output (the `reasoning` field), stop strings, seeds, penalties, `min_p`, `logit_bias` | [Usage](docs/USAGE.md) |
-| Learn how it is built | A small CUDA engine (graph of fused kernels, W4A16, exact speculative sampling) with a file-by-file map | [Architecture](docs/ARCHITECTURE.md) |
+| Decode, tokens/s, by prompt length | 32k | 64k | 100k | 130k | 190k | 262k |
+|---|---|---|---|---|---|---|
+| **qwen-warp** `--profile long` (4-bit KV cache, prompt-lookup tail) | 124 | 119 | 115 | 108 | 102 | - |
+| **qwen-warp** 4-bit KV cache, tail off | 124 | 133 | 109 | 105 | 96 | 94 |
+| **qwen-warp** fp8 KV cache | 123 | 123 | 112 | 108 | - | - |
+| *reference:* HyperQwen `mtp-long` | 94 | 88 | 80 | 68 | - | - |
 
-## Is it for you?
+`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608).
 
-| Yes, if | Not (yet), if |
+| Short prompts, tokens/s | code | prose | math |
+|---|---|---|---|
+| **qwen-warp** default (bf16 KV cache) | 172 | 110 | 172 |
+| **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
+| *reference:* HyperQwen `mtp-long` | 118 | 79 | 121 |
+
+| | |
 |---|---|
-| You have an **RTX 3090** (24 GB), Linux, driver 580 or newer | You have another GPU: the kernels target sm_86 and nothing else was tried |
-| You want **Swift-1.5-Qwen3.8-27B INT4** with long prompts: coding agents, big repos, long documents | You want a different model, vision input, or batching: one stream at a time, text only |
-| You are happy to read the code and adapt it | You need a drop-in, general-purpose serving stack: use vLLM or a similar project |
+| Context | 262,144 tokens fit in about 22.5 to 22.7 GiB in use, desktop included (`--host-tables` moves 4.8 GiB of tables to host memory; the 4-bit cache costs 16.5 KiB per token, bf16 64 KiB) |
+| Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
+| Ready after | 21 to 30 s |
+| Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
+| Not measured | multi-turn agent task success, other GPUs, other power limits |
+
+HyperQwen rows are a reference point, not a competitor: another project, measured on 2026-11-03 with the same prompts and client, image
+`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04). A newer build may differ.
+Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## How it gets there
+
+- **Fused kernels.** The 4-bit weights decode as one CUDA graph of fused kernels, with no framework work per step.
+- **MTP speculative decoding.** The checkpoint's own draft head proposes 3 tokens per step; the engine verifies them in one pass and keeps the output distribution exact, greedy or sampled. About 3 tokens come out per step.
+- **A 4-bit KV cache and host-pinned tables.** The cache shrinks 4x; the embedding and rescoring head live in pinned host memory. Together they free the VRAM for 262k tokens.
+- **Prompt lookup and prefix reuse.** Repeated text in the prompt speeds up decoding; a chat's earlier turns skip prefill.
+
+The code map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick start
 
-You need an NVIDIA driver 580 or newer, the model weights (19 GB; the checkpoint [`ukisai/Swift-1.5-Qwen3.8-27b-INT4`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4)
-is gated and has its own licence, so you accept it on Hugging Face), and one of the two paths below. Full prerequisites, disk sizes and troubleshooting:
-[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
-
-| | **A. Docker** | **B. Native (uv)** |
-|---|---|---|
-| Needs | Docker with the NVIDIA container toolkit | CUDA 13.0 toolkit (`nvcc`), [uv](https://docs.astral.sh/uv/), a C compiler |
-| Disk | image about 24 GB, plus the weights | about 8 GB environment, plus the weights |
-| First setup | about 8 GB of wheels download during the build | `make setup`: 27 minutes on a clean machine, almost all downloads |
-| Start | `docker compose up --build` | `uv run server/serve.py --profile long` |
+You need Linux, an NVIDIA driver 580 or newer, an RTX 3090, and the weights (19 GB; accept the model's licence on Hugging Face first). Prerequisites, disk sizes and troubleshooting: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
 ```bash
-# 0. the weights (both paths); accept the licence on the Hugging Face model page first
+# 0. weights, for both paths
 uvx --from huggingface_hub hf auth login
-uvx --from huggingface_hub hf download ukisai/Swift-1.5-Qwen3.8-27b-INT4 --local-dir ~/models/swift-1.5-int4   # 19 GB; or scripts/fetch_model.sh
+uvx --from huggingface_hub hf download ukisai/Swift-1.5-Qwen3.8-27b-INT4 --local-dir ~/models/swift-1.5-int4
 
-# A. Docker
-docker compose up --build                    # serves on http://localhost:8000, long-context profile
+# A. Docker (needs the NVIDIA container toolkit; serves the long-context profile on :8000)
+docker compose up --build
 
-# B. native
+# B. native (needs the CUDA 13.0 toolkit and uv; `make setup` takes 20 to 30 minutes, mostly downloads)
 make setup
 uv run server/serve.py --profile long --port 8000
 ```
 
-The server is ready after 19 to 35 s (native, warm caches; the long profile takes 26 to 35 s); the first start in Docker took about 80 s in our test because the compile caches are cold. Then try it:
+Then call it like any OpenAI server:
 
 ```bash
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "swift",
-  "messages": [{"role": "user", "content": "Write a binary search in Go."}],
-  "max_tokens": 600}'
+  "model": "swift", "messages": [{"role": "user", "content": "Write a binary search in Go."}], "max_tokens": 600}'
 ```
 
-The model **thinks before it answers** by default, and the thinking tokens count against `max_tokens` (the thinking text comes back in the `reasoning` field of the message). If you get a truncated or empty
-answer, raise `max_tokens` or switch thinking off per request with `"chat_template_kwargs": {"enable_thinking": false}`. More in [docs/USAGE.md](docs/USAGE.md).
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="x")   # any key unless you started the server with --api-key
-r = client.chat.completions.create(model="swift", messages=[{"role": "user", "content": "Hello"}], max_tokens=600)
-print(r.choices[0].message.content)
-```
-
-Check your install with `make test` (needs an RTX 3090 and the weights, and takes a long time: it starts the server several times). It tests the KV cache, the host tables, the sampling parameters, the tool-call path, the start-up configurations and the server end to end; the list is in [Getting started](docs/GETTING_STARTED.md#4-verify-it-works), together with the quick subset that needs no server.
-
-## Pick a mode
+The model thinks before it answers, and the thinking tokens count against `max_tokens` (the text comes back in the `reasoning` field). Raise `max_tokens`, or switch thinking off per request with
+`"chat_template_kwargs": {"enable_thinking": false}`. More in [docs/USAGE.md](docs/USAGE.md).
 
 | Goal | Flags | Context |
 |---|---|---|
-| **Long context** (the Docker default) | `--profile long` | 196,608 |
+| Long context (the Docker default) | `--profile long` | 196,608 |
 | The model's full context | `--profile long --max-model-len 262144 --prompt-lookup 0` | 262,144 |
 | Fastest at short context | defaults (bf16 KV cache) | 20,480 (28,672 with `--prompt-lookup 0`) |
-| fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 (the prompt-lookup tail is switched off automatically at this length) |
+| fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 |
 
-`--profile long` means a 4-bit KV cache plus `--host-tables`, which keeps the 4.7 GiB embedding and head tables in pinned host memory (bit-identical decode) so the VRAM goes to
-the cache. The server measures the free GPU memory at start and refuses a `--max-model-len` that does not fit, before loading the weights, naming the largest lengths that do
-([memory and context](docs/USAGE.md#memory-and-context)); the context numbers here were measured with a desktop holding 0.6 GiB of the card. Without `--prompt-lookup 0`, the 262,144 row
-also starts and serves (the tail then stays on and about 0.7 GiB more VRAM are in use). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file instead of typing flags (see [.env.example](.env.example)).
-Every flag: [docs/USAGE.md](docs/USAGE.md#server-flags).
+The server measures the free GPU memory at start and refuses a context that does not fit, before it loads the weights; the limits are in [USAGE](docs/USAGE.md#memory-and-context). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file ([.env.example](.env.example)).
+`make test` checks your install; it needs the GPU and the weights and takes a while ([list](docs/GETTING_STARTED.md#4-verify-it-works)).
 
-## Numbers at a glance
+## What works and what does not
 
-Same RTX 3090 at 350 W, same checkpoint and client, batch size 1, greedy decoding. **Single runs on one machine**; `n/s` = not served in that run.
-
-| Decode, tokens/s by prompt length | 32k | 64k | 100k | 130k | 190k |
-|---|---|---|---|---|---|
-| qwen-warp, 4-bit KV, `--profile long` | 122 | 117 | 107 | 102 | 94 |
-| qwen-warp, 4-bit KV, `--prompt-lookup 0` | 120 | 128 | 103 | 101 | 91 |
-| qwen-warp, fp8 KV | 117 | 117 | 108 | 98 | n/s |
-| *reference:* HyperQwen `mtp-long` (fp8/int8 KV) | 94 | 88 | 80 | 68 | n/s |
-| *reference:* HyperQwen `mtp-huge` (4/2-bit KVarN) | 58 | 53 | 39 | 31 | 27 |
-
-| Short prompts, tokens/s | code | prose | math |
-|---|---|---|---|
-| qwen-warp, 4-bit KV | 166 | 105 | 156 |
-| *reference:* HyperQwen `mtp-long` | 118 | 79 | 121 |
-
-| Quality, 283 coding tasks (pass@1) | passed |
+| | |
 |---|---|
-| bf16 KV (reference) | 244 |
-| qwen-warp, 4-bit KV | 241 (-1.1 points, p = 0.45, not significant) |
-
-- **HyperQwen is a reference point, not a competitor**: a different, more general project. Its numbers describe one build only: image
-  `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04).
-  Prefill is within about 10% of it. A newer build may be faster or slower. Its `mtp-long` needed `GPU_UTIL=0.88` on this desktop card; its `dflash2-long` preset failed to start here and is not compared.
-- Cold prefill: 1,830 tok/s at 16k, about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes. Follow-up turns reuse the cached prefix.
-- Our 4-bit arm missed a planted needle at 100k in the speed sweep (fp8 and both HyperQwen presets found it); output text drifts from bf16 earlier than with fp8 (67% token-identical on HumanEval+ against 88%).
-- **Not measured:** multi-turn agentic task success (edit-and-test loops, six-tool coding-agent sets, second turns of a tool conversation), other GPUs, power limits other than 350 W. What was measured for tool calls (one small schema): [Usage](docs/USAGE.md#tool-calls).
-
-All tables, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-
-## Known limits
-
-| Limit | Detail |
-|---|---|
-| Hardware | RTX 3090 only (sm_86 kernels, CUDA 13.0 only); no other GPU was tested |
-| Model | Swift-1.5-Qwen3.8-27B INT4, text only |
-| Concurrency | One request decodes at a time; the rest queue in order |
-| Sampling | `temperature`, `top_p`, `top_k` (up to 64; more is HTTP 400), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` work; `logprobs`, `bad_words`, structured output and `thinking_token_budget` return HTTP 400 ([table](docs/USAGE.md#sampling-parameters)) |
-| Long prompts | Slow to prefill: about 3 minutes at 190k tokens |
-| 4-bit cache | Lossy; see the quality caveats above. A minimal one-parameter tool schema in the usual key order gave a well-formed tool call in 39% of requests (bf16: 91%); the default `--sort-tool-schema` lifts it to 87% ([details](docs/USAGE.md#tool-calls)) |
+| Sampling | `temperature`, `top_p`, `top_k` (up to 64), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` ([table](docs/USAGE.md#sampling-parameters)) |
+| Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
+| Tool calls | They work, with one caveat: with the 4-bit cache a minimal one-parameter schema in the usual key order gave a well-formed call in 39% of requests (bf16: 91%). The default `--sort-tool-schema` lifts it to 87% ([details](docs/USAGE.md#tool-calls)) |
+| Concurrency | One request decodes at a time; the rest queue |
 
 ## Documentation
 
@@ -138,29 +100,10 @@ All tables, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 | Call the API, tune flags, understand memory and context | [docs/USAGE.md](docs/USAGE.md) |
 | See every measurement and its caveats | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
 | Understand the engine and find the code | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Pick up an open question | [docs/IDEAS.md](docs/IDEAS.md) |
-| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) and the [changelog](CHANGELOG.md) |
-
-## Ideas to explore
-
-A list of things we may try, not a roadmap: nothing is promised, scheduled or in progress. Details and evidence: [docs/IDEAS.md](docs/IDEAS.md).
-
-| Idea | Where it stands |
-|---|---|
-| A rotated 4-bit KV cache | About 2x lower perplexity cost on this 27B (+0.10% and +0.13% against +0.27% and +0.26%), not the 10x seen on a 2B proxy; no kernel, no speed number |
-| Why the 4-bit cache missed a needle at 100k | One miss in two experiments; cause unknown |
-| A better quantized model, if one appears | The W4 kernels assume uniform symmetric int4, group size 128 |
-| A non-uniform weight codebook | +2.8 points top-1 fidelity on Qwen3-4B, but on the 27B the extra weight bytes alone would slow the decode step by about 17% |
-| Multi-turn agentic task success per KV dtype | Agent tasks not measured; the tool-call rate of one small schema was |
-| Faster long prefill | About 960 tok/s at 262k |
-| Repeating the HyperQwen reference measurement | One pinned build, single runs |
-| Thinking budget (`thinking_token_budget`), `logprobs`, `bad_words`, structured output | HTTP 400 today; why each is hard here and a sketch for the first |
-| Why bf16 KV is about 5 points below a reference service on tool calls | Cause not isolated |
-
-Out of scope: other models, other GPUs, batching.
+| Pick up an open question (a list of ideas, not a roadmap) | [docs/IDEAS.md](docs/IDEAS.md) |
+| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md), [changelog](CHANGELOG.md) |
 
 ## Credits and license
 
-MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. What was and was not taken from each third-party project: [NOTICE](NOTICE).
-Measured next to [HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware (pinned build above); we are not competing with it: it is a general serving stack
-for several models and GPUs, and this engine is a single-purpose reference for one model on one card. Thanks to its authors for publishing their work and benchmarks.
+MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. What I took, and did not take, from each third-party project: [NOTICE](NOTICE).
+Thanks to the [HyperQwen](https://github.com/syv-ai/hyperqwen) authors for publishing their work and benchmarks.

@@ -10,7 +10,7 @@ open an issue so others know. Back to the [README](../README.md).
 | [Multi-turn agentic task success per KV dtype](#multi-turn-agentic-task-success-per-kv-dtype) | agent tasks not measured; the tool-call rate of one small schema was ([Usage](USAGE.md#tool-calls)) | an agent benchmark run three times |
 | [A non-uniform weight codebook](#a-non-uniform-weight-codebook) | helps accuracy on a 4B model; the extra bytes alone bound the 27B step at about +17% | a kernel; likely a dead end at this size |
 | [A better quantized model](#a-better-quantized-model-if-one-appears) | nothing to measure yet | kernel work if the format changes |
-| [Faster long prefill](#faster-long-prefill) | about 960 tok/s at 262k | profiling first |
+| [Faster long prefill](#faster-long-prefill) | 963 tok/s at 262k | profiling first |
 | [Repeating the HyperQwen reference measurement](#repeating-the-hyperqwen-reference-measurement) | one pinned build, single runs | a few hours of runs |
 | [A thinking token budget](#a-thinking-token-budget) | `thinking_token_budget` is HTTP 400; `reasoning_effort` is only a prompt hint; a design sketch fits the existing processors | a kernel rule, an exactness test, a quality measurement at cut-off budgets |
 | [Log-probabilities](#log-probabilities-through-an-extra-bf16-pass) | HTTP 400; the head returns exact logits for 64 candidates only | an extra bf16 pass for requests that ask, and its cost |
@@ -69,7 +69,7 @@ A different weight format means kernel work, and a different model means re-chec
 
 ## Faster long prefill
 
-Cold prefill is 1,830 tok/s at 16k and about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes; later turns reuse the cached prefix. It is within about 10% of the reference build in the
+Cold prefill is 1,888 tok/s at 16k, 1,094 at 190k and 963 at 262k (re-measured 2026-11-04), so a 190k prompt takes about 3 minutes; later turns reuse the cached prefix. It is within about 10% of the reference build in the
 [comparison](PERFORMANCE.md#4-hyperqwen-as-a-reference-point), so a gain would come from the attention and DeltaNet prefill path (`engine/prefill.py`). No profile has been taken.
 
 ## Repeating the HyperQwen reference measurement

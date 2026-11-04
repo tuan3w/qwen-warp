@@ -1,4 +1,4 @@
-"""Host-pinned embedding / lm_head tables (Engine(host_tables=True)): bit-identical to the GPU tables, ~4.7 GiB less VRAM, no per-step cost.
+"""Host-pinned embedding / lm_head tables (Engine(host_tables=True)): bit-identical to the GPU tables, ~4.8 GiB less VRAM, no per-step cost.
 
   python tests/test_host_tables.py [--kv 2] [--prompt 600]
 Runs the same workload twice in subprocesses (GPU tables, host tables) with SpecEngine: prefill, plain greedy decode, one T=1 head step's logits, MTP spec cycles.

@@ -120,7 +120,7 @@ Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schem
 | Answers are cut off or empty | the model's thinking tokens count against `max_tokens` | raise `max_tokens`, or send `"chat_template_kwargs": {"enable_thinking": false}` ([details](USAGE.md#thinking-and-reasoning-output)) |
 | A tool call is missing or malformed in an answer | the model sometimes does not write a well-formed call, much more often on the 4-bit cache with a minimal tool schema (39% well-formed as clients send it, 87% with the default `--sort-tool-schema on`) | check `tool_calls` and retry; leave `--sort-tool-schema` on; [details and what was not measured](USAGE.md#tool-calls) |
 | The server breaks after you upgraded vLLM or torch by hand | the engine-core client and the tool-schema hook use vLLM internals of the pinned `vllm==0.30.0`; other versions are untested (0.33.0 exists) | go back to the locked environment: `uv sync --group dev` (what `make setup` runs) |
-| The first request with a very long prompt takes minutes | prefill speed: about 1,830 tok/s at 16k, about 960 tok/s at 262k | expected; follow-up turns reuse the cached prefix |
+| The first request with a very long prompt takes minutes | prefill speed: about 1,890 tok/s at 16k, about 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes) | expected; follow-up turns reuse the cached prefix |
 | Port 8000 is taken | another server | `--port 8013`, or `PORT=8013` for Docker |
 | First Docker start is slow | cold Triton and vLLM compile caches | wait; they persist in the `cache` volume |
 | It does not build or run on another GPU | the kernels are written and tested for sm_86 only | not supported; see [Ideas](IDEAS.md) if you want to try |

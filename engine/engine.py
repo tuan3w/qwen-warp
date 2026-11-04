@@ -71,7 +71,7 @@ class Engine:
         if G.hq is not None:  # K9: quantised head + exact BF16 rescoring (the BF16 head above stays resident for the rescoring)
             m.head_q_kind, m.head_q, m.head_qs = self.hq_kind, p(G.hq.w), p(G.hq.s)
         self.m = m
-        self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet ring has tmax + 1 slots (8: +0.62 GiB, needed for the prompt-lookup tail)
+        self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet ring has tmax + 1 slots (8: +0.56 GiB, needed for the prompt-lookup tail)
         self.h = self.lib.smk_engine_create_ex(C.byref(m), ctx_max, kv_fp8, self.tmax)
         if not self.h:
             raise RuntimeError("smk_engine_create failed (out of device memory?)")

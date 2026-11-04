@@ -14,8 +14,8 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | How much context fits? | 262,144 tokens on the 4-bit cache with host-pinned tables: 23,227 MiB in use on the card after a 262,080-token prompt with `--prompt-lookup 0` (22.7 GiB, of which 0.57 GiB is the desktop), 23,899 MiB with the default tail | server-level: real starts, literal near-limit prompts | [1](#1-memory-how-much-context-fits) |
 | What does the 4-bit cache cost in quality? | perplexity +0.26% at 98k tokens; coding pass@1 244 -> 241 of 283 (p = 0.45, not significant) | proxies (perplexity, single-shot coding) | [2](#2-quality-of-the-4-bit-kv-cache) |
 | What does it cost for tool calls? | a minimal one-parameter schema in the usual key order: 39% well-formed on the 4-bit cache against 91% on bf16; 87% with the default sorted rendering | one schema, in-process runs of 150 requests per cell | [2](#tool-calls) |
-| How fast is decode? | 91 to 128 tok/s from 32k to 190k tokens; 105 to 166 tok/s on short prompts | single runs | [3](#3-speed) |
-| How fast is prefill? | 1,830 tok/s at 16k, about 960 tok/s at 262k (a 190k prompt takes 178 s) | single runs | [3](#3-speed) |
+| How fast is decode? | 94 to 133 tok/s from 32k to 262k tokens (4-bit cache); 105 to 181 tok/s on short prompts | single runs, re-measured 2026-11-04 | [3](#3-speed) |
+| How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | a reference point on one pinned build, not a competition | single runs, one build | [4](#4-hyperqwen-as-a-reference-point) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
@@ -101,25 +101,51 @@ A well-formed tool call is the fraction of requests whose answer carries a call 
 
 ## 3. Speed
 
-Decode tokens/s at the given prompt length (single run, 350 W):
+Re-measured on 2026-11-04 on the released code (merged tree of this repository), with the frozen prompts and the streaming client of the HyperQwen comparison in [section 4](#4-hyperqwen-as-a-reference-point)
+(real code from several repositories with a planted passphrase at 40% of the prompt; greedy; 256 tokens after the prompt; decode tok/s = tokens after the first chunk over the time from the first to the last chunk). One run per cell, 350 W.
 
-| context | 32k | 64k | 100k | 130k | 190k |
-|---|---|---|---|---|---|
-| int4 KV + prompt lookup | 122 | 117 | 107 | 102 | 94 |
-| int4 KV | 120 | 128 | 103 | 101 | 91 |
-| fp8 KV | 117 | 117 | 108 | 98 | not served in this run |
+Decode tokens/s at the given prompt length:
 
-Short prompts, int4 KV, greedy: 166 tok/s on code, 105 on prose, 156 on math (speculative decoding gain depends on the text; the cause of the prose gap was not isolated). The default profile (bf16 KV) decodes a short code answer at about 192 to 194 tok/s (several measurements of the same prompts before and after the later server changes agree within about 1%).
-Cold prefill: 1,830 tok/s at 16k, falling to 964 tok/s at 262k (179 s for a 196,544-token prompt, 275 s for 262,080). Attention kernel time with int4 is 0.55 to 0.9 of fp8 at every length measured.
+| context | 16k | 32k | 64k | 100k | 130k | 190k | 262k |
+|---|---|---|---|---|---|---|---|
+| int4 KV + prompt lookup (`--profile long`) | - | 124 | 119 | 115 | 108 | 102 | - |
+| int4 KV, `--prompt-lookup 0` | 154 | 124 | 133 | 109 | 105 | 96 | 94 |
+| fp8 KV, `--host-tables` | - | 123 | 123 | 112 | 108 | - | - |
+| bf16 KV (defaults) | 159 | - | - | - | - | - | - |
 
-Decode slows from 120 to 91 tok/s between 32k and 190k. [INFERENCE] This is the attention scan over a longer cache, since the weight reads are the same at every length; no profile was taken to separate it.
+`-` = not run (the configuration does not serve that length, or it was not part of the run). The planted passphrase was found in every cell except 100k with the 4-bit cache (both arms); fp8 found it at every length it served, and the 4-bit cache found it at 16k, 32k, 64k, 130k, 190k and 262k.
+
+Cold prefill, seconds to the first token (tokens per second in brackets), same runs:
+
+| context | 16k | 32k | 64k | 100k | 130k | 190k | 262k |
+|---|---|---|---|---|---|---|---|
+| int4 KV, `--prompt-lookup 0` | 8.4 (1,888) | 18.0 (1,776) | 40.5 (1,576) | 71.5 (1,398) | 101.7 (1,277) | 173.5 (1,094) | 271.8 (963) |
+| int4 KV + prompt lookup | - | 17.8 (1,788) | 40.4 (1,583) | 68.8 (1,453) | 97.5 (1,332) | 167.7 (1,133) | - |
+| fp8 KV | - | 18.0 (1,775) | 40.6 (1,575) | 71.6 (1,395) | 99.4 (1,307) | - | - |
+
+Short prompts (385 tokens, greedy, median of 3 runs, tokens/s):
+
+| configuration | code | prose | math |
+|---|---|---|---|
+| bf16 KV (defaults) | 172 | 110 | 172 |
+| int4 KV, `--prompt-lookup 0` | 170 | 108 | 162 |
+| int4 KV + prompt lookup | 173 | 106 | 175 |
+| fp8 KV | 172 | 105 | 171 |
+| `--profile long --max-model-len 262144 --prompt-lookup 0` | 181 | 115 | 172 |
+
+The speculative-decoding gain depends on the text (prose is the slowest; the cause was not isolated). The last row differs from the 4-bit row above only in the context length, yet is up to 6% faster: treat differences of that size between runs of different server starts as noise.
+Another code prompt (the one used by the smoke tests) decodes at about 192 to 194 tok/s on the default profile, so short-prompt speed depends on the prompt as much as on the configuration.
+Time to ready was 21 to 30 s for every configuration. Attention kernel time with int4 is 0.55 to 0.9 of fp8 at every length measured (earlier engine-level measurement).
+
+Decode slows from 124 to 96 tok/s between 32k and 190k with the 4-bit cache and the tail off. [INFERENCE] This is the attention scan over a longer cache, since the weight reads are the same at every length; no profile was taken to separate it.
 
 ## 4. HyperQwen as a reference point
 
 This is a reference point, not a competition: [HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) is a general project for several models and GPUs, and it changes quickly.
 The numbers below describe **one build only**: its public image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`
 (OCI revision label `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04, tag `latest` at the time), run unmodified on the same card, power limit,
-checkpoint, client and prompts. A newer build may be faster or slower. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
+checkpoint, client and prompts. A newer build may be faster or slower. The "ours" rows below are the numbers of that same session (2026-11-03), so the comparison is like for like;
+the re-measurement of [section 3](#3-speed) on 2026-11-04 is 1% to 10% higher in every decode cell. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
 
 ```
 Decode, tokens/s by prompt length           32k   64k  100k  130k  190k

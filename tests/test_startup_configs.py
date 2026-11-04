@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Every documented way to start the qwen-warp server must start AND serve on a 24 GB RTX 3090 that also drives a desktop (~0.6 GiB in use).  Needs the checkpoint ($SWIFT_MODEL,
-default ~/models/swift-1.5-int4); starts and stops its own servers, one after the other (about 6 minutes).
+default ~/models/swift-1.5-int4); starts and stops its own servers, one after the other (about 4 minutes).
 
   python tests/test_startup_configs.py [--port 8021] [--full]
 
@@ -10,7 +10,7 @@ and report the time to ready and the GPU memory in use afterwards.  --max-model-
 Beyond the memory there must be a fast, actionable refusal: two configurations that need more than the card has must exit non-zero within 60 s (not hang, not die with a raw CUDA OOM
 after loading the weights) and the message must give the free memory and the largest --max-model-len per cache layout.
 A prompt of ~200k tokens takes 3 minutes to prefill: without --full the long profiles get a 32,768-token prompt (their KV cache is allocated up front and the request-time scratch does not
-depend on the prompt length: the torch reserved memory after a request is identical at 8k and 98k tokens); --full sends the literal near-limit prompts (adds about 9 minutes).
+depend on the prompt length: the torch reserved memory after a request is identical at 8k and 98k tokens); --full sends the literal near-limit prompts (adds about 8 minutes).
 """
 import argparse
 import os
