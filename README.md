@@ -18,7 +18,7 @@ long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, cave
 - [Performance](#performance)
 - [How it works](#how-it-works)
 - [Limits](#limits)
-- [Roadmap](#roadmap)
+- [Ideas to explore](#ideas-to-explore)
 - [Development](#development)
 - [Credits and license](#credits-and-license)
 
@@ -129,20 +129,18 @@ Details and file-level pointers: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - Long prompts are slow to prefill (see Performance).
 - The 4-bit cache is lossy: output text drifts from bf16's earlier (67% token-identical on HumanEval+ against 88% for fp8) even though task accuracy held.
 
-## Roadmap
+## Ideas to explore
 
-Done: 4-bit KV cache (262,144 tokens in 24 GB), host-pinned tables, MTP speculative decoding with prompt lookup, the OpenAI server with prefix reuse.
+A list of things we may try, not a roadmap: nothing here is promised, scheduled or in progress. Each line says what is known so far and what is not.
 
-To do:
+- **A better quantized model, if one appears.** The W4 kernels assume uniform symmetric int4 with group size 128, so a different weight format means kernel work.
+- **A rotated 4-bit KV cache.** A 256-point Walsh-Hadamard rotation with a log2 group scale and a fixed Gaussian 16-level codebook at the same 4.125 bits cut the perplexity cost about 10x on a Qwen3.5-2B proxy (+2.0% to +0.19%), but on this 27B it is only about 2x: +0.10% at 32k and +0.13% at 98k tokens against +0.27% and +0.26% for the current cache (fp8: 0.00% and +0.03%). Measured as quantise-then-dequantise in bf16 storage, so there is no decode kernel and no speed number. A per-channel mean table added nothing. A 5-bit variant (group 32, asymmetric, with the rotation) measured +0.05% at 32k in an earlier run, at one more bit per element.
+- **A non-uniform weight codebook.** +2.8 points top-1 fidelity on Qwen3-4B; not tried on the 27B, where our fused kernel is about 2x slower than int4.
+- **Multi-turn agentic task success for each KV dtype.** Not measured at all so far.
+- **Faster long prefill** (about 960 tok/s at 262k).
+- **Repeating the HyperQwen comparison**, with its DFlash2 preset if it starts.
 
-- [ ] **Better quantized model.** Move to it when it is released. The W4 kernels assume uniform symmetric int4, group size 128; a different format means kernel work.
-- [ ] Rotated 4-bit KV cache: about 10x lower perplexity cost on a Qwen3.5-2B proxy (+2.0% to +0.19%); check on the 27B.
-- [ ] Non-uniform weight codebook: +2.8 points top-1 fidelity on Qwen3-4B; check on the 27B (our fused kernel is about 2x slower than int4).
-- [ ] Multi-turn agentic task success for each KV dtype.
-- [ ] Faster long prefill (about 960 tok/s at 262k).
-- [ ] Repeat the HyperQwen comparison, and add its DFlash2 preset if it starts.
-
-Not planned: other models, other GPUs, batching.
+Out of scope: other models, other GPUs, batching.
 
 ## Development
 
