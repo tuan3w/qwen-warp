@@ -83,7 +83,7 @@ The server is ready 19 to 35 s after it starts (warm caches; 26 to 35 s for `--p
 curl localhost:8000/health                          # HTTP 200 when ready
 curl localhost:8000/v1/models                       # the served model name is "swift"
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"swift","messages":[{"role":"user","content":"Say hello."}],"max_tokens":300}'
+  -d '{"model":"swift","messages":[{"role":"user","content":"Say hello."}],"max_tokens":1000}'
 ```
 
 For a deeper check, `make test` (native path, needs an RTX 3090 and the weights; it takes a long time because several tests start the server; stop any running server first, because the tests start their own and the engine needs the VRAM).

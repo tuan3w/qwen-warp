@@ -25,14 +25,14 @@ One request is decoded at a time; further requests wait in order, and a client t
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "swift",
   "messages": [{"role": "user", "content": "Explain the CAP theorem in three sentences."}],
-  "max_tokens": 800}'
+  "max_tokens": 2000}'
 ```
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="x")      # the key is only checked if you started the server with --api-key
 
-stream = client.chat.completions.create(model="swift", stream=True, max_tokens=800,
+stream = client.chat.completions.create(model="swift", stream=True, max_tokens=2000,
                                         messages=[{"role": "user", "content": "Write a quicksort in Rust."}])
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
