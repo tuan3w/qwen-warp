@@ -5,6 +5,7 @@ in the serving layer); it only needs an engine core that accepts `EngineCoreRequ
 one worker thread that owns the swift-mk engine (smk_runner.Runner), vLLM's `EngineCoreClient.make_async_mp_client` is replaced by `install()`.
 """
 import asyncio
+import math
 import queue
 import threading
 import time
@@ -14,6 +15,7 @@ import torch
 
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.metrics.stats import PrefillStats
@@ -24,8 +26,12 @@ from smk_runner import GenParams, MAX_TOP_K, Runner, STOP
 logger = init_logger("vllm.swift_mk")
 
 
+LOGIT_BIAS_MAX = 1024  # logit_bias entries (the device table is dense; the request only uploads the sparse list)
+VOCAB = 248320
+
+
 def check_supported(sp):
-    """Reject what the engine cannot do, with a 400 that names the parameter (instead of silently ignoring it)."""
+    """Reject what the engine cannot do, with a 400 that names the parameter (instead of silently ignoring it); validate the limits of what it can."""
     if sp.top_k > MAX_TOP_K:
         raise VLLMValidationError(f"top_k must be <= {MAX_TOP_K} (the swift-mk sampler keeps at most the {MAX_TOP_K} highest logits; 0 or -1 = no top-k filter), got {sp.top_k}",
                                   parameter="top_k", value=sp.top_k)
@@ -34,20 +40,6 @@ def check_supported(sp):
         bad.append(("logprobs", sp.logprobs))
     if sp.prompt_logprobs is not None:
         bad.append(("prompt_logprobs", sp.prompt_logprobs))
-    if sp.presence_penalty:
-        bad.append(("presence_penalty", sp.presence_penalty))
-    if sp.frequency_penalty:
-        bad.append(("frequency_penalty", sp.frequency_penalty))
-    if sp.repetition_penalty != 1.0:
-        bad.append(("repetition_penalty", sp.repetition_penalty))
-    if sp.min_p:
-        bad.append(("min_p", sp.min_p))
-    if sp.min_tokens:
-        bad.append(("min_tokens", sp.min_tokens))
-    if sp.logit_bias:
-        bad.append(("logit_bias", sp.logit_bias))
-    if sp.allowed_token_ids:
-        bad.append(("allowed_token_ids", sp.allowed_token_ids))
     if sp.bad_words:
         bad.append(("bad_words", sp.bad_words))
     if sp.structured_outputs is not None:
@@ -59,15 +51,31 @@ def check_supported(sp):
     if bad:
         name, val = bad[0]
         raise VLLMValidationError(
-            f"swift-mk engine does not support {', '.join(n for n, _ in bad)} (supported sampling: temperature, top_p, top_k <= 64, seed, max_tokens, stop, stop_token_ids, ignore_eos, n)",
+            f"swift-mk engine does not support {', '.join(n for n, _ in bad)} (supported sampling: temperature, top_p, top_k <= 64, min_p, presence_penalty, frequency_penalty, repetition_penalty, "
+            f"logit_bias, min_tokens, allowed_token_ids, seed, max_tokens, stop, stop_token_ids, ignore_eos, n)",
             parameter=name, value=val)
+    lb = sp.logit_bias
+    if lb:
+        if len(lb) > LOGIT_BIAS_MAX:
+            raise VLLMValidationError(f"logit_bias has {len(lb)} entries, at most {LOGIT_BIAS_MAX} are supported", parameter="logit_bias", value=len(lb))
+        if any(not 0 <= t < VOCAB for t in lb) or any(not math.isfinite(v) for v in lb.values()):
+            raise VLLMValidationError(f"logit_bias: token ids must be in [0, {VOCAB}) and values finite", parameter="logit_bias", value=len(lb))
+    al = sp.allowed_token_ids
+    if al:
+        if len(al) > VOCAB or any(not 0 <= t < VOCAB for t in al):
+            raise VLLMValidationError(f"allowed_token_ids: at most {VOCAB} ids, each in [0, {VOCAB})", parameter="allowed_token_ids", value=len(al))
+        if sp.min_tokens and set(al) <= set(sp.all_stop_token_ids):
+            raise VLLMValidationError("min_tokens masks the stop tokens, but every allowed_token_ids entry is a stop token: nothing could be generated", parameter="min_tokens", value=sp.min_tokens)
 
 
 def to_gen_params(sp) -> GenParams:
     greedy = sp.temperature < 1e-5
     # InputProcessor has already folded generation_config's EOS ids into stop_token_ids and left eos_token_id None under ignore_eos (SamplingParams.update_from_generation_config)
     return GenParams(max_tokens=sp.max_tokens, eos=sp.eos_token_id, stop_ids=frozenset(sp.stop_token_ids or ()),
-                     temperature=0.0 if greedy else sp.temperature, top_k=sp.top_k, top_p=sp.top_p, seed=sp.seed)
+                     temperature=0.0 if greedy else sp.temperature, top_k=sp.top_k, top_p=sp.top_p, seed=sp.seed, min_p=sp.min_p,
+                     presence_penalty=sp.presence_penalty, frequency_penalty=sp.frequency_penalty, repetition_penalty=sp.repetition_penalty, min_tokens=sp.min_tokens,
+                     min_tokens_ids=frozenset(sp.all_stop_token_ids), logit_bias=dict(sp.logit_bias) if sp.logit_bias else None,
+                     allowed_token_ids=tuple(dict.fromkeys(sp.allowed_token_ids)) if sp.allowed_token_ids else None)
 
 
 OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False, sort_tool_schema=True)
@@ -263,3 +271,6 @@ def install(**options):
         return SwiftCoreClient(vllm_config, executor_class, log_stats, client_addresses, client_count, client_index, renderer)
 
     EngineCoreClient.make_async_mp_client = staticmethod(make)
+    # vLLM refuses min_p and logit_bias whenever a speculative config is set (SamplingParams._validate_spec_decode): a limit of ITS rejection sampler, which applies neither to the verify rows
+    # (v1/sample/rejection_sampler.py apply_logits_processors).  This engine's cycle applies every supported processor to every verify row, exactly (engine/src/proc.h), so the check goes.
+    SamplingParams._validate_spec_decode = lambda self, speculative_config: None

@@ -124,13 +124,35 @@ int smk_engine_head(smk_engine* e);
 // of smk_engine_step); runs final RMSNorm (-> debug tap NLAYER+1 = the hidden the MTP stage reads) + lm_head (BF16, or the K9 quantised head + exact rescoring; rsamp != 0: R = 64
 // candidates, i.e. sampling) + argmax -> device ds[OUT].  No pos / cur advance, no token feedback.  Stream-ordered, capturable.  Used by the fast prefill (prefill.cu).
 cudaError_t smk_engine_head_tail(smk_engine* e, int rsamp, cudaStream_t st);
+// Request-level logit processors (OpenAI / vLLM semantics and order: allowed_token_ids mask, min_tokens stop-token mask, logit_bias, repetition, frequency, presence penalty; see src/proc.h).
+// Active only for sampling head steps (rsamp != 0: the speculative driver's sampling graphs, include/mtp.h); the greedy graphs never contain them.  Repetition penalty sees prompt + generated tokens,
+// frequency / presence the generated tokens only; a verify row also sees the draft tokens before it as generated.  All-default fields (presence = frequency = 0, repetition = 1, min_tokens = 0,
+// no bias / allowed ids) or p == NULL: off (kernels return at once).  Call before the prefill of every request (stream-ordered; zeroes the per-request counts).
+typedef struct smk_procs {
+  float presence, frequency, repetition;  // 0, 0, 1 = off
+  int min_tokens;                         // stop tokens are masked until this many tokens have been generated
+  const int* prompt;                      // prompt token ids (repetition penalty)
+  int n_prompt;
+  const int* bias_ids;                    // logit_bias: ids (distinct) and values
+  const float* bias_vals;
+  int n_bias;
+  const int* allowed;                     // allowed_token_ids (n_allowed == 0: unrestricted)
+  int n_allowed;
+  const int* stop;                        // stop token ids masked by min_tokens
+  int n_stop;
+} smk_procs;
+cudaError_t smk_engine_set_procs(smk_engine* e, const smk_procs* p, cudaStream_t st);
+// Test hooks (a scratch processor state per call, no engine): the approximate-logit kernel on host logits [T][248320] -> out [T][248320], and the candidate kernel on cand int [T][64]
+// (-1 unused) / exact float [T][64] -> out [T][64].  gen[n_gen] = tokens already generated (noted through the device path), drafts[T-1] = the draft tokens of rows 1..T-1.
+cudaError_t smk_test_proc_logits(const smk_procs* p, int T, const int* gen, int n_gen, const int* drafts, const float* logits, float* out);
+cudaError_t smk_test_proc_cand(const smk_procs* p, int T, const int* gen, int n_gen, const int* drafts, const int* cand, const float* exact, float* out);
 // Same work launched as individual kernels (no graph): for profiling / debugging.
 cudaError_t smk_engine_step_nograph(smk_engine* e, int T, int head, cudaStream_t st);
 // Greedy decode: n replays of the T=1 head graph, host out_tok[0..n-1] filled (synchronises).
 cudaError_t smk_engine_decode(smk_engine* e, int n, int* host_tokens, cudaStream_t st);
 // Synchronous copy of an engine debug buffer to host memory.  what = 0: device state int[20] (pos0, cur, tok[8], out_tok[8], ring slots, pad);
 // 1: debug taps bf16 [66][SMK_TMAX][5120] (always written; slot 0 = embedding, slot l+1 = hidden after layer l, slot 65 = final-norm output; rows 0..T-1 of the last step);
-// 2: logits fp32 [SMK_TMAX][248320] of the last head step.  `bytes` must be <= the buffer size.
+// 2: logits fp32 [SMK_TMAX][248320] of the last head step; 3: the request processors' generated-token counts int [248320] (smk_procs); 4: their device state (src/proc.h ProcP: on, has_allowed, min_tokens, ngen, ...).  `bytes` must be <= the buffer size.
 cudaError_t smk_engine_read(smk_engine* e, int what, void* host, size_t bytes);
 size_t smk_engine_bytes(smk_engine* e);          // device bytes allocated by the engine
 

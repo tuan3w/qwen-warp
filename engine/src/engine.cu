@@ -24,12 +24,18 @@ static cudaError_t head_tail(smk_engine* e, int T, int head, int rsamp, cudaStre
   int l = NLAYER;
   auto dbgp = [&](int slot) { return (void*)(e->dbg + (size_t)slot * TM * H); };
   CK(smk_rmsnorm(e->h, e->dn, e->w.final_norm, dbgp(NLAYER + 1), dbgp(NLAYER), T, H, 1e-6f, st));
+  // Sampling steps (rsamp) apply the request's logit processors (proc.h) with the draft tokens ds[TOK + 1 ..] as the history of the later rows: to the approximate logits before the
+  // candidate selection (so a penalty / bias / mask that promotes a token outside the quantised top-R makes it a candidate), then again to the exact logits of the selected candidates.
+  const int* drafts = e->ds + DS_TOK + 1;
   if (head == 1 && !e->hq_on) {
     CK(smk_bf16_gemv_f32(e->w.lm_head, dbgp(NLAYER + 1), VOC, H, T, e->logits, st));
+    if (rsamp) CK(proc_logits(e->pb.dev, e->logits, drafts, T, st));
     CK(smk_argmax(e->logits, T, VOC, (int*)(e->ds + DS_OUT), nullptr, e->ws_am, st));
   } else if (head == 1) {
     CK(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, dbgp(NLAYER + 1), VOC, H, T, e->logits, st));
+    if (rsamp) CK(proc_logits(e->pb.dev, e->logits, drafts, T, st));
     CK(smk_headq_select_rescore(e->logits, e->w.lm_head, dbgp(NLAYER + 1), VOC, H, T, rsamp ? HEAD_R_SAMPLING : HEAD_R_GREEDY, (int*)(e->ds + DS_OUT), nullptr, e->ws_hq, st));
+    if (rsamp) CK(proc_cand(e->pb.dev, smk_headq_ws_cand(e->ws_hq), (float*)smk_headq_ws_exact(e->ws_hq), SMK_HEADQ_RMAX, e->logits, drafts, T, st));
   }
   return cudaSuccess;
 }
@@ -137,6 +143,14 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
   e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
   e->kv = (char*)dalloc(e, (size_t)na * e->kv_layer_bytes, true);
+  // the processor state is allocated last: the addresses of every buffer the decode path reads stay what they were
+  e->pb.dev = (ProcP*)dalloc(e, sizeof(ProcP), true);
+  e->pb.counts = (int*)dalloc(e, (size_t)VOC * 4, true);
+  e->pb.flags = (uint8_t*)dalloc(e, VOC, true);
+  e->pb.bias = (float*)dalloc(e, (size_t)VOC * 4, true);
+  e->pb.ids = (int*)dalloc(e, PROC_CHUNK * 4);
+  e->pb.vals = (float*)dalloc(e, PROC_CHUNK * 4);
+  { ProcP p0 = {}; p0.rep = 1.0f; p0.counts = e->pb.counts; p0.flags = e->pb.flags; p0.bias = e->pb.bias; cudaMemcpy(e->pb.dev, &p0, sizeof(p0), cudaMemcpyHostToDevice); }
   cudaStreamCreateWithFlags(&e->cap, cudaStreamNonBlocking);
   cudaStreamCreateWithFlags(&e->side, cudaStreamNonBlocking);
   cudaEventCreateWithFlags(&e->ev_fork, cudaEventDisableTiming);
@@ -224,8 +238,8 @@ cudaError_t smk_engine_decode(smk_engine* e, int n, int* host_tokens, cudaStream
 }
 
 cudaError_t smk_engine_read(smk_engine* e, int what, void* host, size_t bytes) {
-  const void* src = what == 0 ? (const void*)e->ds : what == 1 ? (const void*)e->dbg : what == 2 ? (const void*)e->logits : nullptr;
-  const size_t cap = what == 0 ? DS_N * sizeof(int) : what == 1 ? (size_t)DBG_SLOTS * TM * H * 2 : (size_t)TM * VOC * 4;
+  const void* src = what == 0 ? (const void*)e->ds : what == 1 ? (const void*)e->dbg : what == 2 ? (const void*)e->logits : what == 3 ? (const void*)e->pb.counts : what == 4 ? (const void*)e->pb.dev : nullptr;
+  const size_t cap = what == 0 ? DS_N * sizeof(int) : what == 1 ? (size_t)DBG_SLOTS * TM * H * 2 : what == 3 ? (size_t)VOC * 4 : what == 4 ? sizeof(ProcP) : (size_t)TM * VOC * 4;
   if (!src || bytes > cap) return cudaErrorInvalidValue;
   return cudaMemcpy(host, src, bytes, cudaMemcpyDeviceToHost);
 }

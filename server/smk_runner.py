@@ -45,6 +45,22 @@ class GenParams:
     top_k: int = 0  # 1..MAX_TOP_K; <= 0: no top-k filter (the sampler then ranks the MAX_TOP_K best candidates)
     top_p: float = 1.0
     seed: int | None = None
+    # request-level logit processors (vLLM / OpenAI semantics, engine/src/proc.h); the defaults are off
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_tokens: int = 0
+    min_tokens_ids: frozenset = frozenset()  # tokens masked until min_tokens are generated (eos + stop token ids)
+    logit_bias: dict | None = None
+    allowed_token_ids: tuple | None = None
+
+    def procs(self, prompt_ids):
+        """spec.make_procs arguments of the elementwise processors, None when none is active (min_p is a sampler parameter)."""
+        if not (self.presence_penalty or self.frequency_penalty or self.repetition_penalty != 1.0 or self.min_tokens or self.logit_bias or self.allowed_token_ids):
+            return None
+        return dict(prompt=prompt_ids, presence=self.presence_penalty, frequency=self.frequency_penalty, repetition=self.repetition_penalty, min_tokens=self.min_tokens,
+                    bias=self.logit_bias, allowed=self.allowed_token_ids, stop=sorted(self.min_tokens_ids))
 
 
 @dataclass
@@ -85,6 +101,7 @@ class Runner:
         # all snapshot buffers are allocated up front (cudaHostAlloc of 151 MB costs ~20 ms): len(snaps) + len(pool) == max_snaps
         self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory()) for _ in range(max_snaps)]
         self.last = Stats()
+        self._procs_on = False
         if warmup:
             t0 = time.time()
             self._warmup()
@@ -224,11 +241,17 @@ class Runner:
             raise ValueError(f"prompt of {len(ids)} tokens does not fit the engine context {self.ctx_max}")
         t0 = time.time()
         ends, folded = self._plan(ids)
+        procs = p.procs(ids)
         if p.temperature > 0:
             seed = p.seed if p.seed is not None else random.getrandbits(62)
-            e.set_sampling(temperature=p.temperature, top_k=p.top_k if p.top_k > 0 else MAX_TOP_K, top_p=p.top_p, seed=seed)
+            e.set_sampling(temperature=p.temperature, top_k=p.top_k if p.top_k > 0 else MAX_TOP_K, top_p=p.top_p, seed=seed, min_p=p.min_p)
+        elif procs:  # greedy over the PROCESSED logits: the sampling graphs with top_k = 1 (the greedy graphs have no processors)
+            e.set_sampling(temperature=1.0, top_k=1, top_p=1.0, seed=0)
         else:
             e.set_sampling(0.0)
+        if procs or self._procs_on:  # requests without processors touch nothing (a previous request's processors are switched off once)
+            e.set_procs(**(procs or {}))
+            self._procs_on = bool(procs)
         snap = self._choose(ids, set(ends))
         if snap is None:
             self._free_snaps([])

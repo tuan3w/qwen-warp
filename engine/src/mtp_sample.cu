@@ -150,14 +150,18 @@ __global__ void __launch_bounds__(SK2_THREADS) k_topk2(const SampP* __restrict__
     Dist* o = out + r;
     const float v0 = key_val(sk[0]);
     float e[SK_KMAX], sum = 0.f;
-    for (int i = 0; i < K; i++) {
-      e[i] = expf((key_val(sk[i]) - v0) * inv_t);
-      sum += e[i];
+    for (int i = 0; i < K; i++) e[i] = expf((key_val(sk[i]) - v0) * inv_t);
+    // min_p (vLLM: after temperature, before top-k / top-p): keep the tokens with p_i >= min_p * p_max, i.e. e_i >= min_p as e_0 = 1; the survivors are a prefix of the sorted list
+    int Ke = K;
+    if (!sel && sp->min_p > 0.f) {
+      Ke = 1;
+      while (Ke < K && e[Ke] >= sp->min_p) Ke++;
     }
-    // top-p on the softmax over the top-k survivors (HF: TopP after TopK; keep token i iff the mass before it is < top_p, at least one)
+    for (int i = 0; i < Ke; i++) sum += e[i];
+    // top-p on the softmax over the survivors of top-k and min_p (HF: TopP after TopK; keep token i iff the mass before it is < top_p, at least one)
     int n = 1;
     float cum = e[0] / sum;
-    while (n < K && (top_p >= 1.0f || cum < top_p)) {  // top_p >= 1: disabled (keep all K)
+    while (n < Ke && (top_p >= 1.0f || cum < top_p)) {  // top_p >= 1: disabled (keep all Ke)
       cum += e[n] / sum;
       n++;
     }
@@ -264,7 +268,10 @@ __global__ void k_accept_s(int* ds, int* ss, int* ring, int k, const Dist* pd, c
   __syncwarp();
   if (lane < a) ds[DS_OUT + lane] = y[lane];
   __syncwarp();
-  if (lane == 0) spec_finish(ds, ss, ring, a - 1, k + 1);
+  if (lane == 0) {
+    spec_finish(ds, ss, ring, a - 1, k + 1);
+    proc_note(sp->pr, ds + DS_OUT, ss[SS_A]);  // the emitted tokens (a forced partial acceptance lowers a) become generated history
+  }
 }
 
 __global__ void k_draft_pick(const Dist* qd, const SampP* sp, const int* ss, int j, int* dst) {
@@ -293,7 +300,10 @@ __global__ void k_first_pick(const Dist* pd, const SampP* sp, int* ss, int* ds, 
       ds[DS_TOK] = tok;
     }
   }
-  if (lane == 0 && bump) ss[SS_NCYC] += 1;
+  if (lane == 0) {
+    proc_note(sp->pr, ds + DS_OUT, 1);
+    if (bump) ss[SS_NCYC] += 1;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------- test kernels
@@ -326,6 +336,33 @@ __global__ void k_trials(const Dist* pd, const Dist* qd, const SampP* sp, int k,
   }
 }
 
+// K12 test hook kernels (logit processors in the cycle): per trial, the draft tokens d[trial][1..k] (chain drafts sampled from q, tail tokens fixed), then the acceptance on the trial's own verify rows.
+__global__ void k_trial_drafts(const Dist* qd, const SampP* sp, int nchain, int ntail, const int* tail, int nt, uint32_t ctr0, int* d) {
+  const int lane = threadIdx.x & 31;
+  const int trial = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (trial >= nt) return;
+  for (int j = 1; j <= nchain; j++) {
+    const int tok = sample_dist(qd + (j - 1), sp, ctr0 + (uint32_t)trial, ST_DRAFT + j, lane);
+    if (lane == 0) d[trial * 8 + j] = tok;
+  }
+  if (lane == 0) for (int j = 0; j < ntail; j++) d[trial * 8 + nchain + 1 + j] = tail[j];
+}
+__global__ void k_trial_fill(float* exact, const float* base, int nt, int n) {  // exact[trial][n] = base[n]
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < nt * n) exact[i] = base[i % n];
+}
+__global__ void k_trial_accept(const Dist* pd, const Dist* qd, const SampP* sp, int k, int nt, uint32_t ctr0, const int* d, int* y, int* a) {
+  const int lane = threadIdx.x & 31;
+  const int trial = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (trial >= nt) return;
+  int yy[8];
+  const int n = accept_core(pd + (size_t)trial * (k + 1), qd, d + trial * 8, k, sp, ctr0 + (uint32_t)trial, lane, yy);
+  if (lane == 0) {
+    for (int t = 0; t < 8; t++) y[trial * 8 + t] = t < n ? yy[t] : -1;
+    a[trial] = n;
+  }
+}
+
 __global__ void k_philox_test(const unsigned* c, const unsigned* kk, unsigned* out) {
   const uint4 r = philox(c[0], c[1], c[2], c[3], kk[0], kk[1]);
   out[0] = r.x; out[1] = r.y; out[2] = r.z; out[3] = r.w;
@@ -342,11 +379,12 @@ SampP make_sampp(const smk_sampling* c) {
   p.d_top_p = c->draft_top_p > 0.f ? c->draft_top_p : c->top_p;
   p.flags = c->test_flags;
   p.seed = c->seed;
+  p.min_p = c->min_p;
   return p;
 }
 bool valid(const smk_sampling* c) {
   return c->temperature > 0.f && c->top_k >= 1 && c->top_k <= SK_KMAX && c->top_p > 0.f && c->top_p <= 1.f && c->draft_top_k >= 0 && c->draft_top_k <= SK_KMAX &&
-         c->draft_temperature >= 0.f && c->draft_top_p >= 0.f && c->draft_top_p <= 1.f;
+         c->draft_temperature >= 0.f && c->draft_top_p >= 0.f && c->draft_top_p <= 1.f && c->min_p >= 0.f && c->min_p <= 1.f;
 }
 }  // namespace
 
@@ -499,6 +537,61 @@ cudaError_t smk_test_trials_pld(const float* tl, int NT, const float* dl, int ND
   const cudaError_t er = cudaMemcpy(a, b.a, (size_t)ntrials * 4, cudaMemcpyDeviceToHost);
   cudaFree(dtail);
   return er;
+}
+
+
+// K12: nchain chain drafts + ntail delta tail tokens on rows whose logits are processed per trial with the trial's own draft tokens (logit processors, proc.h).  Target rows: a small vocabulary N <= 64,
+// every token a candidate (cand = identity).  y[ntrials][8] (-1 padded), a[ntrials].  ignore_drafts: TEST ONLY broken variant (the rows are processed as if no draft token had been generated).
+cudaError_t smk_test_trials_procs(const float* tl, int N, const float* dl, int nchain, const int* tail, int ntail, const smk_sampling* cfg, const smk_procs* procs, const int* gen, int n_gen,
+                                  int ignore_drafts, int ntrials, unsigned ctr0, int* y, int* a) {
+  const int k = nchain + ntail;
+  const int top_k = cfg->top_k, d_top_k = cfg->draft_sample ? (cfg->draft_top_k > 0 ? cfg->draft_top_k : cfg->top_k) : 1;
+  if (!valid(cfg) || N < 1 || N > SMK_HEADQ_RMAX || top_k > N || d_top_k > N || nchain < 1 || nchain > SMK_SPEC_KMAX || ntail < 0 || k > SMK_SPEC_PMAX || ntrials < 1 || !procs) return cudaErrorInvalidValue;
+  constexpr int R = SMK_HEADQ_RMAX, B = 4096;
+  ProcScratch ps;
+  SMK_CK(ps.init(procs, gen, n_gen));
+  const SampP sp = make_sampp(cfg);
+  int *dtail = nullptr, *d = nullptr, *dneg = nullptr, *cand = nullptr, *dy = nullptr, *da = nullptr;
+  float *base = nullptr, *exact = nullptr, *ddl = nullptr;
+  Dist *pd = nullptr, *qd = nullptr;
+  uint64_t* ws = nullptr;
+  SampP* dsp = nullptr;
+  std::vector<int> hc((size_t)(k + 1) * R, -1), hneg(8, -1);
+  for (int t = 0; t <= k; t++) for (int i = 0; i < N; i++) hc[(size_t)t * R + i] = i;
+  std::vector<float> hb((size_t)(k + 1) * R, -INFINITY);
+  for (int t = 0; t <= k; t++) for (int i = 0; i < N; i++) hb[(size_t)t * R + i] = tl[(size_t)t * N + i];
+  cudaError_t e = cudaSuccess;
+  auto M = [&](void** p, size_t n) { if (e == cudaSuccess) e = cudaMalloc(p, n); };
+  M((void**)&dtail, 8 * 4); M((void**)&d, (size_t)B * 8 * 4); M((void**)&dneg, 8 * 4); M((void**)&cand, hc.size() * 4); M((void**)&dy, (size_t)B * 8 * 4); M((void**)&da, (size_t)B * 4);
+  M((void**)&base, hb.size() * 4); M((void**)&exact, (size_t)B * (k + 1) * R * 4); M((void**)&ddl, (size_t)nchain * N * 4);
+  M((void**)&pd, sizeof(Dist) * (size_t)B * (k + 1)); M((void**)&qd, sizeof(Dist) * k); M((void**)&ws, sizeof(uint64_t) * SK_WS_ENTRIES); M((void**)&dsp, sizeof(SampP));
+  if (e == cudaSuccess) {
+    cudaMemcpy(dtail, tail, ntail * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dneg, hneg.data(), 8 * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(cand, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(base, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(ddl, dl, (size_t)nchain * N * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dsp, &sp, sizeof(sp), cudaMemcpyHostToDevice);
+    for (int j = 0; j < nchain && e == cudaSuccess; j++) e = sk_topk(ddl + (size_t)j * N, 1, N, N, nullptr, dsp, 1, ws, qd + j, 0);
+    if (e == cudaSuccess && ntail > 0) { k_delta_q<<<ntail, SK_KMAX>>>(dtail - nchain, qd, nchain, k); e = cudaGetLastError(); }
+    for (int b0 = 0; b0 < ntrials && e == cudaSuccess; b0 += B) {
+      const int nb = ntrials - b0 < B ? ntrials - b0 : B;
+      const int rows = (k + 1) * R;
+      k_trial_drafts<<<(nb + 3) / 4, 128>>>(qd, dsp, nchain, ntail, dtail, nb, ctr0 + (uint32_t)b0, d);
+      k_trial_fill<<<(nb * rows + 255) / 256, 256>>>(exact, base, nb, rows);
+      for (int i = 0; i < nb && e == cudaSuccess; i++) {
+        e = proc_cand(ps.b.dev, cand, exact + (size_t)i * rows, R, nullptr, ignore_drafts ? dneg : d + i * 8 + 1, k + 1, 0);
+        if (e == cudaSuccess) e = sk_topk(exact + (size_t)i * rows, k + 1, N, R, nullptr, dsp, 0, ws, pd + (size_t)i * (k + 1), 0);
+      }
+      if (e != cudaSuccess) break;
+      k_trial_accept<<<(nb + 3) / 4, 128>>>(pd, qd, dsp, k, nb, ctr0 + (uint32_t)b0, d, dy, da);
+      e = cudaGetLastError();
+      if (e == cudaSuccess) e = cudaMemcpy(y + (size_t)b0 * 8, dy, (size_t)nb * 32, cudaMemcpyDeviceToHost);
+      if (e == cudaSuccess) e = cudaMemcpy(a + b0, da, (size_t)nb * 4, cudaMemcpyDeviceToHost);
+    }
+  }
+  for (void* p : {(void*)dtail, (void*)d, (void*)dneg, (void*)cand, (void*)dy, (void*)da, (void*)base, (void*)exact, (void*)ddl, (void*)pd, (void*)qd, (void*)ws, (void*)dsp}) if (p) cudaFree(p);
+  return e;
 }
 
 }  // extern "C"
