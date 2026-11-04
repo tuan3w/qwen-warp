@@ -11,6 +11,7 @@ open an issue so others know. Back to the [README](../README.md).
 | [A non-uniform weight codebook](#a-non-uniform-weight-codebook) | helps accuracy on a 4B model; the extra bytes alone bound the 27B step at about +17% | a kernel; likely a dead end at this size |
 | [A better quantized model](#a-better-quantized-model-if-one-appears) | nothing to measure yet | kernel work if the format changes |
 | [Faster long prefill](#faster-long-prefill) | 963 tok/s at 262k | profiling first |
+| [A block drafter (DFlash2-style)](#a-block-drafter-dflash2-style) | HyperQwen's DFlash2 decoded 1.5x faster on short code (5.8 against 3.5 tokens per step) | train or port a drafter; the verify path already handles 8 rows |
 | [Repeating the HyperQwen reference measurement](#repeating-the-hyperqwen-reference-measurement) | one pinned build, two same-protocol runs (2026-11-03 and 2026-11-04) that differ by 5% to 22% | a newer build, repeats per cell, a second power limit |
 | [A thinking token budget](#a-thinking-token-budget) | `thinking_token_budget` is HTTP 400; `reasoning_effort` is only a prompt hint; a design sketch fits the existing processors | a kernel rule, an exactness test, a quality measurement at cut-off budgets |
 | [Log-probabilities](#log-probabilities-through-an-extra-bf16-pass) | HTTP 400; the head returns exact logits for 64 candidates only | an extra bf16 pass for requests that ask, and its cost |
@@ -66,6 +67,13 @@ not a built kernel.] An earlier fused prototype ran about 2x slower than int4.
 
 The W4 kernels assume uniform symmetric int4 with groups of 128 (`uint32 [N][K/8]` plus bf16 scales `[N][K/128]`, see [Architecture](ARCHITECTURE.md#conventions-the-kernels-share)).
 A different weight format means kernel work, and a different model means re-checking the MTP head and the DeltaNet layout.
+
+## A block drafter (DFlash2-style)
+
+On short prompts HyperQwen's DFlash2 preset beat this engine (254 against 166 tok/s on code, 225 against 166 on math, equal on prose; [comparison](PERFORMANCE.md#4-hyperqwen-as-a-reference-point)). The measured cause is tokens per step: 5.8 (code) and 5.2 (math) against 3.5, at 23.0 against 21.1 ms per step, so the step cost is about the same and the acceptance is what differs.
+Its drafter proposes 7 tokens in one non-autoregressive pass (a 1.9B-parameter, 5-layer block drafter fed with target hidden states, quantised to 1.19 GB) and a lookup drafter extends the verify block; this engine drafts 3 tokens with the checkpoint's own MTP head plus a prompt-lookup tail of up to 4.
+**What is not known:** whether a block drafter fits in the VRAM that is left at long context (the 4-bit cache and host tables leave little), what it would do at 100k tokens (DFlash2 was never run at long context here), and whether the Swift checkpoint's hidden states work with a drafter trained on the base model.
+**To settle it.** Measure HyperQwen's DFlash2 at long context on this card first (its `dflash2-long` preset did not start here; try a lower `GPU_UTIL`), then decide whether a drafter is worth porting. The verify path already takes up to 8 rows per cycle (`engine/include/mtp.h`).
 
 ## Faster long prefill
 
