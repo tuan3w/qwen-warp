@@ -12,10 +12,10 @@ speculative decoding keeps decoding at 91 to 128 tok/s even with 32k to 190k tok
 
 | If you want to... | What you get | Evidence |
 |---|---|---|
-| Keep a whole repository or a long document in context on a 24 GB card | 262,144 tokens in 22.4 GiB; the 4-bit cache costs 16.5 KiB per token against 64 KiB for bf16 | [Memory](docs/PERFORMANCE.md#1-memory-how-much-context-fits) |
+| Keep a whole repository or a long document in context on a 24 GB card | 262,144 tokens fit: 22.7 GiB in use on the card with the desktop included (23.3 GiB with the default prompt-lookup tail); the 4-bit cache costs 16.5 KiB per token against 64 KiB for bf16 | [Memory](docs/PERFORMANCE.md#1-memory-how-much-context-fits) |
 | Stay fast when the prompt is long | 91 to 128 tok/s from 32k to 190k tokens, 105 to 166 tok/s on short prompts | [Speed](#numbers-at-a-glance) |
-| Not pay for it in quality | Coding pass@1 244 -> 241 of 283 tasks (not significant); perplexity +0.26% at 98k tokens | [Quality](docs/PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) |
-| Plug in what you already use | vLLM's own OpenAI frontend: chat and text completions, streaming, tool calls, reasoning output, stop strings, seeds | [Usage](docs/USAGE.md) |
+| Know what the 4-bit cache costs in quality | Single-shot proxies: coding pass@1 244 -> 241 of 283 tasks (not significant); perplexity +0.26% at 98k tokens. Tool calls are more sensitive to it: [what was measured](docs/USAGE.md#tool-calls) | [Quality](docs/PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) |
+| Plug in what you already use | vLLM's own OpenAI frontend: chat and text completions, streaming, tool calls, reasoning output (the `reasoning` field), stop strings, seeds, penalties, `min_p`, `logit_bias` | [Usage](docs/USAGE.md) |
 | Learn how it is built | A small CUDA engine (graph of fused kernels, W4A16, exact speculative sampling) with a file-by-file map | [Architecture](docs/ARCHITECTURE.md) |
 
 ## Is it for you?
@@ -52,7 +52,7 @@ make setup
 uv run server/serve.py --profile long --port 8000
 ```
 
-The server is ready after 23 to 40 s (native, warm caches); the first start in Docker took about 80 s in our test because the compile caches are cold. Then try it:
+The server is ready after 19 to 35 s (native, warm caches; the long profile takes 26 to 35 s); the first start in Docker took about 80 s in our test because the compile caches are cold. Then try it:
 
 ```bash
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -61,8 +61,8 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
   "max_tokens": 600}'
 ```
 
-The model **thinks before it answers** by default, and the thinking tokens count against `max_tokens`. If you get a truncated or empty answer, raise `max_tokens` or switch
-thinking off per request with `"chat_template_kwargs": {"enable_thinking": false}`. More in [docs/USAGE.md](docs/USAGE.md).
+The model **thinks before it answers** by default, and the thinking tokens count against `max_tokens` (the thinking text comes back in the `reasoning` field of the message). If you get a truncated or empty
+answer, raise `max_tokens` or switch thinking off per request with `"chat_template_kwargs": {"enable_thinking": false}`. More in [docs/USAGE.md](docs/USAGE.md).
 
 ```python
 from openai import OpenAI
@@ -71,19 +71,22 @@ r = client.chat.completions.create(model="swift", messages=[{"role": "user", "co
 print(r.choices[0].message.content)
 ```
 
-Check your install with `make test` (about 6 minutes on an RTX 3090 with the weights): it tests the KV cache, the host tables and the server end to end.
+Check your install with `make test` (needs an RTX 3090 and the weights, and takes a long time: it starts the server several times). It tests the KV cache, the host tables, the sampling parameters, the tool-call path, the start-up configurations and the server end to end; the list is in [Getting started](docs/GETTING_STARTED.md#4-verify-it-works), together with the quick subset that needs no server.
 
 ## Pick a mode
 
 | Goal | Flags | Context |
 |---|---|---|
-| **Long context** (recommended) | `--profile long` | 196,608 |
+| **Long context** (the Docker default) | `--profile long` | 196,608 |
 | The model's full context | `--profile long --max-model-len 262144 --prompt-lookup 0` | 262,144 |
-| Fastest at short context | defaults (bf16 KV cache) | 28,672 |
-| fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 |
+| Fastest at short context | defaults (bf16 KV cache) | 20,480 (28,672 with `--prompt-lookup 0`) |
+| fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 (the prompt-lookup tail is switched off automatically at this length) |
 
 `--profile long` means a 4-bit KV cache plus `--host-tables`, which keeps the 4.7 GiB embedding and head tables in pinned host memory (bit-identical decode) so the VRAM goes to
-the cache. With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file instead of typing flags (see [.env.example](.env.example)). Every flag: [docs/USAGE.md](docs/USAGE.md#server-flags).
+the cache. The server measures the free GPU memory at start and refuses a `--max-model-len` that does not fit, before loading the weights, naming the largest lengths that do
+([memory and context](docs/USAGE.md#memory-and-context)); the numbers in this README were measured with a desktop holding 0.6 GiB of the card. Without `--prompt-lookup 0`, the 262,144 row
+also starts and serves (the tail then stays on and about 0.7 GiB more VRAM are in use). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file instead of typing flags (see [.env.example](.env.example)).
+Every flag: [docs/USAGE.md](docs/USAGE.md#server-flags).
 
 ## Numbers at a glance
 
@@ -112,7 +115,7 @@ Same RTX 3090 at 350 W, same checkpoint and client, batch size 1, greedy decodin
   Prefill is within about 10% of it. A newer build may be faster or slower. Its `mtp-long` needed `GPU_UTIL=0.88` on this desktop card; its `dflash2-long` preset failed to start here and is not compared.
 - Cold prefill: 1,830 tok/s at 16k, about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes. Follow-up turns reuse the cached prefix.
 - Our 4-bit arm missed a planted needle at 100k in the speed sweep (fp8 and both HyperQwen presets found it); output text drifts from bf16 earlier than with fp8 (67% token-identical on HumanEval+ against 88%).
-- **Not measured:** multi-turn agentic task success (tool calls, edit-and-test loops), other GPUs, power limits other than 350 W.
+- **Not measured:** multi-turn agentic task success (edit-and-test loops, six-tool coding-agent sets, second turns of a tool conversation), other GPUs, power limits other than 350 W. What was measured for tool calls (one small schema): [Usage](docs/USAGE.md#tool-calls).
 
 All tables, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
@@ -123,9 +126,9 @@ All tables, methods and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 | Hardware | RTX 3090 only (sm_86 kernels, CUDA 13.0 only); no other GPU was tested |
 | Model | Swift-1.5-Qwen3.8-27B INT4, text only |
 | Concurrency | One request decodes at a time; the rest queue in order |
-| Sampling | `temperature`, `top_p`, `top_k` (up to 64), `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` work; other sampling and structured-output parameters return HTTP 400 ([list](docs/USAGE.md#sampling-parameters)) |
+| Sampling | `temperature`, `top_p`, `top_k` (up to 64; more is HTTP 400), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` work; `logprobs`, `bad_words`, structured output and `thinking_token_budget` return HTTP 400 ([table](docs/USAGE.md#sampling-parameters)) |
 | Long prompts | Slow to prefill: about 3 minutes at 190k tokens |
-| 4-bit cache | Lossy; see the quality caveats above |
+| 4-bit cache | Lossy; see the quality caveats above. A minimal one-parameter tool schema in the usual key order gave a well-formed tool call in 39% of requests (bf16: 91%); the default `--sort-tool-schema` lifts it to 87% ([details](docs/USAGE.md#tool-calls)) |
 
 ## Documentation
 
@@ -151,6 +154,8 @@ A list of things we may try, not a roadmap: nothing is promised, scheduled or in
 | Multi-turn agentic task success per KV dtype | Not measured at all |
 | Faster long prefill | About 960 tok/s at 262k |
 | Repeating the HyperQwen reference measurement | One pinned build, single runs |
+| Thinking budget (`thinking_token_budget`), `logprobs`, `bad_words`, structured output | HTTP 400 today; why each is hard here and a sketch for the first |
+| Why bf16 KV is about 5 points below a reference service on tool calls | Cause not isolated |
 
 Out of scope: other models, other GPUs, batching.
 
