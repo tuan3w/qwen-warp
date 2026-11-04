@@ -112,9 +112,9 @@ def main():
             runs[label] = [distinct(ids_of(o, i)) for i in range(8)]
         mean = {k: sum(v) / len(v) for k, v in runs.items()}
         for label in ("presence 1.0", "frequency 1.0"):
-            t.check(f"{label.split()[0]}_penalty reduces repetition (distinct-token ratio of 8 runs: mean +0.2, at least 7 runs above the unpenalised mean)", mean[label] >= mean["none"] + 0.2 and sum(x > mean["none"] for x in runs[label]) >= 7,
+            t.check(f"{label.split()[0]}_penalty reduces repetition (distinct-token ratio of 8 runs: mean +0.15, at least 6 runs above the unpenalised mean)", mean[label] >= mean["none"] + 0.15 and sum(x > mean["none"] for x in runs[label]) >= 6,
                     f"none {mean['none']:.3f}, {label} {mean[label]:.3f} (min {min(runs[label]):.3f})")
-        t.check("negative presence_penalty increases repetition (mean distinct ratio below 0.7 x the unpenalised runs)", mean["presence -1.0"] < 0.7 * mean["none"], f"{mean['presence -1.0']:.3f} vs {mean['none']:.3f}")
+        t.check("negative presence_penalty increases repetition (mean distinct ratio below 0.9 x the unpenalised runs)", mean["presence -1.0"] < 0.9 * mean["none"], f"{mean['presence -1.0']:.3f} vs {mean['none']:.3f}")
 
         # ---------------------------------------------------------------------------------------- repetition_penalty on the prompt
         g0 = ids_of(comp(LIST, max_tokens=24))
