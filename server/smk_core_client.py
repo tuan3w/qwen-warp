@@ -18,13 +18,16 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.metrics.stats import PrefillStats
 
-from smk_runner import GenParams, Runner, STOP
+from smk_runner import GenParams, MAX_TOP_K, Runner, STOP
 
 logger = init_logger("vllm.swift_mk")
 
 
 def check_supported(sp):
     """Reject what the engine cannot do, with a 400 that names the parameter (instead of silently ignoring it)."""
+    if sp.top_k > MAX_TOP_K:
+        raise VLLMValidationError(f"top_k must be <= {MAX_TOP_K} (the swift-mk sampler keeps at most the {MAX_TOP_K} highest logits; 0 or -1 = no top-k filter), got {sp.top_k}",
+                                  parameter="top_k", value=sp.top_k)
     bad = []
     if sp.logprobs is not None:
         bad.append(("logprobs", sp.logprobs))
