@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """The `seed` contract and the `top_k` rules of the qwen-warp OpenAI server.  Needs an RTX 3090 (the server takes ~21 GB) and the checkpoint ($SWIFT_MODEL, default ~/models/swift-1.5-int4).
 
-  python tests/test_server_seed.py [--port 8013] [--reps 9] [--pld auto|0|1] [--k 3] [--tree DIR] [--dump FILE]
+  python tests/test_server_seed.py [--port 8013] [--reps 9] [--pld auto|0|1] [--k 3] [--extra FLAGS] [--tree DIR] [--dump FILE]
 
 Starts serve.py once.  A request with a seed must give the same tokens whatever the cache state (cold prefill, resumed from a snapshot of an earlier turn, repeated), so every
 scenario repeats ONE seeded request `reps` times, alternating the preceding requests:  cold = an unrelated request in between (the engine's cache is replaced),
@@ -53,12 +53,13 @@ def main():
     ap.add_argument("--reps", type=int, default=9, help="repetitions of the seeded request per scenario (multiple of 3)")
     ap.add_argument("--pld", default="auto", choices=["0", "1", "auto"])
     ap.add_argument("--k", type=int, default=3, choices=[0, 1, 2, 3], help="the server's --num-speculative-tokens")
+    ap.add_argument("--extra", default="", help="more serve.py flags, e.g. '--snapshots 0 --stream-cycles 1'")
     ap.add_argument("--tree", help="serve from this checkout instead of this one (run the test against an older revision)")
     ap.add_argument("--dump", help="write the token ids of fixed seeded probes to this json file")
     a = ap.parse_args()
     env = dict(os.environ, HF_HUB_OFFLINE="1")
     log = open("/tmp/swift_mk_seed_server.log", "w")
-    srv = subprocess.Popen([sys.executable, str(Path(a.tree) / "server" / "serve.py" if a.tree else SERVE), "--port", str(a.port), "--max-model-len", str(a.max_model_len), "--prompt-lookup", a.pld, "--num-speculative-tokens", str(a.k)],
+    srv = subprocess.Popen([sys.executable, str(Path(a.tree) / "server" / "serve.py" if a.tree else SERVE), "--port", str(a.port), "--max-model-len", str(a.max_model_len), "--prompt-lookup", a.pld, "--num-speculative-tokens", str(a.k)] + a.extra.split(),
                            env=env, stdout=log, stderr=subprocess.STDOUT)
     import httpx
     from transformers import AutoTokenizer
