@@ -41,9 +41,16 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
 | Not measured | multi-turn agent task success, other GPUs, other power limits |
 
-HyperQwen is a general serving project for several models and GPUs; this comparison covers one thing, single-stream decode of this model on this card. It ran unmodified, image
-`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04); a newer build may differ. It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so treat gaps under about 10% as noise.
-Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
+
+<details>
+<summary>Exact HyperQwen build and caveats</summary>
+
+- Image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`, revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04. A newer build may differ.
+- It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so one run per cell is a rough number.
+- Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+</details>
 
 ## How it gets there
 
