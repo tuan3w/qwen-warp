@@ -1,6 +1,6 @@
 # qwen-warp
 
-**Fast Qwen3.8-27B on one RTX 3090, with a 200k-token context.**
+**Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s.**
 
 I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt**, fits the model's full 262,144-token context in 24 GB,
 and on the same card, the same day and the same prompts it is **1.2x to 1.3x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s `mtp-long` and 1.9x to 3.6x faster than its `mtp-huge`** (single-stream decode; table below).
