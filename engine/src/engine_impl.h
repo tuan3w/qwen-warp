@@ -10,6 +10,7 @@
 #include "deltanet.h"
 #include "engine.h"
 #include "head_q.h"
+#include "proc.h"
 
 namespace smk {
 constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX;
@@ -54,6 +55,7 @@ struct smk_engine {
   int hq_on = 0, hsamp = 0;
   unsigned head_epoch = 0;  // bumped by smk_engine_set_head: graphs of the speculative driver are recaptured
   void* ws_hq = nullptr;
+  smk::ProcBufs pb = {};  // request-level logit processors (proc.h)
   int* pinned = nullptr;
   int dn_idx[smk::NLAYER], at_idx[smk::NLAYER];
 };

@@ -102,6 +102,7 @@ typedef struct smk_sampling {
   float draft_top_p;         // 0 = top_p
   int test_flags;            // TEST ONLY.  bit0: broken variant (on rejection resample from p, not the residual); bit1: keep the engine's argmax as the first token
   unsigned long long seed;
+  float min_p;               // [0, 1]: 0 = off; else the target rows keep the tokens with p >= min_p * p_max (vLLM order: after temperature, before top-k / top-p)
 } smk_sampling;
 cudaError_t smk_spec_set_sampling(smk_spec* s, const smk_sampling* cfg, cudaStream_t st);
 // After the prefill's last head step (logits row 0 in the engine): sample the first generated token from it (-> device anchor / next input).  Call before smk_spec_start.
@@ -122,6 +123,12 @@ cudaError_t smk_test_trials(const float* tl, int NT, const float* dl, int ND, co
 // K11 test hook: ntrials speculative-sampling cycles on fixed rows with nchain drafts from the draft logits dl [nchain][ND] and ntail delta tail tokens tail[0..ntail-1] (rows tl [nchain+ntail+1][NT]).
 // y[ntrials][8] emitted tokens (-1 padded), a[ntrials] = emitted count.  The same device functions as the graph.
 cudaError_t smk_test_trials_pld(const float* tl, int NT, const float* dl, int ND, const int* idmap, const smk_sampling* cfg, int nchain, const int* tail, int ntail, int ntrials, unsigned ctr0, int* y, int* a);
+// K12: speculative-sampling cycles WITH request logit processors (include/engine.h smk_procs).  Target rows = a small vocabulary N <= 64 (every token a candidate): base logits tl [k+1][N] are processed per
+// trial with the trial's own draft tokens d1..dk (nchain chain drafts sampled from the draft logits dl [nchain][N], ntail fixed delta tail tokens; k = nchain + ntail), the history before the cycle being
+// gen[0..n_gen-1] (generated tokens) + smk_procs.prompt; then temperature / top-k / top-p / min_p and the same acceptance as the graph.  y[ntrials][8] emitted tokens (-1 padded), a[ntrials] = emitted count.
+// ignore_drafts != 0: TEST ONLY broken variant, the rows are processed as if the draft tokens had not been generated.
+cudaError_t smk_test_trials_procs(const float* tl, int N, const float* dl, int nchain, const int* tail, int ntail, const smk_sampling* cfg, const smk_procs* procs, const int* gen, int n_gen,
+                                  int ignore_drafts, int ntrials, unsigned ctr0, int* y, int* a);
 // philox4x32-10 reference output for counter c[4], key kk[2] (checked against the Random123 known-answer vectors).
 cudaError_t smk_test_philox(const unsigned* c, const unsigned* kk, unsigned* out);
 

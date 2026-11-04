@@ -281,7 +281,8 @@ smk_spec* smk_spec_create(smk_engine* e, const smk_mtp_w* w, int head_mode) {
   if (e->failed || cudaGetLastError() != cudaSuccess) { smk_spec_destroy(s); return nullptr; }
   smk_sampling dflt = {};
   dflt.temperature = 1.0f; dflt.top_k = 20; dflt.top_p = 1.0f; dflt.draft_sample = 1;
-  const SampP p0 = smk_make_sampp(&dflt);
+  SampP p0 = smk_make_sampp(&dflt);
+  p0.pr = e->pb.dev;
   if (cudaMemcpy(s->sp, &p0, sizeof(p0), cudaMemcpyHostToDevice) != cudaSuccess) { smk_spec_destroy(s); return nullptr; }
   return s;
 }
@@ -508,7 +509,8 @@ cudaError_t smk_spec_set_sampling(smk_spec* s, const smk_sampling* cfg, cudaStre
   }
   if (!smk_sampling_valid(cfg)) return cudaErrorInvalidValue;
   if (s->head_mode == 1 || s->w.head_nv > SK_NCH_D * SK_CHUNK) return cudaErrorNotSupported;
-  const SampP p = smk_make_sampp(cfg);
+  SampP p = smk_make_sampp(cfg);
+  p.pr = s->e->pb.dev;
   CKS(cudaMemcpyAsync(s->sp, &p, sizeof(p), cudaMemcpyHostToDevice, st));
   s->samp = 1;
   s->e->hsamp = 1;  // K9: the engine's head steps rescore R = 64 candidates so the device top-k (<= 64) sees exact logits

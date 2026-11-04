@@ -33,8 +33,9 @@ struct SampP {
   float d_inv_t, d_top_p;
   int d_top_k;
   int flags;  // bit0: TEST ONLY (broken variant): on rejection resample from p instead of the residual.  bit1: keep the engine's argmax as the first token.
-  int pad;
+  float min_p;  // min_p > 0: target rows keep the tokens with p >= min_p * p_max (before top-p)
   unsigned long long seed;
+  ProcP* pr;  // request logit processors (proc.h); null in the host-fed test hooks
 };
 
 // rng streams (philox counter word 1): the counter word 0 is the cycle counter ss[SS_NCYC]

@@ -36,11 +36,32 @@ def make_pld(n=2, min_len=3, max_tail=4, cap=64, back=64, longest=1, force_tail=
 
 class Sampling(C.Structure):
     _fields_ = [("temperature", C.c_float), ("top_k", C.c_int), ("top_p", C.c_float), ("draft_sample", C.c_int), ("draft_temperature", C.c_float), ("draft_top_k", C.c_int),
-                ("draft_top_p", C.c_float), ("test_flags", C.c_int), ("seed", C.c_ulonglong)]
+                ("draft_top_p", C.c_float), ("test_flags", C.c_int), ("seed", C.c_ulonglong), ("min_p", C.c_float)]
 
 
-def make_sampling(temperature=0.0, top_k=20, top_p=1.0, draft_sample=1, draft_temperature=0.0, draft_top_k=0, draft_top_p=0.0, seed=0, test_flags=0):
-    return Sampling(temperature, top_k, top_p, draft_sample, draft_temperature, draft_top_k, draft_top_p, test_flags, seed)
+def make_sampling(temperature=0.0, top_k=20, top_p=1.0, draft_sample=1, draft_temperature=0.0, draft_top_k=0, draft_top_p=0.0, seed=0, test_flags=0, min_p=0.0):
+    return Sampling(temperature, top_k, top_p, draft_sample, draft_temperature, draft_top_k, draft_top_p, test_flags, seed, min_p)
+
+
+class Procs(C.Structure):
+    """include/engine.h smk_procs: request-level logit processors."""
+    _fields_ = [("presence", C.c_float), ("frequency", C.c_float), ("repetition", C.c_float), ("min_tokens", C.c_int), ("prompt", C.POINTER(C.c_int)), ("n_prompt", C.c_int),
+                ("bias_ids", C.POINTER(C.c_int)), ("bias_vals", C.POINTER(C.c_float)), ("n_bias", C.c_int), ("allowed", C.POINTER(C.c_int)), ("n_allowed", C.c_int),
+                ("stop", C.POINTER(C.c_int)), ("n_stop", C.c_int)]
+
+
+def make_procs(prompt=(), presence=0.0, frequency=0.0, repetition=1.0, min_tokens=0, bias=None, allowed=None, stop=()):
+    """Returns (Procs, keepalive): bias = {token id: value}, allowed = token ids (None / empty: unrestricted), stop = ids masked by min_tokens."""
+    def ints(x):
+        t = torch.as_tensor(list(x), dtype=torch.int32).contiguous()
+        return t, C.cast(C.c_void_p(t.data_ptr()), C.POINTER(C.c_int)), len(t)
+
+    keep = []
+    pr, bi, al, st = ints(prompt), ints((bias or {}).keys()), ints(allowed or ()), ints(stop)
+    bv = torch.as_tensor(list((bias or {}).values()), dtype=torch.float32).contiguous()
+    keep += [pr[0], bi[0], al[0], st[0], bv]
+    p = Procs(presence, frequency, repetition, min_tokens, pr[1], pr[2], bi[1], C.cast(C.c_void_p(bv.data_ptr()), C.POINTER(C.c_float)), bi[2], al[1], al[2], st[1], st[2])
+    return p, keep
 
 
 def setup_spec_api(lib):
@@ -74,6 +95,10 @@ def setup_spec_api(lib):
         "smk_test_dist": [vp, ci, ci, vp, C.POINTER(Sampling), ci, C.POINTER(ci), C.POINTER(ci), C.POINTER(C.c_float)],
         "smk_test_trials": [vp, ci, vp, ci, vp, C.POINTER(Sampling), ci, ci, cu, C.POINTER(ci), C.POINTER(ci)],
         "smk_test_philox": [C.POINTER(cu), C.POINTER(cu), C.POINTER(cu)],
+        "smk_engine_set_procs": [vp, C.POINTER(Procs), vp],
+        "smk_test_trials_procs": [vp, ci, vp, ci, C.POINTER(ci), ci, C.POINTER(Sampling), C.POINTER(Procs), C.POINTER(ci), ci, ci, ci, cu, C.POINTER(ci), C.POINTER(ci)],
+        "smk_test_proc_logits": [C.POINTER(Procs), ci, C.POINTER(ci), ci, C.POINTER(ci), vp, vp],
+        "smk_test_proc_cand": [C.POINTER(Procs), ci, C.POINTER(ci), ci, C.POINTER(ci), vp, vp, vp],
     }
     for n, a in sig.items():
         f = getattr(lib, n)
@@ -153,10 +178,17 @@ class SpecEngine(Engine):
         return self.read_out_tok()
 
     # ---- sampling (K7): temperature > 0 switches cycles / start / plain decode to the sampling graphs; 0 = greedy
-    def set_sampling(self, temperature=0.0, top_k=20, top_p=1.0, draft_sample=1, draft_temperature=0.0, draft_top_k=0, draft_top_p=0.0, seed=0, test_flags=0):
-        cfg = make_sampling(temperature, top_k, top_p, draft_sample, draft_temperature, draft_top_k, draft_top_p, seed, test_flags)
+    def set_sampling(self, temperature=0.0, top_k=20, top_p=1.0, draft_sample=1, draft_temperature=0.0, draft_top_k=0, draft_top_p=0.0, seed=0, test_flags=0, min_p=0.0):
+        cfg = make_sampling(temperature, top_k, top_p, draft_sample, draft_temperature, draft_top_k, draft_top_p, seed, test_flags, min_p)
         smk.check(self.lib.smk_spec_set_sampling(self.sp, C.byref(cfg), self.st), "set_sampling")
         self.sampling = temperature > 0
+
+    def set_procs(self, **kw):
+        """Request-level logit processors (make_procs arguments; none = off).  Call after set_sampling and before the prefill of every request; they act on sampling steps only
+        (temperature > 0; a greedy request with processors is run as top_k = 1 sampling by the caller)."""
+        p, keep = make_procs(**kw)
+        smk.check(self.lib.smk_engine_set_procs(self.h, C.byref(p), self.st), "set_procs")  # pageable host arrays: copied before the call returns
+        assert keep
 
     def plain_sample(self, n):
         """n plain (non-speculative) sampled decode steps from the staged next input token; returns the sampled tokens."""

@@ -15,8 +15,9 @@ SRCS_MTP := $(wildcard src/mtp*.cu)
 SRCS_PRE := $(wildcard src/prefill*.cu)
 SRCS_HQ := $(wildcard src/head_q*.cu)
 SRCS_PLD := $(wildcard src/pld*.cu)
+SRCS_PROC := $(wildcard src/proc*.cu)
 
-SRCS := $(SRCS_CORE) $(SRCS_K1) $(SRCS_K2) $(SRCS_ENG) $(SRCS_MTP) $(SRCS_PRE) $(SRCS_HQ) $(SRCS_PLD)
+SRCS := $(SRCS_CORE) $(SRCS_K1) $(SRCS_K2) $(SRCS_ENG) $(SRCS_MTP) $(SRCS_PRE) $(SRCS_HQ) $(SRCS_PLD) $(SRCS_PROC)
 HDRS := $(wildcard include/*.h) $(wildcard src/*.cuh) $(wildcard src/*.h)
 
 all: $(BUILD)/libswiftmk.so
