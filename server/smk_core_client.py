@@ -67,16 +67,43 @@ def to_gen_params(sp) -> GenParams:
 
 
 OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False)
-# The prompt-lookup tail needs the 9-slot DeltaNet ring (+0.62 GiB).  Largest --max-model-len measured to start AND serve on a 23.56 GiB card, keyed by (kv dtype, host tables):
-# bf16 KV 28672 (30720 OOM), fp8 KV 53248 (57344 OOM), int4 KV + host tables 196608 (a 190k prompt served).  Combinations not listed are unmeasured: "auto" then
-# leaves the tail off (pass --prompt-lookup 1 to force it).
-PLD_MAX_LEN = {(0, False): 28672, (1, False): 53248, (2, True): 196608}
 KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
 KV_NAMES = ("bf16", "fp8", "int4")
 
+# GPU memory the engine needs after a request at --max-model-len (peak, MiB): VRAM_FIXED_MIB[host tables, prompt-lookup tail] + VRAM_KIB_PER_TOKEN[kv dtype] * --max-model-len.
+# per token = the KV cache (64 / 32 / 16.5 KiB for bf16 / fp8 / int4) + 8 KiB that also grow with the length (the MTP layer's bf16 KV, the fast-prefill K/V scratch).
+# Fitted to the 21 real server starts that bracket, for every cache layout, the largest length which starts AND serves a prompt of that length (RTX 3090, a desktop holding 0.6 GiB,
+# 23228 MiB free at start): within +-40 MiB (about 1 K tokens at bf16) of each of them.  The fixed part is the weights, the activations, the 4-slot DeltaNet ring and the engine
+# buffers; --host-tables moves the 4.7 GiB bf16 embedding + lm_head to pinned host memory; the tail adds the 9-slot ring and its cycle graphs.
+# The server compares it with the memory that is free at start instead of trusting lengths measured next to some other desktop.
+VRAM_FIXED_MIB = {(False, False): 20740, (False, True): 21312, (True, False): 15800, (True, True): 16488}
+VRAM_KIB_PER_TOKEN = (72.0, 40.0, 24.5)
+MIN_HEADROOM_MIB = 64  # refuse to start with less than this predicted to be left after a request at --max-model-len (the prediction is good to +-40 MiB)
+AUTO_TAIL_HEADROOM_MIB = 256  # `--prompt-lookup auto` only turns the tail on if at least this much stays free
+MODEL_MAX_LEN = 262144
 
-def engine_cfg(vllm_config):
-    """swift-mk engine settings from the stock vLLM config: --max-model-len, --kv-cache-dtype, --speculative-config (num_speculative_tokens)."""
+
+def vram_need_mib(ctx, dt, ht, pld):
+    return VRAM_FIXED_MIB[ht, bool(pld)] + ctx * VRAM_KIB_PER_TOKEN[dt] / 1024
+
+
+def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB):
+    """Largest --max-model-len (a multiple of 1024) whose predicted need leaves `headroom` MiB of `free_mib`; 0 if not even a short context fits."""
+    n = (free_mib - headroom - vram_need_mib(0, dt, ht, pld)) * 1024 / VRAM_KIB_PER_TOKEN[dt]
+    return min(MODEL_MAX_LEN, max(0, int(n) // 1024 * 1024))
+
+
+def vram_limits_text(free_mib, k):
+    """One line per cache layout: the largest --max-model-len for the memory that is free now (with the tail, without it)."""
+    rows = []
+    for dt, ht, flags in ((0, False, "(default)"), (1, False, "--kv-cache-dtype fp8"), (2, False, "--kv-cache-dtype int4_per_token_head"), (2, True, "--profile long")):
+        with_tail = f"{vram_max_len(free_mib, dt, ht, True):,} with the prompt-lookup tail, " if k == 3 else ""
+        rows.append(f"  {KV_NAMES[dt]} KV{' + host tables' if ht else ''} {flags}: {with_tail}{vram_max_len(free_mib, dt, ht, False):,} without (--prompt-lookup 0)")
+    return "\n".join(rows)
+
+
+def engine_cfg(vllm_config, free_mib):
+    """swift-mk engine settings from the stock vLLM config: --max-model-len, --kv-cache-dtype, --speculative-config (num_speculative_tokens).  free_mib: GPU memory free at start."""
     mc, sc = vllm_config.model_config, vllm_config.speculative_config
     k = sc.num_speculative_tokens if sc is not None else 0
     if not 0 <= k <= 3:
@@ -87,18 +114,25 @@ def engine_cfg(vllm_config):
     g = OPTIONS["stream_cycles"]
     pl = OPTIONS["prompt_lookup"]  # K11 hybrid draft (MTP chain + prompt-lookup tail, 9-slot ring): True / False / "auto" = on iff k == 3 and --max-model-len fits next to the ring
     dt, ht = KV_DTYPES[kv], bool(OPTIONS["host_tables"])
-    lim = PLD_MAX_LEN.get((dt, ht))
-    pld = k == 3 and ((lim is not None and mc.max_model_len <= lim) if pl == "auto" else bool(pl))
+    L = mc.max_model_len
+    pld = k == 3 and (vram_need_mib(L, dt, ht, True) <= free_mib - AUTO_TAIL_HEADROOM_MIB if pl == "auto" else bool(pl))
     if pl == "auto" and k == 3 and not pld:
-        logger.info("swift-mk: prompt-lookup tail off: --max-model-len %d vs measured limit %s for kv %s%s (the 9-slot DeltaNet ring costs +0.62 GiB); pass --prompt-lookup 1 to force it", mc.max_model_len, lim, KV_NAMES[dt], " + host tables" if ht else "")
-    return SimpleNamespace(ctx_max=mc.max_model_len + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], pld=pld)
+        logger.info("swift-mk: prompt-lookup tail off: at --max-model-len %d with %s KV%s it needs %.0f MiB of the %d MiB free (it keeps %d MiB free at most); pass --prompt-lookup 1 to force it",
+                    L, KV_NAMES[dt], " + host tables" if ht else "", vram_need_mib(L, dt, ht, True), free_mib, AUTO_TAIL_HEADROOM_MIB)
+    need = vram_need_mib(L, dt, ht, pld)
+    if need > free_mib - MIN_HEADROOM_MIB:
+        raise RuntimeError(f"swift-mk: --max-model-len {L:,} with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{' and the prompt-lookup tail' if pld else ''} needs about {need:.0f} MiB of GPU memory "
+                           f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
+                           f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k)}")
+    return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], pld=pld)
 
 
 class SwiftCoreClient(EngineCoreClient):
     engine_ranks_managed = [0]
 
     def __init__(self, vllm_config, executor_class, log_stats, client_addresses=None, client_count=1, client_index=0, renderer=None):
-        cfg = engine_cfg(vllm_config)
+        free_mib = torch.cuda.mem_get_info()[0] >> 20
+        cfg = engine_cfg(vllm_config, free_mib)
         self.vllm_config = vllm_config
         self.loop = asyncio.get_running_loop()
         self.out_q: asyncio.Queue = asyncio.Queue()
@@ -112,8 +146,9 @@ class SwiftCoreClient(EngineCoreClient):
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "older than the sources" in str(e):
                 raise
-            raise RuntimeError(f"swift-mk engine does not fit at --max-model-len {vllm_config.model_config.max_model_len} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''} on this GPU "
-                               f"(measured on a 24 GB 3090: bf16 KV up to ~40K, fp8 KV up to ~80K, int4 KV up to ~98K, int4 KV + host tables to 262K tokens; defaults 32768): {e}") from e
+            raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
+                               f"{' and the prompt-lookup tail' if cfg.pld else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
+                               f"Largest --max-model-len that fits that memory:\n{vram_limits_text(free_mib, cfg.k)}\n{e}") from e
         logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, prompt-lookup tail %s",
                     time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, "on" if cfg.pld else "off")
         self.thread = threading.Thread(target=self._worker, name="swift-mk-engine", daemon=True)
