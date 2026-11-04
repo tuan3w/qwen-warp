@@ -14,7 +14,7 @@
 
 ### Not measured on the new format
 
-Perplexity at 98k, coding pass@1, repository question-answering, agent-sized tool sets. On one 61-token loop prompt at temperature 0.7 the sampled text repeats more than with bf16 (distinct-token ratio 0.240 against 0.330; the previous format 0.350); teacher-forced entropy matches bf16 and the cause is not known.
+Coding pass@1, repository question-answering, agent-sized tool sets. (Perplexity at 98k was measured: +0.056% over bf16, previous format +0.26%.) On one 61-token loop prompt at temperature 0.7 the sampled text repeats more than with bf16 (distinct-token ratio 0.240 against 0.330; the previous format 0.350); teacher-forced entropy matches bf16 and the cause is not known.
 
 ## 0.3.0 - 2026-11-04
 

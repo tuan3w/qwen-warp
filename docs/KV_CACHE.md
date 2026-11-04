@@ -42,6 +42,8 @@ All-exact K and V (the floor, with ring and sink already exact): 0.0149%. With o
 is the key logits** and 25% the values (they add to within 1%); it is flat in position beyond 256 tokens. A gain of 1.015 (twice the right value) is worse than none (0.0918%): the optimum is sharp and
 the gain should not be fitted per text. A logit offset for the Jensen bias of noisy keys on top of the gain gave 0.0685% against 0.0701% and is not included.
 
+**Perplexity at 98k** (code from several repositories, 98,304 tokens, teacher-forced through the engine, paired per token against the earlier bf16, fp8 and previous-int4 runs on the same text): this format **+0.056% (+-0.017)** over bf16, against +0.26% (+-0.05) for the previous format and +0.03% for fp8; it is 0.20% lower than the previous format in the paired comparison. The gap does not grow with position (by bin, 0-4k / 4-8k / 8-16k / 16-32k / 32-64k / 64-98k: +0.00 / -0.06 / -0.01 / +0.10 / +0.09 / +0.04%).
+
 **End to end, through the server** (`--profile long`, thinking on, default sampling; old = the previous 4-bit format of 0.3.0, same prompts):
 
 | Measure | old | this version |
@@ -73,7 +75,7 @@ prompt-lookup tail token) is still about 12% slower at 160k.
 ## What is not known
 
 - **Sampled repetition.** On a 61-token loop prompt at temperature 0.7 (40 batches of 8), the share of distinct tokens is 0.240 with this cache against 0.330 with bf16 and 0.350 with the old int4 cache (0.318 against 0.433 with no speculation), i.e. the sampled text repeats more. Teacher-forced entropy and maximum probability match bf16 closely (top-64 entropy 0.539 / 1.959 / 1.184 against 0.537 / 1.958 / 1.185 over positions 0-60 / 60-260 / 260-1400), so it is not a per-position sharpening. The cause is not known. `tests/test_sampling_params.py` passed 4 of 4 runs.
-- **Not re-measured on this format:** perplexity at 98k, coding pass@1 over 283 tasks, repo question-answering at 64k and 100k (the numbers in [PERFORMANCE.md](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) are for the previous format). The 32k fidelity above is what was measured.
+- **Not re-measured on this format:** coding pass@1 over 283 tasks and repo question-answering at 64k and 100k (the numbers in [PERFORMANCE.md](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) are for the previous format). Perplexity at 98k was measured (above).
 - The 2% to 7% speed difference at 32k was not traced: the acceptance rate of speculative drafts under the two formats was not compared.
 - One model, one card, one set of prompts; dKL was measured on two 32k texts. Needle tests: 4 runs and 8 depths.
 
