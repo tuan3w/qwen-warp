@@ -2,10 +2,31 @@
 
 ## Unreleased
 
-- Docker: `Dockerfile`, `docker-compose.yml`, `.env.example` and an entrypoint (`PROFILE`, `EXTRA_ARGS`, `MODEL_DIR`, `PORT`); the checkpoint is mounted, not baked in. Checked once: the image built, the container became healthy and answered a chat request with `--profile long`.
+### Fixed
+
+- A request with a `seed` now gives the same tokens whatever the cache state (cold prefill, resumed from an earlier turn, repeated prompt, `--snapshots 0`); before, a resumed prefill and a cold one were not numerically identical, so a seeded answer could change with the cache. The prefill is now cut into segments that depend on the prompt only, and a resume continues that plan. A repeated prompt with 240 tokens or fewer after its last cut is prefilled again instead of resumed. The realisation still depends on `--num-speculative-tokens` and `--prompt-lookup` ([Usage](docs/USAGE.md#seeds-and-reproducibility)).
+- `top_k` above 64 was silently clamped to 64; it is now HTTP 400 with the limit in the message. `0` and `-1` still mean "no filter" and behave as 64.
+- The documented default (`--max-model-len` 28,672 with the prompt-lookup tail, bf16 KV) did not start on a 24 GB card with a 0.6 GiB desktop: it ran out of memory in the first warm-up prefill. The server now measures the free GPU memory at start and refuses a length that does not fit within about 10 s, before loading the weights, naming the largest lengths that do. The documented memory limits were wrong in both directions and were re-measured.
+- Tool calls on the 4-bit cache: a minimal one-parameter schema in the usual key order (`type`, `properties`, `required`) gave a well-formed tool call in 39% of requests (bf16: 91%). The server now renders tool schemas with sorted keys by default (`--sort-tool-schema`): 87% (n = 150), 40/40 through the server on `--profile long`. The sampler was checked and is exact. Not measured: coding-agent tool sets, second turns, fp8 with the sorted order ([Usage](docs/USAGE.md#tool-calls)).
+- Docs: the full 262,144-token context was documented as using 22.4 GiB; measured on the server it is 23,227 MiB in use on the card, the desktop included, with `--prompt-lookup 0` (23,899 MiB with the tail). Context limits, the prompt-lookup cost (0.56 GiB, not 0.62), the vLLM field name of the thinking text (`reasoning`), "same seed, same output" (true for a fixed configuration only), and the claim that the 4-bit cache costs almost nothing (not for tool calls) were corrected. The `make test` list and the quick no-GPU subset are documented.
+
+### Added
+
+- Sampling parameters `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `min_p`, `logit_bias`, `min_tokens` and `allowed_token_ids` (vLLM semantics and order), exact under speculative decoding; `min_p` and `logit_bias` also work with speculative decoding, which stock vLLM refuses. Still HTTP 400: `logprobs`, `prompt_logprobs`, `logprob_token_ids`, `bad_words`, `structured_outputs`, `thinking_token_budget`. `allowed_token_ids` with thousands of ids costs about 11% per cycle; all processors together lowered tok/s by 15% at T 0.7; no measurable cost without them ([Usage](docs/USAGE.md#sampling-parameters)).
+- `--sort-tool-schema {on,off}` (default on).
+- Tests in `make test`: `test_logit_procs`, `test_spec_procs`, `test_proc_model`, `test_sampling_params` (default and long profile), `test_tool_schema`, `test_sampler_dist`, `test_tool_call_rate`, `test_prefill_plan`, `test_server_seed`, `test_startup_configs`; the smoke test's long-document prompt is pinned in `tests/long_doc.txt`.
+- Docs: `reasoning_effort` (values, the 400 for others, a prompt hint with no measured shortening; measured on a stock vLLM server, not yet tested on this one), the thinking-text field name, the vLLM version pin (0.30.0; other versions untested), the tool-call measurements and a troubleshooting row, new entries in `docs/IDEAS.md` (thinking budget, log-probabilities, `bad_words`, structured output, processors on the draft head, bf16 tool-call gap, rotated cache and tool calls, upgrading vLLM).
+- Docker: `Dockerfile`, `docker-compose.yml`, `.env.example` and an entrypoint (`PROFILE`, `EXTRA_ARGS`, `MODEL_DIR`, `PORT`); the checkpoint is mounted, not baked in. Checked once, before the changes in this section: the image built, the container became healthy and answered a chat request with `--profile long`.
 - `server/serve.py` honours `$SWIFT_MODEL` as the default model path (the README already documented it).
+
+### Changed
+
+- Defaults: `--max-model-len` 20,480 (was 28,672); 28,672 with `--prompt-lookup 0` (was 32,768); `--profile long` stays 196,608. Measured edges on this card: bf16 26,624 with the tail and 34,816 without; fp8 48,128 and 62,464; 4-bit 79,872 and 104,448; with `--host-tables` bf16 94,208 and 105,472, fp8 172,032 and 184,320, 4-bit the model maximum 262,144.
+- `--prompt-lookup auto` turns the tail on only if the length leaves 256 MiB of the free memory next to it (before: a table of lengths); the tail costs 0.56 GiB (0.67 GiB with `--host-tables`). With `auto` the tail now also fits at 262,144 on `--profile long`.
+- Unsupported-parameter list: the server rejects 6 names now (it rejected 13 before the new parameters).
+- Prefix-reuse snapshots are taken at the last two cut points of the prompt-determined prefill plan (a long system prompt or document is reused across different questions); turn 2 and 3 of a 1,529-token chat: 0.54 s and 0.41 s per request (was 0.60 s and 0.39 s).
 - Docs reworked around the reader: a README that leads with why and for whom, tables for scanning, and two quick-start paths (Docker, native); new `docs/GETTING_STARTED.md` (prerequisites, weights, troubleshooting), `docs/USAGE.md` (API, flags, memory and context, thinking mode) and `docs/IDEAS.md`; a file map and a "where to start reading" table in `docs/ARCHITECTURE.md`; a summary table in `docs/PERFORMANCE.md`.
-- Docs corrected: the list of unsupported sampling parameters was incomplete (the server rejects 13 names, the README listed 3); disk and RAM needs now include the environment and the Docker image; the repository layout (now a table in `docs/ARCHITECTURE.md`) includes `smk.py`, `docker/` and the scripts, which the old README tree missed; the model's default thinking mode and its effect on `max_tokens` are explained; the non-uniform weight codebook entry no longer claims a measured kernel slowdown and states the byte-count bound instead.
+- Docs corrected earlier in this cycle: disk and RAM needs include the environment and the Docker image; the repository layout (now a table in `docs/ARCHITECTURE.md`) includes `smk.py`, `docker/` and the scripts; the model's default thinking mode and its effect on `max_tokens` are explained; the non-uniform weight codebook entry states the byte-count bound instead of a measured kernel slowdown.
 - The HyperQwen measurements are a reference point, not a competition, and name the exact build they describe (image digest and source revision). The roadmap became "Ideas to explore", with the 27B result for a rotated 4-bit KV cache (about 2x lower perplexity cost, not the 10x seen on a 2B proxy).
 
 ## 0.2.0 - 2026-11-04
@@ -13,7 +34,7 @@
 Serving-only rework (commit 6d0e932 and the docs commits after it).
 
 - 4-bit KV cache (`--kv-cache-dtype int4_per_token_head`): per token and KV head, asymmetric int4 with fp16 scale and minimum, 4.125 bits per element, 16.5 KiB per token. Perplexity +0.26% at 98k tokens; coding pass@1 244 -> 241 of 283 tasks (not significant).
-- `--profile long`: 4-bit KV plus host-pinned embedding and head tables (bit-identical decode); the full 262,144-token context fits in 22.4 GiB on one RTX 3090 (`--prompt-lookup 0`).
+- `--profile long`: 4-bit KV plus host-pinned embedding and head tables (bit-identical decode); the full 262,144-token context fits on one RTX 3090 (`--prompt-lookup 0`; the 22.4 GiB stated in this entry at the time was not reproduced, see Unreleased).
 - MTP speculative decoding (k <= 3) with an optional prompt-lookup tail; exact speculative sampling.
 - OpenAI-compatible server on vLLM's frontend with an in-process engine client; multi-turn prefix reuse via DeltaNet state snapshots.
 - Torch stack locked to the +cu130 builds (`uv.lock`).
