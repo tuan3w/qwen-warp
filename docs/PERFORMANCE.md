@@ -12,8 +12,8 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | Question | Answer | Kind of evidence | Section |
 |---|---|---|---|
 | How much context fits? | 262,144 tokens on the 4-bit cache with host-pinned tables: 23,227 MiB in use on the card after a 262,080-token prompt with `--prompt-lookup 0` (22.7 GiB, of which 0.57 GiB is the desktop), 23,899 MiB with the default tail | server-level: real starts, literal near-limit prompts | [1](#1-memory-how-much-context-fits) |
-| What does the 4-bit cache cost in quality? | perplexity +0.26% at 98k tokens; coding pass@1 244 -> 241 of 283 (p = 0.45, not significant) | proxies (perplexity, single-shot coding) | [2](#2-quality-of-the-4-bit-kv-cache) |
-| What does it cost for tool calls? | a minimal one-parameter schema in the usual key order: 39% well-formed on the 4-bit cache against 91% on bf16; 87% with the default sorted rendering | one schema, in-process runs of 150 requests per cell | [2](#tool-calls) |
+| What does the 4-bit cache cost in quality? | rotated format (this version): KL divergence from the bf16 cache 0.069% on a 32k code text (previous format 0.51%), perplexity +0.025% (+-0.025) at 32k; the 98k perplexity and the coding pass@1 below are for the previous format and were not re-measured | fidelity through the real kernels on two 32k texts; proxies | [2](#2-quality-of-the-4-bit-kv-cache), [KV cache](KV_CACHE.md) |
+| What does it cost for tool calls? | a minimal one-parameter schema in the usual key order: 92% well-formed on the 4-bit cache through the server (n = 200; the previous 4-bit format: 46%, n = 100; in-process earlier: 39%), bf16 91%; 88% with the default sorted rendering (n = 100) | one schema, 100 to 200 requests per cell | [2](#tool-calls) |
 | How fast is decode? | 94 to 133 tok/s from 32k to 262k tokens (4-bit cache); 105 to 181 tok/s on short prompts | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | long context: decode is 1.2x to 1.3x faster than its `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than its `mtp-huge` at 32k to 190k; short prompts: 1.2x to 1.3x faster than its MTP presets but slower than its DFlash2 preset (about 1.5x on code, earlier session); DFlash2 was not measured at long context; prefill within about 10% | same day, same card, prompts and client for the MTP presets; one pinned build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
@@ -27,7 +27,7 @@ The KV cache is the only thing that grows with context. Per token, for the 16 fu
 |---|---|---|
 | bf16 | 64 KiB | 16 GiB |
 | fp8 (e4m3, checkpoint scales) | 32 KiB | 8 GiB |
-| int4 (per token+head, asymmetric) | 16.5 KiB | 4.1 GiB |
+| int4 (per token+head, rotated; exact fp16 sink 4 + ring 256: +34 MiB of device memory and +32 MB of pinned host RAM per snapshot) | 16.5 KiB | 4.1 GiB |
 
 Largest `--max-model-len` that was **measured to start and serve** with the full stack (MTP + fast prefill), tail = the prompt-lookup tail (`--prompt-lookup`, on by default where it fits). "Serve" = a prompt of
 (`--max-model-len` - 64) tokens plus 64 generated tokens answered with HTTP 200 and the server alive afterwards. The card also drives a desktop that held 589 MiB before the server started; torch reported 23,228 MiB free at start.
@@ -60,7 +60,9 @@ refused in this mode because they would stream a whole table over PCIe every ste
 
 ## 2. Quality of the 4-bit KV cache
 
-Perplexity on code text, teacher-forced, same engine and head, bf16 KV as reference:
+**Rotated format (this version; format and method: [KV cache](KV_CACHE.md)).** Mean per-token KL divergence from the bf16-cache distribution to the int4 one (top-64 tokens, teacher-forced through the real kernels, 32k code text): **0.0691% (+-0.0031)**, previous format 0.512%; perplexity +0.025% (+-0.025) against bf16 on the same text. On a held-out 32k text in other languages the previous 0.577% control becomes about 0.085% (derived from the 5.67x score ratio). `tests/test_kv_dtypes.py` measured +0.05% to +0.10% on its text. Needle probe at 64k in chat format (8 depths, passphrase negative log-likelihood): 0.079 nats against 0.086 for fp8 and 0.124 for the previous format; needle at 100k through the server: found 4 of 4 runs, the previous format missed 4 of 4. Not re-measured on this format: perplexity at 98k, coding pass@1, repository question-answering. The numbers below are for the **previous format** (asymmetric, no rotation, no exact window).
+
+Perplexity on code text, teacher-forced, same engine and head, bf16 KV as reference (previous int4 format):
 
 - 32k tokens: int4 +0.27%
 - 98k tokens: int4 **+0.26% (+-0.05)**, no growth with position. fp8: +0.03%.
@@ -86,8 +88,10 @@ A well-formed tool call is the fraction of requests whose answer carries a call 
 |---|---|---|
 | bf16 | 91% (137/150) [86, 95] | 93% (139/150) [87, 96] |
 | fp8 | 88% (132/150) [82, 92] | not measured |
-| int4 (`--profile long`) | **39% (58/150)** [31, 47] | **87% (130/150)** [80, 91] |
-| int4, greedy | 99% (149/150) | |
+| int4, previous format (`--profile long`) | **39% (58/150)** [31, 47] | **87% (130/150)** [80, 91] |
+| int4, greedy (previous format) | 99% (149/150) | |
+| int4, previous format, through the server (n = 100) | 46% (46/100) [37, 56] | 94% (94/100) [88, 97] |
+| int4, rotated format (this version), through the server (n = 200 / 100) | **92% (183/200) [87, 95]** | 88% (88/100) [80, 93] |
 
 - The chat template prints each tool with `tojson` in the key order the client sent; `--sort-tool-schema on` (the default) sorts the top-level keys of every `function.parameters` before rendering (`server/tool_schema.py`). The change alters the prompt, not the client's JSON, the parser or the arguments.
 - Server level (`tests/test_tool_call_rate.py`, 40 requests): before the sorting, `--profile long` gave 18/40 (45%); with it, 37/40 on the default profile and 40/40 on `--profile long`.
@@ -97,9 +101,21 @@ A well-formed tool call is the fraction of requests whose answer carries a call 
 - A reference vLLM service behind a gateway (its rendered prompt had only `function.parameters` key-sorted) gave 97/100, 100/100, 98/100 and 98/100 at its default temperature, 0.3, 0.6 and 1.0 (98.3% pooled, [96.4, 99.3]). The bf16 engine is about 5 points below it (93% against 98%). On identical contexts the exact
   log-probability gap between `<` and `<|im_start|>` after `<tool_call>` is 13.7 nats on the service (minimum 8.6, n = 70) and 5.7 on the bf16 engine (minimum -1.6; fp8 5.8), i.e. the engine's hidden state is less sharp at that position.
   The cause was not isolated; untested candidates are the W4A16 weights against the service's unknown weights, and KV or activation numerics.
-- **Not measured:** a six-tool coding-agent set, second turns, fp8 with the sorted order, fp8 with host tables, a rotated 4-bit cache, top_p / min_p as a mitigation. One schema, thinking on: do not read these rates as an agent success rate.
+- With the rotated format the key order no longer moves the rate beyond noise for this schema (the intervals overlap); `--sort-tool-schema` stays on by default. The last two rows used the server with `--profile long`, the same prompt and protocol, one session of old and new builds.
+- **Not measured:** a six-tool coding-agent set, second turns, fp8 with the sorted order, fp8 with host tables, top_p / min_p as a mitigation. One schema, thinking on: do not read these rates as an agent success rate.
 
 ## 3. Speed
+
+**4-bit cache format change (this version, 2026-11-05).** The rotated format with the exact sink and ring ([KV cache](KV_CACHE.md)) was measured against the previous format in one session, interleaved (old, new, new, old), through the server with the frozen prompts below; the GPU drifts about 5% inside a session, so only repeated pairs count. Decode tok/s:
+
+| Arm | Format | 32k | 100k | 190k |
+|---|---|---|---|---|
+| `--profile long`, prompt-lookup tail on | previous | 124.0 | 109.0 | 96.4 |
+| | rotated | 121.2 | 112.4 | 100.5 |
+| tail off (`--prompt-lookup 0`) | previous | 126.3 | 109.3 | 96.0 |
+| | rotated | 117.7 | 114.6 | 96.4 |
+
+Short prompts (code / prose / math), median of 3: previous 172 / 106 / 176 (tail on) and 171 / 108 / 162 (tail off); rotated 167 / 102 / 167 and 167 / 108 / 164. Prefill is unchanged (about 1,780 tok/s at 32k, 1,090 at 190k). The tables below were measured on the previous format on 2026-11-04 and were not repeated; this session's old-format runs gave 96 tok/s at 190k against 102 in that table, which is the drift between sessions. The rotated format is level with the previous one at 100k and 190k and 2% to 7% slower at 32k and on short prompts.
 
 Re-measured on 2026-11-04 on the released code (merged tree of this repository), with the frozen prompts and the streaming client of the HyperQwen comparison in [section 4](#4-hyperqwen-as-a-reference-point)
 (real code from several repositories with a planted passphrase at 40% of the prompt; greedy; 256 tokens after the prompt; decode tok/s = tokens after the first chunk over the time from the first to the last chunk). One run per cell, 350 W.

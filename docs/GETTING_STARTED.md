@@ -16,7 +16,7 @@ Contents: [1. Prerequisites](#1-prerequisites) | [2. Get the weights](#2-get-the
 | uv | a recent version; it installs Python 3.12 and every locked dependency | `uv --version` | native, and the weights download |
 | C compiler | a normal `gcc`/`build-essential`: Triton compiles small C stubs at run time | `gcc --version` | native |
 | Disk | weights 19 GB, plus about 8 GB for the environment (native) or about 24 GB for the image (Docker) | `df -h` | both |
-| Host RAM | about 5 GiB of **pinned** memory in the long-context profile (4.7 GiB of tables plus 151 MB per multi-turn snapshot, 4 by default) | `free -g` | both |
+| Host RAM | about 5 GiB of **pinned** memory in the long-context profile (4.7 GiB of tables plus 151 MB per multi-turn snapshot, 183 MB with the 4-bit cache, 4 snapshots by default) | `free -g` | both |
 | Hugging Face account | to accept the checkpoint's licence | | both |
 
 The server uses almost the whole card. If a desktop or another job holds VRAM, free it first: a desktop alone takes about 0.6 GiB. The server measures the free GPU memory when it starts and sizes the
@@ -91,7 +91,7 @@ For a deeper check, `make test` (native path, needs an RTX 3090 and the weights;
 
 | Test | What it checks | Needs |
 |---|---|---|
-| `tests/test_kv_dtypes.py` | perplexity with bf16, fp8 and 4-bit KV caches; fails if fp8 is worse than +1.5% or 4-bit worse than +3.0% (a regression guard: the real cost is about 0.03% and 0.26%) | GPU, weights |
+| `tests/test_kv_dtypes.py` | perplexity with bf16, fp8 and 4-bit KV caches; fails if fp8 is worse than +1.5% or 4-bit worse than +3.0% (a regression guard: the real cost is about 0.03% for fp8 and +0.05% to +0.10% for the 4-bit cache on its text) | GPU, weights |
 | `tests/test_host_tables.py` | host-pinned tables give bit-identical output and free the VRAM of the 4.7 GiB tables | GPU, weights |
 | `tests/test_logit_procs.py` | the logit processors (penalties, `logit_bias`, `min_tokens`, `allowed_token_ids`, `min_p`) against a torch reference of the vLLM semantics, with negative controls | GPU, built engine |
 | `tests/test_spec_procs.py` | speculative sampling with those processors is exact (joint distribution of the emitted tokens; a broken variant must fail) | GPU, built engine |

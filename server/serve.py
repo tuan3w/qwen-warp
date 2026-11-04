@@ -31,7 +31,7 @@ def parse_args(argv=None):
     g = parser.add_argument_group("swift-mk")
     g.add_argument("--num-speculative-tokens", type=int, default=None, choices=[0, 1, 2, 3], help="MTP drafts per cycle (0 = plain decode; default 3 unless --speculative-config is given)")
     g.add_argument("--stream-cycles", type=int, default=2, help="speculative cycles per host sync = streaming granularity (one cycle ~ 24 ms, 1-4 tokens)")
-    g.add_argument("--snapshots", type=int, default=4, help="DeltaNet state snapshots kept for multi-turn prefix reuse (151 MB pinned host RAM each; 0 = off)")
+    g.add_argument("--snapshots", type=int, default=4, help="DeltaNet state snapshots kept for multi-turn prefix reuse (151 MB pinned host RAM each, 183 MB with the 4-bit KV cache; 0 = off)")
     g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring; "
                    "auto (default) = on iff --max-model-len leaves 256 MiB of the free GPU memory next to it, e.g. up to 23k with bf16 KV, 42k with fp8 KV, any length with int4 KV + --host-tables); "
                    "the default --max-model-len is 20480 (28672 with --prompt-lookup 0)")

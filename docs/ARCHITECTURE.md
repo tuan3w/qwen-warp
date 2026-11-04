@@ -84,17 +84,20 @@ so one captured graph serves every step.
 
 ## The 4-bit KV cache
 
-Each token's 256-element head vector (per KV head, separately for K and V) is quantised asymmetrically to 4 bits: 128 bytes of codes plus one `u32` of metadata
-(fp16 scale | fp16 minimum), i.e. 4.125 bits per element, no rotation. Layout: codes `[K|V][4][ctx][128]`, then meta `[K|V][4][ctx]`.
+Each token's 256-element head vector (per KV head, separately for K and V) is rotated by the orthonormal Walsh-Hadamard transform, then quantised to 4 bits with a symmetric companded 16-level grid:
+128 bytes of codes plus one `u32` of metadata (four 8-bit logarithmic scale codes, one per group of 64 rotated coefficients, `s = 2^((e - 176) / 12)`), i.e. 4.125 bits per element. Layout per layer:
+codes `[K|V][4][ctx][128]`, meta `[K|V][4][ctx]`, then two small fixed buffers of exact fp16 rows (rotated basis): the first 4 positions `[2][4][4][256]` and a ring of recent positions `[2][4][512][256]` (slot `pos & 511`).
+Format, measurements and costs: [KV cache](KV_CACHE.md). Definitions: `engine/src/kvrot.cuh`.
 
 | Part | How |
 |---|---|
-| K scores | `S = s_k * (q . code) + min_k * sum(q)`, with `sum(q)` precomputed once per query (workspace `WS_QSUM`) |
-| V | the scale is folded into the softmax probabilities; `sum(p * min)` is accumulated next to the softmax denominator |
-| Unpack | a `lop3` trick plus `sub.f16x2` |
-| Writers | the decode kernel's writer and the prefill writer produce byte-identical caches |
+| Writers | the decode kernel's writer (`attn_prep_kernel`) and the prefill writer (`k_attn_prep`) rotate (a 256-point transform over one warp with shuffles), pick each group's scale by minimum squared error over a few candidates around the largest magnitude, and write the same bytes; the writers do not know the decoder gain |
+| Scores and output | `q` is rotated the same way at prep, so scores equal the unrotated ones; the attention output is un-rotated once in the reduce kernel. The readers decode nibbles with `fp16x2` arithmetic (`L(n) = u (1 + 0.003 u^2)`) and multiply each decoded scale by 1.0075 |
+| Exact sinks and ring | positions 0-3 are read from the sink rows; the split kernels stop 256 keys before the end of the context and the reduce kernel attends the ring exactly and merges it as one more split |
+| Verify rows | `attn_split_i4_kernel` serves 2 to 8 rows (teams of d-split warps, query tiles in groups, so each K/V tile is dequantised once per group); one row uses the single-warp kernel |
+| Snapshots | the sink and ring rows are state outside the per-token cache, so every prefix snapshot saves and restores them (`kv_aux_*` in `server/smk_runner.py`, 32 MB of pinned host RAM per slot); without that, a resumed generation diverges |
 
-What it costs and gains: [Performance](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache). A rotated variant was measured as an idea, not shipped: [Ideas](IDEAS.md).
+What it costs and gains: [KV cache](KV_CACHE.md) and [Performance](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache).
 
 ## Host-pinned tables
 
@@ -107,7 +110,7 @@ to the KV cache. Decode output is bit-identical (`tests/test_host_tables.py`). I
 |---|---|
 | Concurrency | one request decodes at a time; the rest queue FIFO; a client disconnect aborts the running request |
 | Start-up memory check | the server reads the free GPU memory at start, compares it with a fitted model of what the engine needs (fixed part + KiB per token x length) and refuses a length that does not fit before any weight is loaded ([Usage](USAGE.md#memory-and-context)) |
-| Prefix reuse | DeltaNet states are snapshotted at the last two cut points of a prefill plan that depends on the prompt only (`--snapshots N`, 151 MB of pinned host RAM each); a follow-up turn reuses the cached prefix and reports `cached_tokens`; a resumed prefill is bit-identical to a cold one |
+| Prefix reuse | DeltaNet states are snapshotted at the last two cut points of a prefill plan that depends on the prompt only (`--snapshots N`, 151 MB of pinned host RAM each, 183 MB with the 4-bit cache, which also saves its exact sink and ring rows); a follow-up turn reuses the cached prefix and reports `cached_tokens`; a resumed prefill is bit-identical to a cold one |
 | API | chat and text completions, streaming, stop strings, seeds and the supported sampling parameters, tool calls (`qwen3_coder` parser), reasoning output (`qwen3` parser, field `reasoning`). Details: [Usage](USAGE.md) |
 
 ## Design choices and what they cost

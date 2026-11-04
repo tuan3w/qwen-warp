@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The 4-bit KV cache (`--kv-cache-dtype int4_per_token_head`, `--profile long`) has a new format at the same bytes per token (16.5 KiB): the head vector is rotated with a Walsh-Hadamard transform, quantised with a symmetric companded 16-level grid and 4 logarithmic scales, the first 4 tokens and the last 256 tokens are kept exact (fp16), and the reader multiplies every decoded scale by 1.0075 to undo the shrink of the writer's error-minimising scale. KL divergence from the bf16 cache on a 32k code text: 0.069% against 0.51% for the previous format. Through the server on `--profile long`: a minimal one-parameter tool schema in the usual key order gave a well-formed call in 92% of 200 requests (previous format 46% of 100; bf16 91% earlier), and a planted needle at 100k was found in 4 of 4 runs (previous format 0 of 4). Details, method, speed and what is not known: [docs/KV_CACHE.md](docs/KV_CACHE.md).
+- The exact sink and ring are fixed buffers: +34 MiB of device memory (in the start-up memory model, `VRAM_KV_FIXED_MIB`) and +32 MB of pinned host RAM per prefix snapshot (183 MB instead of 151 MB each, 4 by default). They are saved and restored with every snapshot, so a resumed generation equals a cold prefill (`kv_aux_*` in `server/smk_runner.py`; `tests/test_server_smoke.py`, `tests/test_server_seed.py`).
+- Speed through the server with the previous format as control, same session: level at 100k and 190k prompt tokens (190k: 100.5 against 96.4 tok/s with the prompt-lookup tail, 96.4 against 96.0 without), 2% to 7% slower at 32k and 2% to 4% on short prompts; prefill unchanged. A new decode attention kernel for 2 to 8 verify rows (`attn_split_i4_kernel`) dequantises each K/V tile once per query-tile group; the first version of the new format lost 15% to 20% at 190k without it. A 5-row verify step is about 12% slower and a 1-row step about 3% slower than the previous reader at 160k.
+
+### Fixed
+
+- `kv_aux_new` returned an unpinned empty tensor for caches without aux state (bf16, fp8), which made the server die at the first snapshot; it now returns `None`.
+
+### Not measured on the new format
+
+Perplexity at 98k, coding pass@1, repository question-answering, agent-sized tool sets. On one 61-token loop prompt at temperature 0.7 the sampled text repeats more than with bf16 (distinct-token ratio 0.240 against 0.330; the previous format 0.350); teacher-forced entropy matches bf16 and the cause is not known.
+
 ## 0.3.0 - 2026-11-04
 
 ### Fixed

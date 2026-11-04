@@ -40,10 +40,12 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Context | 262,144 tokens fit in about 22.5 to 22.7 GiB in use, desktop included (`--host-tables` moves 4.8 GiB of tables to host memory; the 4-bit cache costs 16.5 KiB per token, bf16 64 KiB) |
 | Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
 | Ready after | 21 to 30 s |
-| Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
+| Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), a minimal tool schema in the usual key order 92% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found 4 of 4 runs (previous: 0 of 4). Perplexity at 98k and coding pass@1 were measured on the previous format only (+0.26% and 241 against 244 of 283) and not repeated. Sampled text on one loop prompt repeats more than with bf16, cause unknown. [KV cache](docs/KV_CACHE.md) |
 | Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and many concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine serves one request at a time) |
 
 HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
+
+The speed rows above were measured with the previous 4-bit format. With the rotated format of this version, repeated pairs in one session gave the same speed at 100k and 190k and 2% to 7% less at 32k and on short prompts ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
 
 <details>
 <summary>Exact HyperQwen build and caveats</summary>
@@ -106,7 +108,7 @@ The server measures the free GPU memory at start and refuses a context that does
 |---|---|
 | Sampling | `temperature`, `top_p`, `top_k` (up to 64), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` ([table](docs/USAGE.md#sampling-parameters)) |
 | Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
-| Tool calls | They work, with one caveat: with the 4-bit cache a minimal one-parameter schema in the usual key order gave a well-formed call in 39% of requests (bf16: 91%). The default `--sort-tool-schema` lifts it to 87% ([details](docs/USAGE.md#tool-calls)) |
+| Tool calls | They work, with one caveat: the previous 4-bit format gave a well-formed call in 39% to 46% of requests for a minimal one-parameter schema in the usual key order (bf16: 91%); with the rotated 4-bit cache of this version it is 92% (n = 200, through the server). The default `--sort-tool-schema` stays on ([details](docs/USAGE.md#tool-calls)) |
 | Concurrency | One request decodes at a time; the rest queue |
 
 ## Documentation
@@ -115,6 +117,7 @@ The server measures the free GPU memory at start and refuses a context that does
 |---|---|
 | Install it, check it works, fix a problem | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
 | Call the API, tune flags, understand memory and context | [docs/USAGE.md](docs/USAGE.md) |
+| Understand the 4-bit KV cache: format, measurements, what it costs, what is not known | [docs/KV_CACHE.md](docs/KV_CACHE.md) |
 | See every measurement and its caveats | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
 | Understand the engine and find the code | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Pick up an open question (a list of ideas, not a roadmap) | [docs/IDEAS.md](docs/IDEAS.md) |
