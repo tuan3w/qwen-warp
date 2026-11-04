@@ -14,11 +14,16 @@ engine:
 test:
 	uv run tests/test_kv_dtypes.py
 	uv run tests/test_host_tables.py
+	uv run tests/test_logit_procs.py
+	uv run tests/test_spec_procs.py
 	uv run tests/test_tool_schema.py
 	uv run tests/test_sampler_dist.py
 	uv run tests/test_tool_call_rate.py
 	uv run tests/test_server_smoke.py
 	uv run tests/test_server_smoke.py --profile long --port 8012
+	uv run tests/test_proc_model.py
+	uv run tests/test_sampling_params.py
+	uv run tests/test_sampling_params.py --profile long --port 8043
 	uv run tests/test_prefill_plan.py
 	uv run tests/test_server_seed.py
 	uv run tests/test_startup_configs.py
