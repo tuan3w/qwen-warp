@@ -144,45 +144,53 @@ Decode slows from 124 to 96 tok/s between 32k and 190k with the 4-bit cache and 
 This is a reference point, not a competition: [HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) is a general project for several models and GPUs, and it changes quickly.
 The numbers below describe **one build only**: its public image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`
 (OCI revision label `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04, tag `latest` at the time), run unmodified on the same card, power limit,
-checkpoint, client and prompts. A newer build may be faster or slower. The "ours" rows below are the numbers of that same session (2026-11-03), so the comparison is like for like;
-the re-measurement of [section 3](#3-speed) on 2026-11-04 is 1% to 10% higher in every decode cell. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
+checkpoint, client and prompts. A newer build may be faster or slower. Both projects were measured **on the same day, 2026-11-04**, one run per cell (ours: median of 3 for the short prompts), 350 W.
 
 ```
 Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
-ours int4 KV, --profile long (+ lookup)     122   117   107   102    94
-ours int4 KV, --prompt-lookup 0             120   128   103   101    91
-ours fp8 KV                                 117   117   108    98   n/s
-HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
-HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
-Ratio, --profile long / mtp-long         1.30x 1.33x 1.34x 1.50x   n/s
-Ratio, --profile long / mtp-huge         2.10x 2.21x 2.74x 3.29x 3.48x
+ours int4 KV, --profile long (+ lookup)     124   119   115   108   102
+ours int4 KV, --prompt-lookup 0             124   133   109   105    96
+ours fp8 KV                                 123   123   112   108   n/s
+HyperQwen mtp-long (fp8/int8 KV)            106    97    86    83   n/s
+HyperQwen mtp-huge (4/2-bit KVarN)           64    57    41    33    28
+Ratio, --profile long / mtp-long         1.17x 1.23x 1.34x 1.29x   n/s
+Ratio, --profile long / mtp-huge         1.94x 2.10x 2.82x 3.31x 3.58x
 
 Short prompts (385 tokens), tokens/s       code prose  math
-ours int4 KV, --prompt-lookup 0             166   105   156
-ours int4 KV + prompt lookup                170   105   173
-ours fp8 KV                                 164   101   163
-HyperQwen mtp-long                          118    79   121
-HyperQwen mtp-huge                          122    82   128
-Ratio, int4 / mtp-long                  1.41x 1.33x 1.29x
-Ratio, int4 / mtp-huge                  1.36x 1.28x 1.22x
+ours int4 KV, --prompt-lookup 0             170   108   162
+ours int4 KV + prompt lookup                173   106   175
+ours fp8 KV                                 172   105   171
+HyperQwen mtp-long                          135    89   134
+HyperQwen mtp-huge                          132    89   138
+Ratio, int4 / mtp-long                  1.27x 1.22x 1.21x
+Ratio, int4 / mtp-huge                  1.29x 1.22x 1.18x
 
 Cold prefill, seconds to first token        32k   64k  100k  130k  190k
-ours int4 KV                                 18    41    73   104   178
-ours fp8 KV                                  18    41    73   104   n/s
-HyperQwen mtp-long                           21    48    79   113   n/s
-HyperQwen mtp-huge                           20    45    73    99   168
+ours int4 KV                                 18    41    72   102   174
+ours fp8 KV                                  18    41    72    99   n/s
+HyperQwen mtp-long                           19    45    75   104   n/s
+HyperQwen mtp-huge                           19    43    70    95   161
+```
 
-Coding pass@1, 283 tasks                    passed  vs bf16
+`n/s` = not served in that run. Ratios are our decode tok/s divided by HyperQwen's in the same column. **What the ratios cover:** single-stream decode speed on this card.
+Against `mtp-long` the ratio is 1.2x to 1.3x at 32k to 130k (that preset was not served at 190k); against `mtp-huge`, the only HyperQwen preset served at 190k, it is 1.9x to 3.6x across
+32k to 190k (102 tok/s against 28 at 190k). On short prompts it is 1.2x to 1.3x. Prefill is within about 10% in both directions: we are 2% to 11% faster than `mtp-long` and up to 8% slower than `mtp-huge` at 130k and 190k.
+Quality is not part of this re-run (see below).
+
+**The same protocol on 2026-11-03** (an earlier session on the same card; kept to show the run-to-run spread): ours 122 / 117 / 107 / 102 / 94 (`--profile long`) and 120 / 128 / 103 / 101 / 91 (tail off) tok/s; HyperQwen `mtp-long` 94 / 88 / 80 / 68 and `mtp-huge` 58 / 53 / 39 / 31 / 27;
+short prompts ours 166 / 105 / 156 against `mtp-long` 118 / 79 / 121. Between the two days our decode cells moved by +1% to +10% and HyperQwen's by +8% to +22% (`mtp-long`) and +5% to +10% (`mtp-huge`), so the ratios against `mtp-long` fell
+from 1.3x to 1.5x to 1.2x to 1.3x. The cause of the difference between days was not isolated. Treat ratios within about 10% of each other as equal.
+
+Coding pass@1, 283 tasks, from the 2026-11-03 session (not re-run):
+
+```
+                                            passed  vs bf16
 bf16 reference                                 244        -
 HyperQwen mtp-long                             244        0
 ours fp8 KV                                    243       -1
 HyperQwen mtp-huge                             242       -2
 ours int4 KV, --prompt-lookup 0                241       -3   (-1.1 pts, p = 0.45, not significant)
 ```
-
-`n/s` = not served in that run. Ratios are our decode tok/s divided by HyperQwen's in the same column. **What the ratios cover:** single-stream decode speed on this card.
-Against `mtp-long` the ratio is 1.3x to 1.5x at 32k to 130k (that preset was not served at 190k); against `mtp-huge`, the only HyperQwen preset served at 190k, it is 2.1x to 3.5x across
-32k to 190k (91 to 94 tok/s against 27). On short prompts it is 1.2x to 1.4x. **What they do not cover:** prefill (within about 10%) and quality (within noise across all arms).
 
 Caveats, all of which matter:
 

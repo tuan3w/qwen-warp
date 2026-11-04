@@ -8,22 +8,23 @@ One GPU (RTX 3090), one request at a time, text only.
 
 ## Numbers
 
-Same card at 350 W, greedy, batch size 1, one run per cell. Re-measured on this code on 2026-11-04 (client and prompts: [method](docs/PERFORMANCE.md#3-speed)).
+Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, HyperQwen included, was measured on 2026-11-04 with the same prompts and client ([method](docs/PERFORMANCE.md#3-speed)).
 
 | Decode, tokens/s, by prompt length | 32k | 64k | 100k | 130k | 190k | 262k |
 |---|---|---|---|---|---|---|
 | **qwen-warp** `--profile long` (4-bit KV cache, prompt-lookup tail) | 124 | 119 | 115 | 108 | 102 | - |
 | **qwen-warp** 4-bit KV cache, tail off | 124 | 133 | 109 | 105 | 96 | 94 |
 | **qwen-warp** fp8 KV cache | 123 | 123 | 112 | 108 | - | - |
-| *reference:* HyperQwen `mtp-long` | 94 | 88 | 80 | 68 | - | - |
+| *reference:* HyperQwen `mtp-long` | 106 | 97 | 86 | 83 | - | - |
+| *reference:* HyperQwen `mtp-huge` | 64 | 57 | 41 | 33 | 28 | - |
 
-`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608).
+`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608; HyperQwen `mtp-long` does not serve 190k). Against `mtp-long`, qwen-warp decodes 1.2x to 1.3x faster at 32k to 130k.
 
 | Short prompts, tokens/s | code | prose | math |
 |---|---|---|---|
 | **qwen-warp** default (bf16 KV cache) | 172 | 110 | 172 |
 | **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
-| *reference:* HyperQwen `mtp-long` | 118 | 79 | 121 |
+| *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
 
 | | |
 |---|---|
@@ -33,8 +34,8 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Re-measured on this 
 | Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
 | Not measured | multi-turn agent task success, other GPUs, other power limits |
 
-HyperQwen rows are a reference point, not a competitor: another project, measured on 2026-11-03 with the same prompts and client, image
-`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04). A newer build may differ.
+HyperQwen rows are a reference point, not a competitor: another project, run unmodified on the same card, image
+`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04). A newer build may differ. It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so treat gaps under about 10% as noise.
 Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## How it gets there

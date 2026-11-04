@@ -11,7 +11,7 @@ open an issue so others know. Back to the [README](../README.md).
 | [A non-uniform weight codebook](#a-non-uniform-weight-codebook) | helps accuracy on a 4B model; the extra bytes alone bound the 27B step at about +17% | a kernel; likely a dead end at this size |
 | [A better quantized model](#a-better-quantized-model-if-one-appears) | nothing to measure yet | kernel work if the format changes |
 | [Faster long prefill](#faster-long-prefill) | 963 tok/s at 262k | profiling first |
-| [Repeating the HyperQwen reference measurement](#repeating-the-hyperqwen-reference-measurement) | one pinned build, single runs | a few hours of runs |
+| [Repeating the HyperQwen reference measurement](#repeating-the-hyperqwen-reference-measurement) | one pinned build, two same-protocol runs (2026-11-03 and 2026-11-04) that differ by 5% to 22% | a newer build, repeats per cell, a second power limit |
 | [A thinking token budget](#a-thinking-token-budget) | `thinking_token_budget` is HTTP 400; `reasoning_effort` is only a prompt hint; a design sketch fits the existing processors | a kernel rule, an exactness test, a quality measurement at cut-off budgets |
 | [Log-probabilities](#log-probabilities-through-an-extra-bf16-pass) | HTTP 400; the head returns exact logits for 64 candidates only | an extra bf16 pass for requests that ask, and its cost |
 | [bad_words and structured output](#bad_words-and-structured-output) | HTTP 400; each needs device-side state per verify row | a matcher or a grammar automaton in the cycle |
@@ -47,8 +47,8 @@ The CUDA fake-quant was checked against a torch reference on 65,536 real K/V row
 
 ## Why the 4-bit cache missed a needle at 100k
 
-The 4-bit arm missed a planted needle at 100k tokens in the speed sweep and found it at 32k, 64k, 130k and 190k; in a separate test it got 7 of 8 needles at about 100k (fp8: 8 of 8). That could be noise
-at this sample size or a real failure mode of one position range. **To settle it:** many more needle prompts across positions, with fp8 as the control, and a look at which layers' keys carry the miss.
+The 4-bit arm missed a planted needle at 100k tokens in the speed sweep of 2026-11-03 and found it at 32k, 64k, 130k and 190k; on 2026-11-04 both 4-bit arms (tail off and on) missed it at 100k again and found it at every other length (16k to 262k). In a separate test it got 7 of 8 needles at about 100k
+(fp8: 8 of 8, and fp8 found it at every length it served). That is now consistent enough to look like a failure mode of one position range, though it is one prompt per length. **To settle it:** many more needle prompts across positions, with fp8 as the control, and a look at which layers' keys carry the miss.
 
 ## Multi-turn agentic task success per KV dtype
 
@@ -74,8 +74,8 @@ Cold prefill is 1,888 tok/s at 16k, 1,094 at 190k and 963 at 262k (re-measured 2
 
 ## Repeating the HyperQwen reference measurement
 
-The reference numbers describe one HyperQwen build and single runs. A repeat with repeats per cell, a newer build, its DFlash2 preset if it starts, and a second power limit would be a better reference.
-This is a measurement exercise, not a contest.
+The reference numbers describe one HyperQwen build. It was measured twice with the same protocol, and its decode speed differed by 5% to 22% between the two days (the cause was not isolated), so one run per cell is a rough number. A repeat with several runs per cell,
+a newer build, its DFlash2 preset if it starts, and a second power limit would be a better reference. This is a measurement exercise, not a contest.
 
 ## A thinking token budget
 
