@@ -237,8 +237,8 @@ cudaError_t smk_engine_decode(smk_engine* e, int n, int* host_tokens, cudaStream
 }
 
 cudaError_t smk_engine_read(smk_engine* e, int what, void* host, size_t bytes) {
-  const void* src = what == 0 ? (const void*)e->ds : what == 1 ? (const void*)e->dbg : what == 2 ? (const void*)e->logits : nullptr;
-  const size_t cap = what == 0 ? DS_N * sizeof(int) : what == 1 ? (size_t)DBG_SLOTS * TM * H * 2 : (size_t)TM * VOC * 4;
+  const void* src = what == 0 ? (const void*)e->ds : what == 1 ? (const void*)e->dbg : what == 2 ? (const void*)e->logits : what == 3 ? (const void*)e->pb.counts : what == 4 ? (const void*)e->pb.dev : nullptr;
+  const size_t cap = what == 0 ? DS_N * sizeof(int) : what == 1 ? (size_t)DBG_SLOTS * TM * H * 2 : what == 3 ? (size_t)VOC * 4 : what == 4 ? sizeof(ProcP) : (size_t)TM * VOC * 4;
   if (!src || bytes > cap) return cudaErrorInvalidValue;
   return cudaMemcpy(host, src, bytes, cudaMemcpyDeviceToHost);
 }

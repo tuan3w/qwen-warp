@@ -68,6 +68,7 @@ def main():
     stop = [248046, 248044]
     e = SpecEngine(ctx_max=1024, verbose=False)
     cases = [  # name, procs (ref_rows names), temperature, top_k, top_p, min_p
+        ("no processors (the unchanged sampler)", dict(), 1.0, 20, 1.0, 0.0),
         ("penalties", dict(pres=0.8, freq=0.6, rep=1.25), 0.8, 20, 0.95, 0.0),
         ("repetition 1.8", dict(rep=1.8), 1.0, 20, 1.0, 0.0),
         ("logit_bias promoting rare tokens", dict(bias={rare[0]: 22.0, rare[1]: 19.0, rare[2]: -5.0}), 1.0, 20, 1.0, 0.0),
@@ -78,7 +79,7 @@ def main():
     ]
     stats = {}
     for name, pr, T, top_k, top_p, min_p in cases:
-        worst_e, worst_tv, rows, bad_sup, neg_tv, worst = 0.0, 0.0, 0, 0, [], None
+        worst_e, worst_tv, rows, bad_sup, neg_tv, worst, gen_ok = 0.0, 0.0, 0, 0, [], None, True
         for pi, ids in enumerate(prompts):
             procs = dict(prompt=ids, **pr)
             e.set_sampling(temperature=T, top_k=top_k, top_p=top_p, seed=100 + pi, min_p=min_p)
@@ -89,34 +90,42 @@ def main():
             gen = [first]
             # the first-token row: engine Dist row 0 of the prefill (history = prompt only) vs the reference on the same hidden state
             rows_h = [(read_dist(e, 1)[0], e.dbg_hidden(1)[65][0], [], [])]
+            bufs = [e.logits(1)[0].clone()]  # the engine's logits buffer rows: processed exact values on the candidates, processed approximate values elsewhere
             for _ in range(4):
                 _, _, dd = e.draft_state()
                 new, _ = e.cycles(3, 1)
+                counts, ngen = e.proc_state()  # the device history of the processors == what was emitted
+                gen_ok &= ngen == len(gen) + len(new) and bool(torch.equal(counts, torch.bincount(torch.tensor(gen + new), minlength=V).int())) if pr else True
                 dists = read_dist(e, 4)
                 hid = e.dbg_hidden(4)[65][:4]
+                bufs += list(e.logits(4).clone())
                 for t in range(4):
                     rows_h.append((dists[t], hid[t], list(gen), dd[1 : 1 + t]))
                 gen += new
             lg = full_logits(e, torch.stack([h for _, h, _, _ in rows_h]))
             for r, (d, _, g, drafts) in enumerate(rows_h):
-                row = ref_rows(lg[r : r + 1], gen=g, drafts=drafts, **procs)
+                row = ref_rows(lg[r : r + 1], gen=list(g) + list(drafts), **procs)  # one row: its history = generated tokens + the draft tokens before it
                 q = ref_dist(row[0], T, top_k, top_p, min_p)
                 err, tv, sup = compare(d, q)
                 if tv > worst_tv:
-                    worst = (pi, r, d, q)
+                    worst = (pi, r, d, q, bufs[r], row[0])
                 worst_e, worst_tv, rows, bad_sup = max(worst_e, err), max(worst_tv, tv), rows + 1, bad_sup + (not sup)
                 q0 = ref_dist(lg[r], T, top_k, top_p, min_p)  # the reference WITHOUT the processors
                 neg_tv.append(compare(d, q0)[1])
         stats[name] = (worst_e, worst_tv, rows, bad_sup, float(np.mean(neg_tv)))
+        check(f"real logits, {name}: the device generated-token counts equal the emitted tokens after every cycle", gen_ok)
         ok = worst_e < 2e-3 and worst_tv < 5e-3
         check(f"real logits, {name}: engine distribution == full-vocabulary reference ({rows} rows from {len(prompts)} prompts)", ok,
               f"max abs err {worst_e:.2e}, max TV {worst_tv:.2e}, support differs in {bad_sup} rows")
         if not ok and worst:
-            pi, r, d, q = worst
+            pi, r, d, q, buf, prow = worst
             top = lambda dd: sorted(dd.items(), key=lambda kv: -kv[1])[:4]
             ref = {int(i): float(q[i]) for i in torch.nonzero(q).flatten()}
             print(f"    worst row: prompt {pi}, row {r}: engine top {top(d)}  reference top {top(ref)}  missing in engine {[(i, round(v, 4)) for i, v in ref.items() if i not in d][:5]}  extra in engine {[(i, round(v, 4)) for i, v in d.items() if i not in ref][:5]}", flush=True)
-        check(f"real logits, {name}: negative control (reference without the processors) disagrees on at least one row (max TV > 0.2)", max(neg_tv) > 0.2, f"max TV {max(neg_tv):.3f}, mean {np.mean(neg_tv):.3f}")
+            for i in [i for i in ref if i not in d][:3] + [i for i in d if i not in ref][:3] + [i for i, _ in top(d)[:2]] + [i for i, _ in top(ref)[:2]]:
+                print(f"      token {i}: processed exact logit {float(prow[i]):.3f}, engine buffer value {float(buf[i]):.3f}", flush=True)
+        if pr:
+            check(f"real logits, {name}: negative control (reference without the processors) disagrees on at least one row (max TV > 0.2)", max(neg_tv) > 0.2, f"max TV {max(neg_tv):.3f}, mean {np.mean(neg_tv):.3f}")
 
     # greedy over the processed logits = top_k 1 sampling: every emitted token is the argmax of the reference's processed row
     tot = ok = 0

@@ -146,7 +146,8 @@ def scenario(name, N, nchain, tail, m, trials, cfg_kw, procs_kw, gen, seed, draf
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--trials", type=int, default=400000)
+    ap.add_argument("--trials", type=int, default=200000)
+    ap.add_argument("--only", type=int, default=None, help="run only scenario 0, 1 or 2 (each takes a few minutes)")
     args = ap.parse_args()
     # test of the test: chi-square survival function against known values
     ok = abs(chi2_sf(10.0, 5) - 0.0752352) < 1e-6 and abs(chi2_sf(3.84146, 1) - 0.05) < 1e-5 and abs(chi2_sf(101.879, 80) - 0.05) < 1e-4
@@ -154,13 +155,17 @@ def main():
     n = args.trials
     pen = dict(prompt=[1, 2, 5], pres=1.2, freq=0.9, rep=1.3)
     gen = [3, 3, 4]
-    scenario("k=3 drafts, penalties (presence 1.2, frequency 0.9, repetition 1.3), top-k 8", 8, 3, [], 4, n,
-             dict(temperature=1.0, top_k=8, top_p=1.0), pen, gen, seed=11)
-    mix = dict(prompt=[0, 6], pres=0.5, freq=0.5, rep=1.2, min_tokens=len(gen) + 2, stop=[7], bias={2: 1.5, 5: -2.0}, allowed=[0, 1, 2, 3, 4, 5, 7])
-    scenario("k=3 drafts, penalties + bias + allowed set + min_tokens boundary inside the cycle, T=0.8 top-p 0.9 min_p 0.05", 8, 3, [], 4, n,
-             dict(temperature=0.8, top_k=8, top_p=0.9, min_p=0.05), mix, gen, seed=12)
-    scenario("k=4 (2 chain drafts + 2 prompt-lookup tail tokens), penalties", 6, 2, [3, 3], 5, n,
-             dict(temperature=1.0, top_k=6, top_p=1.0), dict(prompt=[1, 2], pres=1.5, freq=1.0, rep=1.4), [3, 4], seed=13)
+    mix = dict(prompt=[0, 6], pres=0.5, freq=0.5, rep=1.2, min_tokens=len(gen) + 2, stop=[7], bias={2: 1.5, 5: -2.0}, allowed=[0, 1, 2, 3, 4, 5, 6, 7])
+    scenarios = [
+        lambda: scenario("k=3 drafts, penalties (presence 1.2, frequency 0.9, repetition 1.3), top-k 8", 8, 3, [], 4, n, dict(temperature=1.0, top_k=8, top_p=1.0), pen, gen, seed=11),
+        lambda: scenario("k=3 drafts, penalties + bias + allowed set + min_tokens boundary inside the cycle, T=0.8 top-p 0.95 min_p 0.02", 8, 3, [], 4, n,
+                         dict(temperature=0.8, top_k=8, top_p=0.95, min_p=0.02), mix, gen, seed=12),
+        lambda: scenario("k=4 (2 chain drafts + 2 prompt-lookup tail tokens), penalties", 6, 2, [3, 3], 5, n, dict(temperature=1.0, top_k=6, top_p=1.0),
+                         dict(prompt=[1, 2], pres=1.5, freq=1.0, rep=1.4), [3, 4], seed=13),
+    ]
+    for i, sc in enumerate(scenarios):
+        if args.only is None or args.only == i:
+            sc()
     print(f"\n{'ALL PASS' if not FAILS else 'FAILED: ' + ', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
 

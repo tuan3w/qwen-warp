@@ -190,6 +190,12 @@ class SpecEngine(Engine):
         smk.check(self.lib.smk_engine_set_procs(self.h, C.byref(p), self.st), "set_procs")  # pageable host arrays: copied before the call returns
         assert keep
 
+    def proc_state(self):
+        """(generated-token counts int32 [V], tokens generated so far) kept on the device by the request processors (only maintained while a processor is active)."""
+        counts = self._read(3, 248320, torch.int32)
+        head = self._read(4, 4, torch.int32)  # ProcP: on, has_allowed, min_tokens, ngen
+        return counts, int(head[3])
+
     def plain_sample(self, n):
         """n plain (non-speculative) sampled decode steps from the staged next input token; returns the sampled tokens."""
         out = (C.c_int * n)()

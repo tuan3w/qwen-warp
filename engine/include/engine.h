@@ -152,7 +152,7 @@ cudaError_t smk_engine_step_nograph(smk_engine* e, int T, int head, cudaStream_t
 cudaError_t smk_engine_decode(smk_engine* e, int n, int* host_tokens, cudaStream_t st);
 // Synchronous copy of an engine debug buffer to host memory.  what = 0: device state int[20] (pos0, cur, tok[8], out_tok[8], ring slots, pad);
 // 1: debug taps bf16 [66][SMK_TMAX][5120] (always written; slot 0 = embedding, slot l+1 = hidden after layer l, slot 65 = final-norm output; rows 0..T-1 of the last step);
-// 2: logits fp32 [SMK_TMAX][248320] of the last head step.  `bytes` must be <= the buffer size.
+// 2: logits fp32 [SMK_TMAX][248320] of the last head step; 3: the request processors' generated-token counts int [248320] (smk_procs); 4: their device state (src/proc.h ProcP: on, has_allowed, min_tokens, ngen, ...).  `bytes` must be <= the buffer size.
 cudaError_t smk_engine_read(smk_engine* e, int what, void* host, size_t bytes);
 size_t smk_engine_bytes(smk_engine* e);          // device bytes allocated by the engine
 

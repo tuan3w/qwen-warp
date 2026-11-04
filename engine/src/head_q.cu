@@ -101,6 +101,7 @@ constexpr int CAP = NCH_MAX * 64;  // survivor list capacity per row: every chun
 constexpr int RMAX = SMK_HEADQ_RMAX;
 static_assert(RMAX <= 64, "CAP assumes R <= 64");
 constexpr int ROWS = 8;  // K11: T <= 8 rows (int4 head; the int8 CUDA-core kernel keeps T <= 4: its smem holds T x 20 KB of activations)
+constexpr uint32_t ORD_NEG_INF = 0x007FFFFFu;  // ord32(-inf)
 
 struct WsLayout {  // byte offsets in ws
   static constexpr size_t cnt = 0;                                    // int [16]: [0..7] survivor counters, [8..15] rescore done counters
@@ -168,7 +169,7 @@ __global__ void __launch_bounds__(256) k_extract(const float* __restrict__ lg, i
   }
   __syncthreads();
   const uint32_t thr = thr_s;
-  if (cm[c] < thr) return;  // block-uniform
+  if (cm[c] < thr || cm[c] <= ORD_NEG_INF) return;  // block-uniform; a chunk that is entirely -inf (masked by allowed_token_ids, src/proc.h) holds no candidate: without this every such chunk takes the flat-chunk path
   const float* row = lg + (size_t)r * N;
   uint64_t key[CHUNK / 256];
   int mine = 0;
