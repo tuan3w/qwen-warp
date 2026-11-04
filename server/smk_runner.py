@@ -7,12 +7,14 @@ No vLLM imports here (the vLLM glue is smk_core_client.py).  Needs an RTX 3090 (
 
 Prefix reuse (DeltaNet state cannot be rewound, so the state is checkpointed instead):
   * the engine's device caches always hold ONE lineage: the prompt ids of the last request (`lineage`; main KV positions [0, len), MTP KV pairs p <= len-2);
-  * during the prefill of a request, DeltaNet + conv snapshots (host pinned memory, 151 MB each) are taken after the tokens [0, q) for
-      - q = len(prompt)-1  (before the last prompt token; the next request that extends / repeats this prompt resumes here: agent loops, completions continuation),
-      - q = p+2 where p = last <|im_start|> in the prompt  (chat: the next turn re-renders the previous assistant message WITHOUT the generation-prompt tail
-        "<think>\\n", so the first divergence is right after "<|im_start|>assistant\\n"; resuming at p+2 re-prefills only the previous answer + the new user turn);
-  * a new request with ids R: L = common prefix of R and the lineage; resume from the snapshot with the largest q <= L-1 (MTP pair q-1 needs token q to be common),
-    restore it into the current DeltaNet ring slot, continue the prefill at position q (main KV / MTP KV positions >= q are simply overwritten).  No snapshot -> reset + full prefill.
+  * the prefill of a prompt is cut into segments by `_plan`, a function of the prompt tokens ALONE (the fast prefill's numerics depend on where the segments start and end: the
+    fla chunking of the DeltaNet scan, the GEMM kernel of a segment <= w4_max rows, the folded last row).  A request resumed from a snapshot continues that same plan, so its state
+    is bit-identical to a cold prefill of the same prompt and the output of a request depends on (prompt, sampling parameters, seed) only, never on the cache;
+  * during the prefill DeltaNet + conv snapshots (host pinned memory, 151 MB each) are taken at the last two segment ends of the plan: segments end at <= seg tokens, at a chat
+    turn boundary q = p+2 (p = a <|im_start|> position; the next turn re-renders the previous assistant message WITHOUT the generation-prompt tail "<think>\\n", so the first
+    divergence is right after "<|im_start|>assistant\\n") that is more than w4_max tokens after the previous end, and at len(prompt)-1 when the last row is not folded (a repeated prompt);
+  * a new request with ids R: L = common prefix of R and the lineage; resume from the snapshot with the largest q <= L-1 (MTP pair q-1 needs token q to be common) that is a segment
+    end of R's plan, restore it into the current DeltaNet ring slot, continue the prefill at position q (main KV / MTP KV positions >= q are simply overwritten).  No snapshot -> reset + full prefill.
 """
 import ctypes as C
 import random
@@ -30,6 +32,7 @@ from spec import SpecEngine, make_pld, smk  # noqa: E402
 from prefill import FastPrefill  # noqa: E402
 
 IM_START = 248045  # <|im_start|>
+MAX_TOP_K = 64  # the engine's sampler keeps at most the 64 highest logits (top_k > 64 is rejected by the server; top_k <= 0 = no top-k filter = these 64)
 STOP, LENGTH = "stop", "length"
 
 
@@ -39,7 +42,7 @@ class GenParams:
     eos: int | None = None  # primary EOS (finish_reason stop, stop_reason None); None with ignore_eos
     stop_ids: frozenset = frozenset()  # other stop token ids (finish_reason stop, stop_reason = the id)
     temperature: float = 0.0
-    top_k: int = 0  # <= 0: disabled (the engine's sampler truncates at 64)
+    top_k: int = 0  # 1..MAX_TOP_K; <= 0: no top-k filter (the sampler then ranks the MAX_TOP_K best candidates)
     top_p: float = 1.0
     seed: int | None = None
 
@@ -82,9 +85,6 @@ class Runner:
         # all snapshot buffers are allocated up front (cudaHostAlloc of 151 MB costs ~20 ms): len(snaps) + len(pool) == max_snaps
         self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory()) for _ in range(max_snaps)]
         self.last = Stats()
-        self._side = torch.cuda.Stream()  # K10: the snapshot D2H copy of a short (folded) prompt runs here, overlapped with the first-token chunk (see _snapshot)
-        self._snap_ev = None
-        self._snap_pending = None
         if warmup:
             t0 = time.time()
             self._warmup()
@@ -102,7 +102,7 @@ class Runner:
 
     def _ss(self):
         buf = (C.c_int * 40)()
-        torch.cuda.current_stream().synchronize()  # not the whole device: an asynchronous snapshot copy (side stream) may still be running
+        torch.cuda.current_stream().synchronize()
         smk.check(self.e.lib.smk_spec_read(self.e.sp, 0, buf, 160), "spec_read")
         return list(buf)
 
@@ -111,42 +111,17 @@ class Runner:
         self.pool += [s for s in self.snaps if s not in keep]
         self.snaps = list(keep)
 
-    def _snap_sync(self):
-        """Wait for an asynchronous snapshot copy (must complete before anything overwrites ring slot `cur` or recycles the buffer)."""
-        if self._snap_ev is not None:
-            self._snap_ev.synchronize()
-            self._snap_ev = None
-
-    def _snap_flush(self):
-        """Issue the snapshot a folded prefill left pending (asynchronous copy of ring slot `cur`)."""
-        if self._snap_pending is not None:
-            args, self._snap_pending = self._snap_pending, None
-            self._snapshot(*args, wait=False)
-
-    def _snapshot(self, i, cur=None, wait=True):
-        """DeltaNet + conv state of ring slot `cur` (default: the engine's current slot) -> a host snapshot buffer for position i.  wait=False: issue the copies on a side
-        stream and return; the caller guarantees nothing writes slot `cur` (the next speculative cycle may) before _snap_sync()."""
-        self._snap_sync()
+    def _snapshot(self, i):
+        """DeltaNet + conv state of the engine's current ring slot -> a host snapshot buffer for position i."""
         self._free_snaps([x for x in self.snaps if x.pos != i])  # same position: reuse the buffer
         if not self.pool:  # evict the oldest (lowest position: conversation prompts grow, early boundaries are the least useful)
             old = min(self.snaps, key=lambda x: x.pos)
             self._free_snaps([x for x in self.snaps if x is not old])
         s = self.pool.pop()
-        if cur is None:
-            cur = self._cur()
+        cur = self._cur()
         s.pos = i
-        if wait:
-            s.dn.copy_(self.fp.dn_state[:, cur])
-            s.conv.copy_(self.fp.dn_conv[:, cur])
-        else:
-            ev = torch.cuda.Event()
-            ev.record()
-            with torch.cuda.stream(self._side):
-                self._side.wait_event(ev)
-                s.dn.copy_(self.fp.dn_state[:, cur], non_blocking=True)
-                s.conv.copy_(self.fp.dn_conv[:, cur], non_blocking=True)
-                self._snap_ev = torch.cuda.Event()
-                self._snap_ev.record(self._side)
+        s.dn.copy_(self.fp.dn_state[:, cur])
+        s.conv.copy_(self.fp.dn_conv[:, cur])
         self.snaps.append(s)
 
     def _restore(self, s):
@@ -160,51 +135,51 @@ class Runner:
         torch.cuda.synchronize()
 
     def drop_cache(self):
-        self._snap_sync()
         self.lineage = None
         self._free_snaps([])
 
-    def _choose(self, ids):
-        """Snapshot to resume from for prompt `ids` (None = cold start)."""
+    def _choose(self, ids, ends):
+        """Snapshot to resume from for prompt `ids` whose plan has the segment ends `ends` (None = cold start)."""
         if self.lineage is None or not self.snaps:
             return None
         n = min(len(ids), len(self.lineage))
         a, b = np.asarray(ids[:n], dtype=np.int32), self.lineage[:n]
         ne = np.flatnonzero(a != b)
         L = int(ne[0]) if len(ne) else n
-        ok = [s for s in self.snaps if s.pos <= min(L - 1, len(ids) - 1)]
+        ok = [s for s in self.snaps if s.pos <= min(L - 1, len(ids) - 1) and s.pos in ends]
         return max(ok, key=lambda s: s.pos) if ok else None
 
     # ------------------------------------------------------------------------------------------------ prefill
-    def _prefill(self, ids, q, snap_pos, cancelled):
-        """Process ids[q:] (state valid for [0, q)); the last token as the head step.  Snapshots after the tokens [0, s) for s in snap_pos.
-        Returns False when cancelled (self.lineage then holds the valid prefix)."""
-        e, fp = self.e, self.fp
+    def _plan(self, ids):
+        """The segmentation of the prefill of `ids` (every request, cold or resumed, follows it): (ends, folded).  ends = the end position of each segment run before the last
+        prompt token; folded: the last row rides in a final batch of <= min(seg, w4_max) rows (K10, no 20 ms T=1 head step) instead of a head step after the last segment.
+        A segment ends after seg rows or at a chat turn boundary p+2 (p = a <|im_start|>) more than w4_max rows after the previous end (a cut that does not save a re-prefill of
+        more than a weight pass would cost ~+55 ms); the decision at a position only looks at the tokens before it, so a prompt extending another one keeps its cuts."""
+        fp = self.fp
         n = len(ids) - 1
-        bounds = sorted(s for s in set(snap_pos) if q < s <= n)
-        i = q
-        folded = False
+        marks = np.flatnonzero(np.asarray(ids[: max(n - 1, 0)], dtype=np.int32) == IM_START) + 2  # turn boundaries <= n
+        ends, i = [], 0
         while i < n:
-            # K10 short tail: the last row rides in the final batch of <= min(seg, w4_max) rows (no 20 ms T=1 head step); the snapshot "before the last token" is then the
-            # state in the ring slot the batch started from (the folded last row's DeltaNet row goes to the next slot), copied asynchronously.
-            if fp.fold and not any(i < b < n for b in bounds) and 2 <= n + 1 - i <= min(fp.seg, fp.w4_max):
-                if cancelled():
-                    self.lineage = np.asarray(ids[:i], dtype=np.int32)
-                    return False
-                cur = self._cur()
-                fp._ev = []
-                fp._segment(ids[i:], i, cur, ids[i + 1 :], head=True)
-                if n in bounds:
-                    self._snap_pending = (n, cur)  # issued after the first token has been read and yielded (see run): the 151 MB D2H copy occupies the single DMA engine
-                folded = True
-                break
+            if fp.fold and 2 <= n + 1 - i <= min(fp.seg, fp.w4_max):
+                return ends, True
+            j = min(n, i + fp.seg)
+            k = int(np.searchsorted(marks, i + fp.w4_max, side="right"))
+            if k < len(marks) and marks[k] < j:
+                j = int(marks[k])
+            ends.append(j)
+            i = j
+        return ends, False
+
+    def _prefill(self, ids, q, ends, folded, cancelled):
+        """Process ids[q:] (state valid for [0, q), q = 0 or a segment end of the plan) following the plan; the last token as the head step.  Snapshots after the last (up to)
+        two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix)."""
+        e, fp = self.e, self.fp
+        snap_at = set(ends[len(ends) - min(2, self.max_snaps) :]) if self.max_snaps else set()
+        i = q
+        for j in (x for x in ends if x > q):
             if cancelled():
                 self.lineage = np.asarray(ids[:i], dtype=np.int32)
                 return False
-            j = min(n, i + fp.seg)
-            nb = next((b for b in bounds if b > i), None)
-            if nb is not None and nb < j:
-                j = nb
             if j - i >= fp.min_fast:
                 cur = self._cur()
                 fp._ev = []
@@ -219,10 +194,17 @@ class Runner:
                     nt = (C.c_int * T)(*ids[a + 1 : a + 1 + T])
                     smk.check(e.lib.smk_spec_prefill_chunk(e.sp, T, nt, a, e.st), "spec_prefill_chunk")
             i = j
-            if i in bounds:
+            if i in snap_at:
                 self._snapshot(i)
             self.lineage = np.asarray(ids[:i], dtype=np.int32)
-        if not folded:
+        if folded:
+            if cancelled():
+                self.lineage = np.asarray(ids[:i], dtype=np.int32)
+                return False
+            cur = self._cur()
+            fp._ev = []
+            fp._segment(ids[i:], i, cur, ids[i + 1 :], head=True)
+        else:
             e._step(ids[-1:], 1)
         if e.sampling:
             smk.check(e.lib.smk_spec_sample_first(e.sp, e.st), "spec_sample_first")
@@ -230,18 +212,6 @@ class Runner:
             smk.check(e.lib.smk_spec_start(e.sp, self.k, e.st), "spec_start")
         self.lineage = np.asarray(ids, dtype=np.int32)
         return True
-
-    def _snap_positions(self, ids):
-        if not self.max_snaps:
-            return []
-        n = len(ids) - 1
-        pos = [n]
-        for p in range(n, -1, -1):  # last <|im_start|>
-            if ids[p] == IM_START:
-                if p + 2 > self.fp.w4_max:  # a snapshot at p+2 <= w4_max would split a short prompt into two weight passes (~+55 ms) to save < that much re-prefill later
-                    pos.append(p + 2)
-                break
-        return [s for s in pos if s > 0]
 
     # ------------------------------------------------------------------------------------------------ generation
     def run(self, ids, p: GenParams, cancelled=lambda: False):
@@ -253,15 +223,13 @@ class Runner:
         if n_new < 1 or len(ids) < 1:
             raise ValueError(f"prompt of {len(ids)} tokens does not fit the engine context {self.ctx_max}")
         t0 = time.time()
-        self._snap_sync()
-        self._snap_pending = None
+        ends, folded = self._plan(ids)
         if p.temperature > 0:
             seed = p.seed if p.seed is not None else random.getrandbits(62)
-            top_k = p.top_k if 0 < p.top_k <= 64 else 64
-            e.set_sampling(temperature=p.temperature, top_k=top_k, top_p=p.top_p, seed=seed)
+            e.set_sampling(temperature=p.temperature, top_k=p.top_k if p.top_k > 0 else MAX_TOP_K, top_p=p.top_p, seed=seed)
         else:
             e.set_sampling(0.0)
-        snap = self._choose(ids)
+        snap = self._choose(ids, set(ends))
         if snap is None:
             self._free_snaps([])
             e.reset()
@@ -272,7 +240,7 @@ class Runner:
             self._restore(snap)
             q = snap.pos
         st.cached = q
-        if not self._prefill(ids, q, self._snap_positions(ids), cancelled):
+        if not self._prefill(ids, q, ends, folded, cancelled):
             return
         e._emitted = self._ss()[12]
         first = e.read_out_tok()
@@ -281,7 +249,7 @@ class Runner:
             e.enable_pld(self.pld)
             e.pld_begin(ids + [first])
         st.prefill_s = time.time() - t0
-        st.snaps = [s.pos for s in self.snaps] + ([self._snap_pending[0]] if self._snap_pending else [])
+        st.snaps = [s.pos for s in self.snaps]
         t1 = time.time()
         produced = 0
         new = [first]
@@ -292,11 +260,8 @@ class Runner:
             if fin is not None:
                 st.gen_s = time.time() - t1
                 yield out, fin, sr
-                self._snap_flush()
                 return
             yield out, None, None
-            self._snap_flush()  # K10: the snapshot of a folded short prompt is copied now, after the first token left (a copy in flight delays every later D2H read by ~13 ms)
-            self._snap_sync()
             if cancelled():
                 st.gen_s = time.time() - t1
                 return

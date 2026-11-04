@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """qwen-warp server: vLLM 0.30's own OpenAI frontend (run_server) on top of the swift-mk CUDA-graph decode engine (RTX 3090, Swift-1.5-Qwen3.8-27B INT4).
 
-  python server/serve.py --port 8000                          # default: bf16 KV, 28k context, MTP k=3 + prompt lookup
+  python server/serve.py --port 8000                          # default: bf16 KV, 20k context, MTP k=3 + prompt lookup
   python server/serve.py --profile long --port 8000           # int4 KV + host-pinned tables: 196k context (up to 262144 with --max-model-len 262144)
   python server/serve.py --kv-cache-dtype fp8 --max-model-len 53248 --num-speculative-tokens 3
 
@@ -17,9 +17,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 DEFAULT_MODEL = os.environ.get("SWIFT_MODEL", os.path.expanduser("~/models/swift-1.5-int4"))
-DEFAULT_MAX_MODEL_LEN = 32768
-DEFAULT_MAX_MODEL_LEN_PLD = 28672  # the prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.62 GiB, measured limit with bf16 KV
-LONG_MAX_MODEL_LEN = 196608  # --profile long: measured to start and serve with the prompt-lookup tail on a 24 GB card (262144 works with --prompt-lookup 0)
+# Defaults leave about 450 MiB of a 24 GB 3090 free after a request at the full length with the desktop holding 0.6 GiB (smk_core_client.vram_need_mib; tests/test_startup_configs.py)
+DEFAULT_MAX_MODEL_LEN = 28672
+DEFAULT_MAX_MODEL_LEN_PLD = 20480  # the prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.55 GiB
+LONG_MAX_MODEL_LEN = 196608  # --profile long: with the prompt-lookup tail (262144 starts too)
 
 
 def parse_args(argv=None):
@@ -31,8 +32,9 @@ def parse_args(argv=None):
     g.add_argument("--num-speculative-tokens", type=int, default=None, choices=[0, 1, 2, 3], help="MTP drafts per cycle (0 = plain decode; default 3 unless --speculative-config is given)")
     g.add_argument("--stream-cycles", type=int, default=2, help="speculative cycles per host sync = streaming granularity (one cycle ~ 24 ms, 1-4 tokens)")
     g.add_argument("--snapshots", type=int, default=4, help="DeltaNet state snapshots kept for multi-turn prefix reuse (151 MB pinned host RAM each; 0 = off)")
-    g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.62 GiB for the 9-slot DeltaNet ring: "
-                   "--max-model-len <= 28672 with bf16 KV / 53248 with fp8 KV).  auto (default) = on iff --max-model-len fits; the default --max-model-len is 28672 (32768 with --prompt-lookup 0)")
+    g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.55 GiB for the 9-slot DeltaNet ring; "
+                   "auto (default) = on iff --max-model-len leaves 256 MiB of the free GPU memory next to it, e.g. up to 23k with bf16 KV, 42k with fp8 KV, any length with int4 KV + --host-tables); "
+                   "the default --max-model-len is 20480 (28672 with --prompt-lookup 0)")
     g.add_argument("--host-tables", action="store_true", help="keep the bf16 embedding + rescoring lm_head (4.7 GiB) in pinned host memory (bit-identical decode, ~free): VRAM for ~190k more KV tokens with int4 KV")
     g.add_argument("--sort-tool-schema", default="on", choices=["on", "off"], help="render the keys of every tool's function.parameters in sorted order (properties, required, type): the model returns a well-formed tool call "
                    "more often than with the type-first order most clients send (server/tool_schema.py); off = render the schemas exactly as sent")
