@@ -206,12 +206,12 @@ def main():
         t.check("sampling: same seed reproducible (cold/cold and warm/warm), other seed differs", s1 == s2 and s3 == s4 and s1 != s3, f"{s1[:40]!r} / {s3[:40]!r}")
         d = cl.chat.completions.create(model="swift", messages=[{"role": "user", "content": "Name a colour."}], max_tokens=20, extra_body=nothink)
         t.check("request without sampling params uses generation_config defaults (T=1, top_p .95, top_k 20)", d.choices[0].message.content.strip() != "")
-        for bad in ({"presence_penalty": 0.5}, {"logprobs": True, "top_logprobs": 2}, {"frequency_penalty": 0.3}):
+        for name, bad in (("logprobs", {"logprobs": True, "top_logprobs": 2}), ("bad_words", {"extra_body": {"bad_words": ["hi"]}}), ("thinking_token_budget", {"extra_body": {"thinking_token_budget": 8}})):
             try:
                 chat("hi", max_tokens=4, **bad)
-                t.check(f"unsupported {list(bad)[0]} -> 400", False, "accepted")
+                t.check(f"unsupported {name} -> 400", False, "accepted")
             except Exception as ex:  # noqa: BLE001
-                t.check(f"unsupported {list(bad)[0]} -> 400", getattr(ex, "status_code", None) == 400, str(ex)[:120])
+                t.check(f"unsupported {name} -> 400", getattr(ex, "status_code", None) == 400, str(ex)[:120])
 
         # tools (qwen3_coder parser)
         tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get the current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
