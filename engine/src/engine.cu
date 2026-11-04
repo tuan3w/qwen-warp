@@ -137,6 +137,13 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   e->ws_attn = dalloc(e, swiftmk_attn_ws_bytes(), true);
   e->ws_am = dalloc(e, smk_argmax_ws_bytes(), true);
   e->ws_hq = dalloc(e, smk_headq_ws_bytes(), true);
+  e->hq_on = w->head_q_kind != SMK_HEADQ_NONE;
+  e->dn_state = (float*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, true);
+  e->dn_conv = (uint16_t*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, true);
+  e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
+  e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
+  e->kv = (char*)dalloc(e, (size_t)na * e->kv_layer_bytes, true);
+  // the processor state is allocated last: the addresses of every buffer the decode path reads stay what they were
   e->pb.dev = (ProcP*)dalloc(e, sizeof(ProcP), true);
   e->pb.counts = (int*)dalloc(e, (size_t)VOC * 4, true);
   e->pb.flags = (uint8_t*)dalloc(e, VOC, true);
@@ -144,12 +151,6 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   e->pb.ids = (int*)dalloc(e, PROC_CHUNK * 4);
   e->pb.vals = (float*)dalloc(e, PROC_CHUNK * 4);
   { ProcP p0 = {}; p0.rep = 1.0f; p0.counts = e->pb.counts; p0.flags = e->pb.flags; p0.bias = e->pb.bias; cudaMemcpy(e->pb.dev, &p0, sizeof(p0), cudaMemcpyHostToDevice); }
-  e->hq_on = w->head_q_kind != SMK_HEADQ_NONE;
-  e->dn_state = (float*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, true);
-  e->dn_conv = (uint16_t*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, true);
-  e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
-  e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
-  e->kv = (char*)dalloc(e, (size_t)na * e->kv_layer_bytes, true);
   cudaStreamCreateWithFlags(&e->cap, cudaStreamNonBlocking);
   cudaStreamCreateWithFlags(&e->side, cudaStreamNonBlocking);
   cudaEventCreateWithFlags(&e->ev_fork, cudaEventDisableTiming);
