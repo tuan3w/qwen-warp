@@ -56,8 +56,8 @@ client.chat.completions.create(model="swift", messages=[...], max_tokens=400,
 
 The thinking text comes back in the field **`reasoning`** of the message (vLLM 0.30.0; read it from the raw JSON), not in `content`.
 
-`reasoning_effort` is accepted by the chat template of the checkpoint. What was measured on a stock vLLM server of the same model (not yet on this server: it goes through the same vLLM frontend and
-template, so the same behaviour is expected here, but that was not tested):
+`reasoning_effort` is accepted by the chat template of the checkpoint. The lengths below were measured on a stock vLLM server of the same model; the behaviour of the values was also checked on this server on 2026-11-04 (`none` gave 0
+reasoning tokens, `low`, `medium` and `xhigh` were accepted and reasoned, `high` returned HTTP 400), in both the native server and the Docker container:
 
 | `reasoning_effort` | Result |
 |---|---|
