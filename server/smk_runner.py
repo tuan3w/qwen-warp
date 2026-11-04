@@ -42,6 +42,22 @@ class GenParams:
     top_k: int = 0  # <= 0: disabled (the engine's sampler truncates at 64)
     top_p: float = 1.0
     seed: int | None = None
+    # request-level logit processors (vLLM / OpenAI semantics, engine/src/proc.h); the defaults are off
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_tokens: int = 0
+    min_tokens_ids: frozenset = frozenset()  # tokens masked until min_tokens are generated (eos + stop token ids)
+    logit_bias: dict | None = None
+    allowed_token_ids: tuple | None = None
+
+    def procs(self, prompt_ids):
+        """spec.make_procs arguments of the elementwise processors, None when none is active (min_p is a sampler parameter)."""
+        if not (self.presence_penalty or self.frequency_penalty or self.repetition_penalty != 1.0 or self.min_tokens or self.logit_bias or self.allowed_token_ids):
+            return None
+        return dict(prompt=prompt_ids, presence=self.presence_penalty, frequency=self.frequency_penalty, repetition=self.repetition_penalty, min_tokens=self.min_tokens,
+                    bias=self.logit_bias, allowed=self.allowed_token_ids, stop=sorted(self.min_tokens_ids))
 
 
 @dataclass
@@ -255,12 +271,16 @@ class Runner:
         t0 = time.time()
         self._snap_sync()
         self._snap_pending = None
+        procs = p.procs(ids)
         if p.temperature > 0:
             seed = p.seed if p.seed is not None else random.getrandbits(62)
             top_k = p.top_k if 0 < p.top_k <= 64 else 64
-            e.set_sampling(temperature=p.temperature, top_k=top_k, top_p=p.top_p, seed=seed)
+            e.set_sampling(temperature=p.temperature, top_k=top_k, top_p=p.top_p, seed=seed, min_p=p.min_p)
+        elif procs:  # greedy over the PROCESSED logits: the sampling graphs with top_k = 1 (the greedy graphs have no processors)
+            e.set_sampling(temperature=1.0, top_k=1, top_p=1.0, seed=0)
         else:
             e.set_sampling(0.0)
+        e.set_procs(**(procs or {}))
         snap = self._choose(ids)
         if snap is None:
             self._free_snaps([])
