@@ -16,7 +16,7 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | What does it cost for tool calls? | a minimal one-parameter schema in the usual key order: 39% well-formed on the 4-bit cache against 91% on bf16; 87% with the default sorted rendering | one schema, in-process runs of 150 requests per cell | [2](#tool-calls) |
 | How fast is decode? | 94 to 133 tok/s from 32k to 262k tokens (4-bit cache); 105 to 181 tok/s on short prompts | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
-| How does it compare with HyperQwen? | a reference point on one pinned build, not a competition | single runs, one build | [4](#4-hyperqwen-as-a-reference-point) |
+| How does it compare with HyperQwen? | decode is 1.2x to 1.3x faster than `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than `mtp-huge` at 32k to 190k; on short prompts 1.2x to 1.3x; prefill within about 10% | same day, same card, prompts and client; one pinned HyperQwen build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
 ## 1. Memory: how much context fits
@@ -141,7 +141,7 @@ Decode slows from 124 to 96 tok/s between 32k and 190k with the 4-bit cache and 
 
 ## 4. HyperQwen as a reference point
 
-This is a reference point, not a competition: [HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) is a general project for several models and GPUs, and it changes quickly.
+[HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) is a general project for several models and GPUs, and it changes quickly; this section compares one thing, single-stream decode of this model on this card.
 The numbers below describe **one build only**: its public image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`
 (OCI revision label `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04, tag `latest` at the time), run unmodified on the same card, power limit,
 checkpoint, client and prompts. A newer build may be faster or slower. Both projects were measured **on the same day, 2026-11-04**, one run per cell (ours: median of 3 for the short prompts), 350 W.

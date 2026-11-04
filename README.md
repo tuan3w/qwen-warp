@@ -2,13 +2,19 @@
 
 **Fast Qwen3.8-27B on one RTX 3090, with a 200k-token context.**
 
-I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt** and fits the model's full 262,144-token context in 24 GB.
-I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them.
-One GPU (RTX 3090), one request at a time, text only.
+I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt**, fits the model's full 262,144-token context in 24 GB,
+and on the same card, the same day and the same prompts it is **1.2x to 1.3x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s `mtp-long` and 1.9x to 3.6x faster than its `mtp-huge`** (single-stream decode; table below).
+I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
 
 ## Numbers
 
 Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, HyperQwen included, was measured on 2026-11-04 with the same prompts and client ([method](docs/PERFORMANCE.md#3-speed)).
+
+| Speedup: our decode tok/s divided by HyperQwen's | 32k | 64k | 100k | 130k | 190k |
+|---|---|---|---|---|---|
+| **qwen-warp `--profile long` vs HyperQwen `mtp-long`** | **1.17x** | **1.23x** | **1.34x** | **1.29x** | - |
+| qwen-warp `--profile long` vs HyperQwen `mtp-huge` (4/2-bit KV, the only HyperQwen preset that serves 190k) | 1.94x | 2.10x | 2.82x | 3.31x | 3.58x |
+
 
 | Decode, tokens/s, by prompt length | 32k | 64k | 100k | 130k | 190k | 262k |
 |---|---|---|---|---|---|---|
@@ -18,13 +24,14 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | *reference:* HyperQwen `mtp-long` | 106 | 97 | 86 | 83 | - | - |
 | *reference:* HyperQwen `mtp-huge` | 64 | 57 | 41 | 33 | 28 | - |
 
-`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608; HyperQwen `mtp-long` does not serve 190k). Against `mtp-long`, qwen-warp decodes 1.2x to 1.3x faster at 32k to 130k.
+`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608; HyperQwen `mtp-long` does not serve 190k).
 
 | Short prompts, tokens/s | code | prose | math |
 |---|---|---|---|
 | **qwen-warp** default (bf16 KV cache) | 172 | 110 | 172 |
 | **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
 | *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
+| **speedup**, qwen-warp 4-bit KV vs `mtp-long` | **1.27x** | **1.22x** | **1.21x** |
 
 | | |
 |---|---|
@@ -34,8 +41,8 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
 | Not measured | multi-turn agent task success, other GPUs, other power limits |
 
-HyperQwen rows are a reference point, not a competitor: another project, run unmodified on the same card, image
-`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04). A newer build may differ. It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so treat gaps under about 10% as noise.
+HyperQwen is a general serving project for several models and GPUs; this comparison covers one thing, single-stream decode of this model on this card. It ran unmodified, image
+`ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8` (revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04); a newer build may differ. It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so treat gaps under about 10% as noise.
 Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## How it gets there
