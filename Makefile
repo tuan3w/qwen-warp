@@ -16,3 +16,5 @@ test:
 	uv run tests/test_host_tables.py
 	uv run tests/test_server_smoke.py
 	uv run tests/test_server_smoke.py --profile long --port 8012
+	uv run tests/test_prefill_plan.py
+	uv run tests/test_server_seed.py

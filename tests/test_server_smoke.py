@@ -193,8 +193,7 @@ def main():
         t.check("3 concurrent requests == sequential results (FIFO, state isolation)", got == seq)
 
         # sampling
-        # (a repeated prompt resumes from its snapshot = the exact T=1 head step; a cold short prompt runs through the K10 batched path = same maths up to bf16 accumulation order,
-        # so a sampled continuation can differ between the two: compare cold with cold (an unrelated request in between replaces the lineage) and warm with warm)
+        # (the output of a seeded request does not depend on the cache: see tests/test_server_seed.py; here the plain round trip, cold/cold and warm/warm)
         def samp(seed):
             return chat(PROMPTS["prose"], temperature=0.8, top_p=0.95, seed=seed, max_tokens=48, extra_body=dict(top_k=20, **nothink)).choices[0].message.content
 
@@ -249,12 +248,10 @@ def main():
         chat("Unrelated question: what is 19*23?", max_tokens=8, extra_body=nothink)
         cold2 = chat(messages=convo, max_tokens=60, extra_body=nothink)
         t.check("multi-turn: cold re-prefill is deterministic (two cold runs, same ids)", cold.choices[0].token_ids == cold2.choices[0].token_ids)
-        # A resumed prefill and a full prefill do not accumulate in the same order, so a greedy answer may drift from the cold one at a near-tie token
-        # (seen in 3 of 12 documents x {speculative, plain} runs, at tokens 6 to 30 of ~35).  The invariant that does hold: the restored state is not broken,
-        # so the answers agree from the start.  A corrupt snapshot changes the first tokens.
+        # The prefill is cut by a plan that depends on the prompt only (Runner._plan), so a resumed prefill is bit-identical to a cold one and the greedy answers are equal.
         w, c = out_ids[2], cold.choices[0].token_ids
         first_diff = next((i for i in range(min(len(w), len(c))) if w[i] != c[i]), None)
-        t.check("multi-turn: warm turn 3 starts like the cold re-prefill answer (first >= 3 greedy ids equal)", first_diff is None or first_diff >= 3,
+        t.check("multi-turn: warm turn 3 == the cold re-prefill answer (same greedy ids)", w == c,
                 f"first difference at token {first_diff} of {len(w)}/{len(c)}" if first_diff is not None else f"identical, {len(w)} tokens")
         t.check("cold re-prefill reports cached_tokens == 0", (cold.usage.prompt_tokens_details.cached_tokens if cold.usage.prompt_tokens_details else 0) == 0)
     finally:
