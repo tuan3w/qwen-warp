@@ -45,6 +45,11 @@ __device__ __forceinline__ float ex2f(float x) {
   return y;
 }
 __device__ __forceinline__ float scale_of(uint32_t e) { return ex2f((float)((int)e - E_BIAS) * (1.f / E_RES)); }
+// Decoder-side debias gains (log2): the encoder's MSE-optimal reconstruction shrinks every group by <y, y^> / <y, y> (~0.9926 on Gaussian rows, simulated in notes.md), which shrinks
+// the attention logits (K) and the attention output (V).  Readers (split kernel, prefill gather) decode scale codes with these exponent offsets; the writer does NOT know them.
+constexpr float LOG2_KGAIN = 0.010779f;  // log2(1.0075) = log2(1 / 0.9926): shrink factor of the writer's quantiser measured on N(0,1) groups of 64 (notes.md); no eval text involved
+constexpr float LOG2_VGAIN = 0.010779f;
+__device__ __forceinline__ float scale_dec(uint32_t e, float log2gain) { return ex2f(fmaf((float)e, 1.f / E_RES, log2gain - (float)E_BIAS / E_RES)); }
 
 // in place y = H x / 16 over the 256 values held by a warp (x[i] = element lane + 32 i).  All 32 lanes must call.
 __device__ __forceinline__ void wht256(float (&x)[8], int lane) {
@@ -148,13 +153,13 @@ __device__ __forceinline__ void quant_store(const float (&y)[8], int lane, uint8
 }
 
 // dequantised rotated row (warp-wide, element lane + 32 i), from the code byte array and the meta word
-__device__ __forceinline__ void dequant_row(const uint8_t* __restrict__ codes, uint32_t meta, int lane, float (&y)[8]) {
+__device__ __forceinline__ void dequant_row(const uint8_t* __restrict__ codes, uint32_t meta, int lane, float log2gain, float (&y)[8]) {
   const int h = (lane >> 3) & 1;
 #pragma unroll
   for (int i = 0; i < 8; i++) {
     const uint32_t b = codes[16 * i + (lane >> 1)];
     const int n = (lane & 1) ? (int)(b >> 4) : (int)(b & 15u);
-    y[i] = scale_of((meta >> (8 * (2 * (i >> 2) + h))) & 255u) * level(n);
+    y[i] = scale_dec((meta >> (8 * (2 * (i >> 2) + h))) & 255u, log2gain) * level(n);
   }
 }
 

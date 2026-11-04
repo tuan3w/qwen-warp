@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <type_traits>
 
 namespace {
@@ -51,7 +52,28 @@ constexpr int S_MAX = SWIFTMK_ATTN_MAX_SPLITS;
 #ifndef ATTN_KS8
 #define ATTN_KS8 1
 #endif
+// int4 d-split verify kernel (attn_split_i4_kernel): teams of DS warps (DS = 2: d halves, DS = 4: d quarters) per key slice, VKS teams per block.
+// T = 2 (NT = 2), T = 3, 4 (NT = 3): d halves; T = 6 (NT = 5): d quarters.  T = 5, 7, 8 stay on the single-warp kernel (measured slower with 4 d-quarters: register-limited, notes.md).
+#ifndef ATTN_VDS2
+#define ATTN_VDS2 2
+#endif
+#ifndef ATTN_VKS2
+#define ATTN_VKS2 4
+#endif
+#ifndef ATTN_VDS3
+#define ATTN_VDS3 2
+#endif
+#ifndef ATTN_VKS3
+#define ATTN_VKS3 4
+#endif
+#ifndef ATTN_VDS6
+#define ATTN_VDS6 4
+#endif
+#ifndef ATTN_VKS6
+#define ATTN_VKS6 2
+#endif
 constexpr int CH_MIN = ATTN_CH_MIN;
+
 constexpr float LOG2E = 1.4426950408889634f;
 
 // ---- workspace layout (bytes)
@@ -322,8 +344,8 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     if constexpr (I4) {
 #pragma unroll
       for (int G = 0; G < 4; G++) {
-        ksc[0][G] = kvrot::scale_of((t.km[0] >> (8 * G)) & 255u); ksc[1][G] = kvrot::scale_of((t.km[1] >> (8 * G)) & 255u);
-        vsc[0][G] = kvrot::scale_of((t.vm[0] >> (8 * G)) & 255u); vsc[1][G] = kvrot::scale_of((t.vm[1] >> (8 * G)) & 255u);
+        ksc[0][G] = kvrot::scale_dec((t.km[0] >> (8 * G)) & 255u, kvrot::LOG2_KGAIN); ksc[1][G] = kvrot::scale_dec((t.km[1] >> (8 * G)) & 255u, kvrot::LOG2_KGAIN);
+        vsc[0][G] = kvrot::scale_dec((t.vm[0] >> (8 * G)) & 255u, kvrot::LOG2_VGAIN); vsc[1][G] = kvrot::scale_dec((t.vm[1] >> (8 * G)) & 255u, kvrot::LOG2_VGAIN);
       }
     }
     // ---- S^T = K Q^T
@@ -599,6 +621,373 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
 }
 
 // =====================================================================================================================
+// int4 multi-token (verify) split kernel: one warp pair per key slice handles ALL NT n-tiles.
+// The 2 warps of a team split the d axis (warp h: K chunks b = 2h, 2h+1 = scale groups 2h, 2h+1; V chunk c = h = instances 8h..8h+7), so every K / V nibble is
+// dequantised exactly once per tile (attn_split_kernel above dequantises each tile once per n-tile warp: NT times).  The partial scores of the two halves are exchanged
+// through shared memory (one team barrier per tile) and summed in the same order as the single-warp kernel: (g0 + g1) + (g2 + g3); the softmax state is kept redundantly
+// by both warps (identical values), the PV accumulators are not.  The merge and the partial layout are those of attn_split_kernel.
+// =====================================================================================================================
+template <int NT, int DS, int KS>
+__global__ void __launch_bounds__(32 * DS * KS, 1)
+    attn_split_i4_kernel(int T, const void* __restrict__ kv, int ctx_max, const int* __restrict__ pos0p, const uint16_t* __restrict__ qbuf, float2* __restrict__ ml,
+                         float* __restrict__ part) {
+  static_assert(DS == 2 || DS == 4, "d-split warps per team");
+  constexpr int NW = DS * KS;
+  constexpr int ROWB = HD / 2;  // 128 B of codes per token row
+  constexpr int NSTEP = 16;     // k16 steps over d
+  constexpr int NI = 16 / DS;   // PV mma instances per warp: DS = 2: chunk c = h, g = 0..7; DS = 4: chunk c = h >> 1, g = 4 (h & 1) + 0..3
+  constexpr int NBB = 4 / DS;   // K chunks (16 codes of a lane = 4 k16 steps each) per warp
+  constexpr int NSL = 4 * NBB;  // k16 steps per warp
+  constexpr int VW = DS == 2 ? 2 : 1;  // 32-bit words of a V chunk (16 codes = 2 words) this warp needs
+  constexpr int GVN = NI / 4;          // V scale groups of this warp
+  extern __shared__ __align__(16) float smem[];
+
+  const int pos0 = *pos0p;
+  const int ctx = max(pos0 + T - kvrot::RING_W, 0);
+  int nsplit, chunk;
+  split_params(ctx, nsplit, chunk);
+  const int s = blockIdx.x, kvh = blockIdx.y;
+  if (s >= nsplit) return;
+  const int kstart = s * chunk, kend = min(ctx, kstart + chunk);
+  const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane >> 2, j = lane & 3;
+  const int h = wid % DS, ks = wid / DS;
+  const int ncols = GRP * T;
+
+  const char* kbase = reinterpret_cast<const char*>(kv) + (size_t)(0 * NKV + kvh) * ctx_max * ROWB;
+  const char* vbase = reinterpret_cast<const char*>(kv) + (size_t)(1 * NKV + kvh) * ctx_max * ROWB;
+  const uint16_t* sinkb = reinterpret_cast<const uint16_t*>(reinterpret_cast<const char*>(kv) + kvrot::sink_off(ctx_max));
+  const uint32_t* kmeta = reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(kv) + (size_t)2 * NKV * ctx_max * ROWB) + (size_t)(0 * NKV + kvh) * ctx_max;
+  const uint32_t* vmeta = reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(kv) + (size_t)2 * NKV * ctx_max * ROWB) + (size_t)(1 * NKV + kvh) * ctx_max;
+  const int ntiles = (kend - kstart + 15) / 16;
+  struct Tile {
+    uint2 k[2][NBB];  // K rows r and r+8, chunks b = NBB h .. NBB h + NBB - 1 of lane j (16 codes = one k16 step each)
+    uint32_t v[4][VW];  // V key slots {2j, 2j+1, 2j+8, 2j+9}, the VW words of chunk c of lane r this warp needs
+    uint32_t km[2], vm[2];
+  };
+  // V chunk c = (h * NI) >> 3 of this warp (byte offset 64 c within the row slice of lane r) and, for DS = 4, its word (h & 1)
+  const int voff = r * 8 + (DS == 2 ? h * 64 : (h >> 1) * 64 + (h & 1) * 4);
+  auto issue = [&](Tile& t, int it) {
+    const int base = kstart + it * 16;
+    const int klast = kend - 1;
+    const char* k0 = kbase + (size_t)min(base + r, klast) * ROWB + j * 8 + h * (NBB * 32);
+    const char* k1 = kbase + (size_t)min(base + r + 8, klast) * ROWB + j * 8 + h * (NBB * 32);
+#pragma unroll
+    for (int bb = 0; bb < NBB; bb++) {
+      t.k[0][bb] = ld_kv8<NT>(k0 + bb * 32);
+      t.k[1][bb] = ld_kv8<NT>(k1 + bb * 32);
+    }
+    t.km[0] = __ldg(kmeta + min(base + r, klast)); t.km[1] = __ldg(kmeta + min(base + r + 8, klast));
+    t.vm[0] = __ldg(vmeta + min(base + r, klast)); t.vm[1] = __ldg(vmeta + min(base + r + 8, klast));
+#pragma unroll
+    for (int sl = 0; sl < 4; sl++) {
+      const int kk_ = base + 2 * j + (sl & 1) + (sl >> 1) * 8;
+      const char* vp = vbase + (size_t)min(kk_, klast) * ROWB + voff;
+      if constexpr (VW == 2) {
+        const uint2 w = ld_kv8<NT>(vp);
+        t.v[sl][0] = w.x; t.v[sl][1] = w.y;
+      } else {
+        uint32_t w;
+        asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(w) : "l"(vp));
+        t.v[sl][0] = w;
+      }
+    }
+  };
+
+  Tile ta, tb;
+  if (ks < ntiles) issue(ta, ks);
+
+  // ---- Q B-fragments of the NSL steps this warp consumes: qs[nt][sidx][lane], sidx = NSL h .. NSL h + NSL - 1 (same fragment layout as attn_split_kernel)
+  uint2* qs = reinterpret_cast<uint2*>(smem);
+  float* xs = smem + NT * NSTEP * 64;  // score exchange [KS][2 parity][DS][NT*4][32]
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++) {
+    const int c = nt * 8 + r;
+    const bool valid = c < ncols;
+    const int tq = valid ? c / GRP : 0, hq = valid ? c - tq * GRP : 0;
+    const uint16_t* qp = qbuf + ((size_t)tq * NH + kvh * GRP + hq) * HD;
+#pragma unroll
+    for (int sl = 0; sl < NSL; sl++) {
+      const int sidx = h * NSL + sl;
+      const int b = sidx >> 2, u = sidx & 3;
+      const uint16_t* qq = qp + b * 64 + j * 16 + 8 * (u >> 1) + 2 * (u & 1);
+      qs[(nt * NSTEP + sidx) * 32 + lane] = valid ? make_uint2((uint32_t)qq[0] | ((uint32_t)qq[4] << 16), (uint32_t)qq[1] | ((uint32_t)qq[5] << 16)) : make_uint2(0u, 0u);
+    }
+  }
+  __syncwarp();
+  int lim[NT][2];
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+    for (int e = 0; e < 2; e++) {
+      const int c = nt * 8 + 2 * j + e;
+      const int tc = min(c / GRP, T - 1);
+      lim[nt][e] = min(pos0 + tc, kend - 1);
+    }
+  const float scl = (1.f / 16.f) * LOG2E;
+  float acc[NT][NI][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+    for (int i = 0; i < NI; i++) acc[nt][i][0] = acc[nt][i][1] = acc[nt][i][2] = acc[nt][i][3] = 0.f;
+  float m_run[NT][2], l_run[NT][2];
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++) { m_run[nt][0] = m_run[nt][1] = -INFINITY; l_run[nt][0] = l_run[nt][1] = 0.f; }
+
+  auto compute = [&](const Tile& t, int it, int par) {
+    const int base = kstart + it * 16;
+    float ksc[2][2], vsc[2][GVN];  // [key row r / r+8][local scale group]: K groups 2 ((h NBB) >> 1) + gl (the 2 groups of this warp's K chunks), V groups GVN h + gl
+#pragma unroll
+    for (int row = 0; row < 2; row++) {
+#pragma unroll
+      for (int gl = 0; gl < 2; gl++) ksc[row][gl] = kvrot::scale_dec((t.km[row] >> (8 * (2 * ((h * NBB) >> 1) + gl))) & 255u, kvrot::LOG2_KGAIN);
+#pragma unroll
+      for (int gl = 0; gl < GVN; gl++) vsc[row][gl] = kvrot::scale_dec((t.vm[row] >> (8 * (h * GVN + gl))) & 255u, kvrot::LOG2_VGAIN);
+    }
+    // ---- S^T = K Q^T over this warp's half of d: K dequantised once, one mma per n-tile
+    float sg[NT][2][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+      for (int gl = 0; gl < 2; gl++) sg[nt][gl][0] = sg[nt][gl][1] = sg[nt][gl][2] = sg[nt][gl][3] = 0.f;
+#pragma unroll
+    for (int sl = 0; sl < NSL; sl++) {
+      const int bb = sl >> 2, u = sl & 3, sidx = h * NSL + sl;
+      const uint2 K0 = t.k[0][bb], K1 = t.k[1][bb];
+      const uint32_t w0 = (u >> 1) ? K0.y : K0.x, w1 = (u >> 1) ? K1.y : K1.x;
+      const uint32_t a0 = i4_pair(w0, 2 * (u & 1)), a2 = i4_pair(w0, 2 * (u & 1) + 1);
+      const uint32_t a1 = i4_pair(w1, 2 * (u & 1)), a3 = i4_pair(w1, 2 * (u & 1) + 1);
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) {
+        const uint2 q = qs[(nt * NSTEP + sidx) * 32 + lane];
+        mma_t<false, true>(sg[nt][u >> 1], a0, a1, a2, a3, q.x, q.y);
+      }
+    }
+    // ---- exchange the partial scores (scaled partial sums over this warp's K chunks) with the other warps of the team, then add them in a fixed order
+    float* xw = xs + ((size_t)((ks * 2 + par) * DS + h) * (NT * 4)) * 32 + lane;
+    const float* xr = xs + ((size_t)((ks * 2 + par) * DS) * (NT * 4)) * 32 + lane;
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const int row = i >> 1;
+        xw[(nt * 4 + i) * 32] = sg[nt][0][i] * ksc[row][0] + sg[nt][1][i] * ksc[row][1];
+      }
+    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + ks), "r"(DS * 32) : "memory");
+
+    const bool sink_tile = base == 0;  // tile 0 of split 0: keys 0..NSINK-1 use the exact fp16 sink rows instead of the 4-bit codes
+    uint32_t pbg[NT][GVN][2];
+    float pk[NT][kvrot::NSINK][2];
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      float sc[4];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float x[DS];
+#pragma unroll
+        for (int hh = 0; hh < DS; hh++) x[hh] = xr[(hh * (NT * 4) + nt * 4 + i) * 32];
+        if constexpr (DS == 2) sc[i] = (x[0] + x[1]) * scl;
+        else sc[i] = ((x[0] + x[1]) + (x[2] + x[3])) * scl;
+      }
+      if (sink_tile) {
+        // exact scores: lane (col = lane>>2, key = (lane&3) + 4m) computes q[col] . k_sink[key]; holder lanes (key r, columns 2j, 2j+1) fetch them by shuffle
+        float dv[kvrot::NSINK / 4];
+#pragma unroll
+        for (int m = 0; m < kvrot::NSINK / 4; m++) {
+          const int c = nt * 8 + (lane >> 2);
+          const int tq = c < ncols ? c / GRP : 0, hq = c < ncols ? c - tq * GRP : 0;
+          const uint4* qv = reinterpret_cast<const uint4*>(qbuf + ((size_t)tq * NH + kvh * GRP + hq) * HD);
+          const uint4* kvp_ = reinterpret_cast<const uint4*>(sinkb + ((size_t)(0 * NKV + kvh) * kvrot::NSINK + (lane & 3) + 4 * m) * HD);
+          float a = 0.f;
+#pragma unroll 4
+          for (int x8 = 0; x8 < HD / 8; x8++) {
+            const uint4 qq = qv[x8], kk8 = kvp_[x8];
+            const uint32_t qw[4] = {qq.x, qq.y, qq.z, qq.w}, kw[4] = {kk8.x, kk8.y, kk8.z, kk8.w};
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+              const float2 qf = __half22float2(*reinterpret_cast<const __half2*>(&qw[w])), kf = __half22float2(*reinterpret_cast<const __half2*>(&kw[w]));
+              a = fmaf(qf.x, kf.x, a);
+              a = fmaf(qf.y, kf.y, a);
+            }
+          }
+          dv[m] = a;
+        }
+        float ex[2];
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          ex[e] = 0.f;
+#pragma unroll
+          for (int m = 0; m < kvrot::NSINK / 4; m++) {
+            const float vsh = __shfl_sync(0xffffffffu, dv[m], (2 * j + e) * 4 + (r & 3));
+            if ((r >> 2) == m) ex[e] = vsh;
+          }
+        }
+        if (r < kvrot::NSINK) { sc[0] = ex[0] * scl; sc[1] = ex[1] * scl; }
+      }
+      const int kp_lo = base + r, kp_hi = base + r + 8;
+      if (kp_lo > lim[nt][0]) sc[0] = -INFINITY;
+      if (kp_lo > lim[nt][1]) sc[1] = -INFINITY;
+      if (kp_hi > lim[nt][0]) sc[2] = -INFINITY;
+      if (kp_hi > lim[nt][1]) sc[3] = -INFINITY;
+      float mx0 = fmaxf(sc[0], sc[2]), mx1 = fmaxf(sc[1], sc[3]);
+#pragma unroll
+      for (int o = 4; o < 32; o <<= 1) {
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o));
+      }
+      const float mn0 = fmaxf(m_run[nt][0], mx0), mn1 = fmaxf(m_run[nt][1], mx1);
+      const float off0 = (mn0 == -INFINITY) ? 0.f : mn0, off1 = (mn1 == -INFINITY) ? 0.f : mn1;
+      const float al0 = exp2f(m_run[nt][0] - off0), al1 = exp2f(m_run[nt][1] - off1);
+      m_run[nt][0] = mn0;
+      m_run[nt][1] = mn1;
+      const float p0 = exp2f(sc[0] - off0), p1 = exp2f(sc[1] - off1), p2 = exp2f(sc[2] - off0), p3 = exp2f(sc[3] - off1);
+      l_run[nt][0] = l_run[nt][0] * al0 + p0 + p2;
+      l_run[nt][1] = l_run[nt][1] * al1 + p1 + p3;
+      if (sink_tile) {  // exact probabilities of the sink keys (held by lanes 4k + j) go to the exact-V update below; the quantised mma sees p = 0 for them
+#pragma unroll
+        for (int k = 0; k < kvrot::NSINK; k++) {
+          pk[nt][k][0] = __shfl_sync(0xffffffffu, p0, 4 * k + j);
+          pk[nt][k][1] = __shfl_sync(0xffffffffu, p1, 4 * k + j);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < NI; i++) {
+        acc[nt][i][0] *= al0; acc[nt][i][1] *= al1; acc[nt][i][2] *= al0; acc[nt][i][3] *= al1;
+      }
+      // fold the per-key, per-group V scale into P: (p_k * scale_kG) multiplies the integer codes of the d rows of group G
+#pragma unroll
+      for (int gl = 0; gl < GVN; gl++) {
+        const bool zs = sink_tile && r < kvrot::NSINK;
+        pbg[nt][gl][0] = movmatrix_t(pack16(zs ? 0.f : p0 * vsc[0][gl], zs ? 0.f : p1 * vsc[0][gl], true));
+        pbg[nt][gl][1] = movmatrix_t(pack16(p2 * vsc[1][gl], p3 * vsc[1][gl], true));
+      }
+    }
+    // ---- O^T += V^T P^T : V dequantised once per instance g (global instance i = NI h + g: d rows 128 (i >> 3) + r*16 + 2 (i & 7), +1), one mma per n-tile
+#pragma unroll
+    for (int g = 0; g < NI; g++) {
+      const int widx = VW == 2 ? (g >> 2) : 0, n = (2 * g) & 7, nn = n & 3;  // compile-time: g is unrolled
+      const uint32_t sel = n < 4 ? 0x5410u : 0x7632u;
+      const uint32_t pab = __byte_perm(t.v[0][widx], t.v[1][widx], sel);
+      const uint32_t pcd = __byte_perm(t.v[2][widx], t.v[3][widx], sel);
+      const uint32_t a0 = i4_pair(pab, nn), a1 = i4_pair(pab, nn + 1), a2 = i4_pair(pcd, nn), a3 = i4_pair(pcd, nn + 1);
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) mma_t<false, true>(acc[nt][g], a0, a1, a2, a3, pbg[nt][g >> 2][0], pbg[nt][g >> 2][1]);  // g >> 2 = local V scale group (0 for NI = 4)
+    }
+    if (sink_tile) {  // acc[nt][g] holds d0 = 128 (i >> 3) + 16 r + 2 (i & 7) with i = NI h + g (elements 0/2: d0, d0+1 of column 2j; 1/3: column 2j+1)
+#pragma unroll
+      for (int g = 0; g < NI; g++) {
+        const int ig = NI * h + g;
+        const int d0 = (ig >> 3) * 128 + r * 16 + 2 * (ig & 7);
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+          float* a = acc[nt][g];
+#pragma unroll
+          for (int k = 0; k < kvrot::NSINK; k++) {
+            const __half2 vh = *reinterpret_cast<const __half2*>(sinkb + ((size_t)(1 * NKV + kvh) * kvrot::NSINK + k) * HD + d0);
+            const float2 vf = __half22float2(vh);
+            a[0] = fmaf(pk[nt][k][0], vf.x, a[0]);
+            a[1] = fmaf(pk[nt][k][1], vf.x, a[1]);
+            a[2] = fmaf(pk[nt][k][0], vf.y, a[2]);
+            a[3] = fmaf(pk[nt][k][1], vf.y, a[3]);
+          }
+        }
+      }
+    }
+  };
+
+  // ---- key loop: two tile buffers per warp, the next tile's loads are in flight while the current one is computed
+  if (ks < ntiles) {
+    int it = ks, par = 0;
+    while (it < ntiles) {
+      const int it1 = it + KS;
+      if (it1 < ntiles) issue(tb, it1);
+      compute(ta, it, par);
+      par ^= 1;
+      if (it1 >= ntiles) break;
+      const int it2 = it1 + KS;
+      if (it2 < ntiles) issue(ta, it2);
+      compute(tb, it1, par);
+      par ^= 1;
+      it = it2;
+    }
+  }
+
+  // ---- finish: complete l over the 8 key-row lanes, dump (m, l, acc) to smem, merge the KS teams of each n-tile
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+    for (int o = 4; o < 32; o <<= 1) {
+      l_run[nt][0] += __shfl_xor_sync(0xffffffffu, l_run[nt][0], o);
+      l_run[nt][1] += __shfl_xor_sync(0xffffffffu, l_run[nt][1], o);
+    }
+  __syncthreads();  // every warp is done with its Q fragments and the score exchange: the merge buffers alias them
+  // the warps of one d chunk c (128 d) dump and merge in round c, so the buffer holds one chunk: sacc [KS][NT][8][128]
+  float* sacc = smem;
+  float* sm_m = smem + (size_t)KS * NT * 8 * 128;  // [KS][NT][8]
+  float* sm_l = sm_m + KS * NT * 8;
+  if (h == 0 && r == 0) {
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      const int w = ks * NT + nt;
+      sm_m[w * 8 + 2 * j] = m_run[nt][0]; sm_m[w * 8 + 2 * j + 1] = m_run[nt][1];
+      sm_l[w * 8 + 2 * j] = l_run[nt][0]; sm_l[w * 8 + 2 * j + 1] = l_run[nt][1];
+    }
+  }
+  const int cw = (h * NI) >> 3;  // d chunk of this warp
+#pragma unroll
+  for (int rc = 0; rc < 2; rc++) {
+    if (cw == rc) {
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++) {
+        const int w = ks * NT + nt;
+#pragma unroll
+        for (int g = 0; g < NI; g++) {
+          const int d0 = r * 16 + 2 * ((NI * h + g) & 7);
+          const float* a = acc[nt][g];
+          *reinterpret_cast<float2*>(sacc + (size_t)(w * 8 + 2 * j) * 128 + d0) = make_float2(a[0], a[2]);
+          *reinterpret_cast<float2*>(sacc + (size_t)(w * 8 + 2 * j + 1) * 128 + d0) = make_float2(a[1], a[3]);
+        }
+      }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < NT * 8 * 128; e += NW * 32) {
+      const int dl = e & 127, col = e >> 7;
+      if (col >= ncols) continue;
+      const int nt_ = col >> 3, cc = col & 7;
+      float M = -INFINITY;
+#pragma unroll
+      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NT + nt_) * 8 + cc]);
+      float o = 0.f;
+      if (M != -INFINITY) {
+#pragma unroll
+        for (int k = 0; k < KS; k++) {
+          const int w = k * NT + nt_;
+          o += exp2f(sm_m[w * 8 + cc] - M) * sacc[(size_t)(w * 8 + cc) * 128 + dl];
+        }
+      }
+      part[(((size_t)kvh * S_MAX + s) * ncols + col) * HD + rc * 128 + dl] = o;
+    }
+    if (rc == 0) __syncthreads();  // the next round overwrites sacc
+  }
+  if (threadIdx.x < NT * 8) {
+    const int col = threadIdx.x, nt_ = col >> 3, cc = col & 7;
+    if (col < ncols) {
+      float M = -INFINITY;
+#pragma unroll
+      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NT + nt_) * 8 + cc]);
+      float L = 0.f;
+      if (M != -INFINITY) {
+#pragma unroll
+        for (int k = 0; k < KS; k++) {
+          const int w = k * NT + nt_;
+          L += exp2f(sm_m[w * 8 + cc] - M) * sm_l[w * 8 + cc];
+        }
+      }
+      ml[((size_t)kvh * S_MAX + s) * ncols + col] = make_float2(M, L);
+    }
+  }
+}
+
+// =====================================================================================================================
 // reduce partials, 1/l, v scale, sigmoid gate
 // =====================================================================================================================
 template <bool I4>
@@ -774,6 +1163,28 @@ cudaError_t launch_split(int T, const void* kv, int ctx_max, float k_scale, floa
   return cudaGetLastError();
 }
 
+template <int NT, int DS, int KS>
+cudaError_t launch_split_i4(int T, const void* kv, int ctx_max, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, cudaStream_t st) {
+  constexpr size_t merge_b = ((size_t)KS * NT * 8 * 128 + (size_t)KS * NT * 16) * sizeof(float);  // one d chunk of every team's partials + (m, l)
+  constexpr size_t loop_b = ((size_t)NT * 16 * 64 + (size_t)KS * 2 * DS * NT * 4 * 32) * sizeof(float);  // Q fragments + score exchange
+  constexpr size_t smem = merge_b > loop_b ? merge_b : loop_b;
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaError_t e = cudaFuncSetAttribute(attn_split_i4_kernel<NT, DS, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    if (e != cudaSuccess) return e;
+    attr_set = true;
+  }
+  attn_split_i4_kernel<NT, DS, KS><<<dim3(S_MAX, NKV), 32 * DS * KS, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part);
+  return cudaGetLastError();
+}
+// n-tile count NT >= 2: the int4 path uses the d-split kernel (teams of DSV warps, KSV teams per block), everything else the single-warp kernel (KSO key-parallel warps per n-tile)
+template <bool FP8, bool I4, int NT, int KSO, int DSV, int KSV>
+cudaError_t launch_multi(int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part,
+                         cudaStream_t st) {
+  if constexpr (I4) return launch_split_i4<NT, DSV, KSV>(T, kv, ctx_max, pos0, qbuf, ml, part, st);
+  else return launch_split<FP8, I4, NT, KSO>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st);
+}
+
 template <bool FP8, bool I4>
 cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, int ctx_max,
                 float k_scale, float v_scale, const int* pos0, void* out, void* ws, cudaStream_t st) {
@@ -788,11 +1199,11 @@ cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const v
   if (e != cudaSuccess) return e;
   switch (T) {
     case 1: e = launch_split<FP8, I4, 1, ATTN_KS1>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 2: e = launch_split<FP8, I4, 2, ATTN_KS2>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 2: e = launch_multi<FP8, I4, 2, ATTN_KS2, ATTN_VDS2, ATTN_VKS2>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
     case 3:
-    case 4: e = launch_split<FP8, I4, 3, ATTN_KS3>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 4: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VDS3, ATTN_VKS3>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
     case 5: e = launch_split<FP8, I4, 4, ATTN_KS5>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 6: e = launch_split<FP8, I4, 5, ATTN_KS6>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VDS6, ATTN_VKS6>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
     case 7: e = launch_split<FP8, I4, 6, ATTN_KS7>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
     default: e = launch_split<FP8, I4, 6, ATTN_KS8>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
   }
@@ -802,16 +1213,21 @@ cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const v
   return cudaGetLastError();
 }
 
+
 }  // namespace
 
 extern "C" {
 
 size_t swiftmk_attn_ws_bytes(void) { return WS_TOTAL; }
 
+
 // kv_dtype: 0 = bf16 (2 B/elem), 1 = fp8 (1 B/elem), 2 = int4: per token and head 128 B of codes + a 4 B meta word (4 x 8-bit log2 group scale, rotated rows, kvrot.cuh; 4.125 bit/elem).
 // Layout: codes [K|V][NKV][ctx_max][128] then meta u32 [K|V][NKV][ctx_max].
 size_t swiftmk_attn_kv_bytes(int ctx_max, int kv_dtype) {
-  if (kv_dtype == 2) return kvrot::ring_off(ctx_max) + kvrot::RING_BYTES;  // + fixed fp16 sink rows and exact recent-token ring
+  if (kv_dtype == 2) {
+    size_t b = kvrot::ring_off(ctx_max) + kvrot::RING_BYTES;  // + fixed fp16 sink rows and exact recent-token ring
+    return b;
+  }
   return (size_t)2 * NKV * (size_t)ctx_max * HD * (kv_dtype == 0 ? 2 : 1);
 }
 

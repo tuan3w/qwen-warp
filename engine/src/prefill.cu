@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(128) k_gather_kv_i4(const void* __restrict__ k
 #pragma unroll
       for (int i = 0; i < 8; i++) y[i] = __half2float(__ushort_as_half(sr[lane + 32 * i]));
     } else {
-      kvrot::dequant_row(codes, m, lane, y);
+      kvrot::dequant_row(codes, m, lane, isv ? kvrot::LOG2_VGAIN : kvrot::LOG2_KGAIN, y);
     }
     kvrot::wht256(y, lane);
     uint16_t* dst = (isv ? v_all : k_all) + (size_t)pk * HD;
