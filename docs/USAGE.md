@@ -90,7 +90,7 @@ Without sampling parameters the model's own defaults apply (T = 1, top_p 0.95, t
 | `chat_template_kwargs.enable_thinking`, `reasoning_effort` | thinking on/off, a prompt hint | [above](#thinking-and-reasoning-output) |
 
 **Order of application**, per generated token, on the logits of the output head: `allowed_token_ids`, `min_tokens`, `logit_bias`, `repetition_penalty`, `frequency_penalty` and `presence_penalty`,
-then temperature, `min_p`, `top_k`, `top_p`, then the draw. Greedy decoding with any of the first five is the argmax of the processed logits. This is the order and the semantics of vLLM 0.30's v1 sampler,
+then temperature, `min_p`, `top_k`, `top_p`, then the draw. Greedy decoding with any of the processors before the temperature is the argmax of the processed logits. This is the order and the semantics of vLLM 0.30's v1 sampler,
 checked against a torch reference (`tests/test_logit_procs.py`, `tests/test_proc_model.py`).
 
 | Not supported (HTTP 400, names the parameter) | Why it is hard here |

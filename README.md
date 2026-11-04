@@ -84,7 +84,7 @@ Check your install with `make test` (needs an RTX 3090 and the weights, and take
 
 `--profile long` means a 4-bit KV cache plus `--host-tables`, which keeps the 4.7 GiB embedding and head tables in pinned host memory (bit-identical decode) so the VRAM goes to
 the cache. The server measures the free GPU memory at start and refuses a `--max-model-len` that does not fit, before loading the weights, naming the largest lengths that do
-([memory and context](docs/USAGE.md#memory-and-context)); the numbers in this README were measured with a desktop holding 0.6 GiB of the card. Without `--prompt-lookup 0`, the 262,144 row
+([memory and context](docs/USAGE.md#memory-and-context)); the context numbers here were measured with a desktop holding 0.6 GiB of the card. Without `--prompt-lookup 0`, the 262,144 row
 also starts and serves (the tail then stays on and about 0.7 GiB more VRAM are in use). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file instead of typing flags (see [.env.example](.env.example)).
 Every flag: [docs/USAGE.md](docs/USAGE.md#server-flags).
 
@@ -151,7 +151,7 @@ A list of things we may try, not a roadmap: nothing is promised, scheduled or in
 | Why the 4-bit cache missed a needle at 100k | One miss in two experiments; cause unknown |
 | A better quantized model, if one appears | The W4 kernels assume uniform symmetric int4, group size 128 |
 | A non-uniform weight codebook | +2.8 points top-1 fidelity on Qwen3-4B, but on the 27B the extra weight bytes alone would slow the decode step by about 17% |
-| Multi-turn agentic task success per KV dtype | Not measured at all |
+| Multi-turn agentic task success per KV dtype | Agent tasks not measured; the tool-call rate of one small schema was |
 | Faster long prefill | About 960 tok/s at 262k |
 | Repeating the HyperQwen reference measurement | One pinned build, single runs |
 | Thinking budget (`thinking_token_budget`), `logprobs`, `bad_words`, structured output | HTTP 400 today; why each is hard here and a sketch for the first |
