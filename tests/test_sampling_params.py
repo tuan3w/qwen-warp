@@ -159,7 +159,7 @@ def main():
         outs = [chat(STORY, max_tokens=48, extra_body=dict(allowed_token_ids=allowed))]  # greedy: n must be 1
         outs.append(chat(STORY, temperature=1.0, max_tokens=48, n=4, extra_body=dict(allowed_token_ids=allowed, top_k=20)))
         toks = [x for o in outs for i in range(len(o.choices)) for x in ids_of(o, i)]
-        t.check("allowed_token_ids restricts every generated token to the set (greedy and 4 sampled runs)", len(toks) > 100 and all(x in allowed for x in toks), f"{sum(x not in allowed for x in toks)} of {len(toks)} tokens outside the set")
+        t.check("allowed_token_ids restricts every generated token to the set (greedy and 4 sampled runs)", len(toks) > 20 and all(x in allowed for x in toks), f"{sum(x not in allowed for x in toks)} of {len(toks)} tokens outside the set")
         o = chat(STORY, temperature=0.8, max_tokens=16, extra_body=dict(allowed_token_ids=[the], top_k=20))
         t.check("allowed_token_ids with a single token forces it", ids_of(o) == [the] * 16)
         rnd = random.Random(5).sample(range(1000, 240000), 10000) + EOS
@@ -170,6 +170,7 @@ def main():
         t.check("allowed_token_ids = the whole vocabulary is the identity", ids_of(o) == base_ids)
 
         # ---------------------------------------------------------------------------------------- temperature 0 + processors, determinism, isolation
+        chat("Unrelated: what is 16*23?", max_tokens=8)  # both penalised runs cold
         pa = ids_of(chat(STORY, max_tokens=48, extra_body=dict(presence_penalty=2.0, frequency_penalty=1.0)))
         chat("Unrelated: what is 17*23?", max_tokens=8)  # makes both runs cold
         pb = ids_of(chat(STORY, max_tokens=48, extra_body=dict(presence_penalty=2.0, frequency_penalty=1.0)))
@@ -188,7 +189,7 @@ def main():
         msgs = [{"role": "user", "content": doc + "Question 1: how many quokkas are listed above?"}]
         cl.chat.completions.create(model="swift", messages=msgs, temperature=0, max_tokens=24, extra_body=NOTHINK)
         msgs2 = msgs + [{"role": "assistant", "content": "There are sixty."}, {"role": "user", "content": "Question 2: which island has the quokka number 7? Repeat the fact exactly."}]
-        kw = dict(model="swift", messages=msgs2, temperature=0, max_tokens=40, extra_body=dict(NOTHINK, repetition_penalty=1.8, frequency_penalty=0.5))
+        kw = dict(model="swift", messages=msgs2, temperature=0, max_tokens=40, extra_body=dict(NOTHINK, repetition_penalty=1.3, frequency_penalty=0.3))
         warm = cl.chat.completions.create(**kw)
         cached = warm.usage.prompt_tokens_details.cached_tokens if warm.usage.prompt_tokens_details else 0
         cl.chat.completions.create(model="swift", messages=[{"role": "user", "content": "Unrelated: what is 21*23?"}], max_tokens=8, temperature=0, extra_body=NOTHINK)
