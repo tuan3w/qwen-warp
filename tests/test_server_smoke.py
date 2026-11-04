@@ -134,10 +134,7 @@ def main():
             ids = ch.model_extra.get("token_ids") if ch.model_extra else None
             pids = (out.model_extra or {}).get("prompt_token_ids") or (ch.model_extra or {}).get("prompt_token_ids")
             fd = next((i for i, (x, y) in enumerate(zip(ids or [], r["gen_ids"])) if x != y), None)
-            # the long-document request is served with other verify widths (prompt-lookup tail rows) than the reference's k = 3 cycles, so a near-tie can flip a greedy id late in the answer: it is
-            # measured to depend only on the prompt text, not on the engine (a663935 diverges at index 29 / 49 on two different documents).  Short prompts must match exactly; this one up to 16 ids.
-            same = ids == r["gen_ids"] or (name == "long" and ids and fd is not None and fd >= 16)
-            t.check(f"greedy chat == direct engine ids [{name}]", same and pids == r["prompt_ids"], f"{len(ids or [])}/{len(r['gen_ids'])} ids, first difference at index {fd}, prompt ids equal {pids == r['prompt_ids']}")
+            t.check(f"greedy chat == direct engine ids [{name}]", ids == r["gen_ids"] and pids == r["prompt_ids"], f"{len(ids or [])}/{len(r['gen_ids'])} ids, first difference at index {fd}, prompt ids equal {pids == r['prompt_ids']}")
         base_out = chat(PROMPTS["code"], extra_body=nothink)
         base_text = base_out.choices[0].message.content
 
