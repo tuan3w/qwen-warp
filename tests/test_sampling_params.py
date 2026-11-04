@@ -107,13 +107,16 @@ def main():
 
         # ---------------------------------------------------------------------------------------- presence / frequency: repetition on a looping prompt, n = 8 runs each
         runs = {}
-        for label, kw in (("none", {}), ("presence 1.0", dict(presence_penalty=1.0)), ("frequency 1.0", dict(frequency_penalty=1.0)), ("presence -1.0", dict(presence_penalty=-1.0))):
+        for label, kw in (("none", {}), ("presence 1.0", dict(presence_penalty=1.0)), ("frequency 1.0", dict(frequency_penalty=1.0)), ("presence -1.0", dict(presence_penalty=-1.0)), ("none again", {})):
             o = comp(LOOP, temperature=0.7, max_tokens=96, n=8, extra_body=dict(ignore_eos=True), **kw)
             runs[label] = [distinct(ids_of(o, i)) for i in range(8)]
         mean = {k: sum(v) / len(v) for k, v in runs.items()}
         for label in ("presence 1.0", "frequency 1.0"):
             t.check(f"{label.split()[0]}_penalty reduces repetition (distinct-token ratio of 8 runs: mean +0.1, at least 6 runs above the unpenalised mean)", mean[label] >= mean["none"] + 0.1 and sum(x > mean["none"] for x in runs[label]) >= 6,
                     f"none {mean['none']:.3f}, {label} {mean[label]:.3f} (min {min(runs[label]):.3f})")
+        # negative control: a second batch WITHOUT the penalty must not pass the criterion that the penalised batches pass (the margin 0.1 is > 1.5 sd of the batch-to-batch spread of the unpenalised mean, measured 0.29 .. 0.43 over 5 batches)
+        t.check("negative control: a second unpenalised batch does not satisfy the 'reduces repetition' criterion", not (mean["none again"] >= mean["none"] + 0.1 and sum(x > mean["none"] for x in runs["none again"]) >= 6),
+                f"none {mean['none']:.3f}, none again {mean['none again']:.3f}")
         t.check("negative presence_penalty increases repetition (mean distinct ratio below 0.9 x the unpenalised runs)", mean["presence -1.0"] < 0.9 * mean["none"], f"{mean['presence -1.0']:.3f} vs {mean['none']:.3f}")
 
         # ---------------------------------------------------------------------------------------- repetition_penalty on the prompt
