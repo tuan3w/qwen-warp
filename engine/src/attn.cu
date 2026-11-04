@@ -52,25 +52,31 @@ constexpr int S_MAX = SWIFTMK_ATTN_MAX_SPLITS;
 #ifndef ATTN_KS8
 #define ATTN_KS8 1
 #endif
-// int4 d-split verify kernel (attn_split_i4_kernel): teams of DS warps (DS = 2: d halves, DS = 4: d quarters) per key slice, VKS teams per block.
-// T = 2 (NT = 2), T = 3, 4 (NT = 3): d halves; T = 6 (NT = 5): d quarters.  T = 5, 7, 8 stay on the single-warp kernel (measured slower with 4 d-quarters: register-limited, notes.md).
-#ifndef ATTN_VDS2
-#define ATTN_VDS2 2
+// int4 d-split kernel (attn_split_i4_kernel), one config per T: ATTN_VCT = NTG, NG, DS, KS = n-tiles per group, n-tile groups, warps per team (d split), teams per group (key slices).
+// A block has NG * KS * DS warps; each K / V tile is dequantised NG times (the single-warp kernel: NT times).  NG = 0: the single-warp kernel (ATTN_KS<T> warps per n-tile).
+#ifndef ATTN_VC1
+#define ATTN_VC1 1, 0, 2, 4
 #endif
-#ifndef ATTN_VKS2
-#define ATTN_VKS2 4
+#ifndef ATTN_VC2
+#define ATTN_VC2 2, 1, 2, 4
 #endif
-#ifndef ATTN_VDS3
-#define ATTN_VDS3 2
+#ifndef ATTN_VC3
+#define ATTN_VC3 3, 1, 2, 4
 #endif
-#ifndef ATTN_VKS3
-#define ATTN_VKS3 4
+#ifndef ATTN_VC4
+#define ATTN_VC4 3, 1, 2, 4
 #endif
-#ifndef ATTN_VDS6
-#define ATTN_VDS6 4
+#ifndef ATTN_VC5
+#define ATTN_VC5 2, 2, 2, 2
 #endif
-#ifndef ATTN_VKS6
-#define ATTN_VKS6 2
+#ifndef ATTN_VC6
+#define ATTN_VC6 3, 2, 2, 2
+#endif
+#ifndef ATTN_VC7
+#define ATTN_VC7 3, 2, 2, 2
+#endif
+#ifndef ATTN_VC8
+#define ATTN_VC8 3, 2, 2, 2
 #endif
 constexpr int CH_MIN = ATTN_CH_MIN;
 
@@ -627,12 +633,15 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
 // through shared memory (one team barrier per tile) and summed in the same order as the single-warp kernel: (g0 + g1) + (g2 + g3); the softmax state is kept redundantly
 // by both warps (identical values), the PV accumulators are not.  The merge and the partial layout are those of attn_split_kernel.
 // =====================================================================================================================
-template <int NT, int DS, int KS>
-__global__ void __launch_bounds__(32 * DS * KS, 1)
+template <int NTG, int NG, int DS, int KS>
+__global__ void __launch_bounds__(32 * DS * KS * NG, 1)
     attn_split_i4_kernel(int T, const void* __restrict__ kv, int ctx_max, const int* __restrict__ pos0p, const uint16_t* __restrict__ qbuf, float2* __restrict__ ml,
                          float* __restrict__ part) {
   static_assert(DS == 2 || DS == 4, "d-split warps per team");
-  constexpr int NW = DS * KS;
+  static_assert(KS * NG <= 15, "named barriers: one per team");
+  constexpr int NT = NTG;       // n-tiles per warp (the group's)
+  constexpr int NTT = NTG * NG;  // n-tiles of the block (>= ceil(6 T / 8); surplus tiles are all-invalid columns)
+  constexpr int NW = DS * KS * NG;
   constexpr int ROWB = HD / 2;  // 128 B of codes per token row
   constexpr int NSTEP = 16;     // k16 steps over d
   constexpr int NI = 16 / DS;   // PV mma instances per warp: DS = 2: chunk c = h, g = 0..7; DS = 4: chunk c = h >> 1, g = 4 (h & 1) + 0..3
@@ -650,7 +659,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
   if (s >= nsplit) return;
   const int kstart = s * chunk, kend = min(ctx, kstart + chunk);
   const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane >> 2, j = lane & 3;
-  const int h = wid % DS, ks = wid / DS;
+  const int h = wid % DS, team = wid / DS, ks = team % KS, gi = team / KS, nt0 = gi * NTG;  // n-tile group gi: global n-tiles nt0 .. nt0 + NTG - 1
   const int ncols = GRP * T;
 
   const char* kbase = reinterpret_cast<const char*>(kv) + (size_t)(0 * NKV + kvh) * ctx_max * ROWB;
@@ -673,8 +682,8 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
     const char* k1 = kbase + (size_t)min(base + r + 8, klast) * ROWB + j * 8 + h * (NBB * 32);
 #pragma unroll
     for (int bb = 0; bb < NBB; bb++) {
-      t.k[0][bb] = ld_kv8<NT>(k0 + bb * 32);
-      t.k[1][bb] = ld_kv8<NT>(k1 + bb * 32);
+      t.k[0][bb] = ld_kv8<NTT>(k0 + bb * 32);
+      t.k[1][bb] = ld_kv8<NTT>(k1 + bb * 32);
     }
     t.km[0] = __ldg(kmeta + min(base + r, klast)); t.km[1] = __ldg(kmeta + min(base + r + 8, klast));
     t.vm[0] = __ldg(vmeta + min(base + r, klast)); t.vm[1] = __ldg(vmeta + min(base + r + 8, klast));
@@ -683,7 +692,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
       const int kk_ = base + 2 * j + (sl & 1) + (sl >> 1) * 8;
       const char* vp = vbase + (size_t)min(kk_, klast) * ROWB + voff;
       if constexpr (VW == 2) {
-        const uint2 w = ld_kv8<NT>(vp);
+        const uint2 w = ld_kv8<NTT>(vp);
         t.v[sl][0] = w.x; t.v[sl][1] = w.y;
       } else {
         uint32_t w;
@@ -698,10 +707,10 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
 
   // ---- Q B-fragments of the NSL steps this warp consumes: qs[nt][sidx][lane], sidx = NSL h .. NSL h + NSL - 1 (same fragment layout as attn_split_kernel)
   uint2* qs = reinterpret_cast<uint2*>(smem);
-  float* xs = smem + NT * NSTEP * 64;  // score exchange [KS][2 parity][DS][NT*4][32]
+  float* xs = smem + NTT * NSTEP * 64;  // score exchange [KS NG teams][2 parity][DS][NT*4][32]
 #pragma unroll
   for (int nt = 0; nt < NT; nt++) {
-    const int c = nt * 8 + r;
+    const int c = (nt0 + nt) * 8 + r;
     const bool valid = c < ncols;
     const int tq = valid ? c / GRP : 0, hq = valid ? c - tq * GRP : 0;
     const uint16_t* qp = qbuf + ((size_t)tq * NH + kvh * GRP + hq) * HD;
@@ -710,7 +719,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
       const int sidx = h * NSL + sl;
       const int b = sidx >> 2, u = sidx & 3;
       const uint16_t* qq = qp + b * 64 + j * 16 + 8 * (u >> 1) + 2 * (u & 1);
-      qs[(nt * NSTEP + sidx) * 32 + lane] = valid ? make_uint2((uint32_t)qq[0] | ((uint32_t)qq[4] << 16), (uint32_t)qq[1] | ((uint32_t)qq[5] << 16)) : make_uint2(0u, 0u);
+      qs[((nt0 + nt) * NSTEP + sidx) * 32 + lane] = valid ? make_uint2((uint32_t)qq[0] | ((uint32_t)qq[4] << 16), (uint32_t)qq[1] | ((uint32_t)qq[5] << 16)) : make_uint2(0u, 0u);
     }
   }
   __syncwarp();
@@ -719,7 +728,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
   for (int nt = 0; nt < NT; nt++)
 #pragma unroll
     for (int e = 0; e < 2; e++) {
-      const int c = nt * 8 + 2 * j + e;
+      const int c = (nt0 + nt) * 8 + 2 * j + e;
       const int tc = min(c / GRP, T - 1);
       lim[nt][e] = min(pos0 + tc, kend - 1);
     }
@@ -758,13 +767,13 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
       const uint32_t a1 = i4_pair(w1, 2 * (u & 1)), a3 = i4_pair(w1, 2 * (u & 1) + 1);
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
-        const uint2 q = qs[(nt * NSTEP + sidx) * 32 + lane];
+        const uint2 q = qs[((nt0 + nt) * NSTEP + sidx) * 32 + lane];
         mma_t<false, true>(sg[nt][u >> 1], a0, a1, a2, a3, q.x, q.y);
       }
     }
     // ---- exchange the partial scores (scaled partial sums over this warp's K chunks) with the other warps of the team, then add them in a fixed order
-    float* xw = xs + ((size_t)((ks * 2 + par) * DS + h) * (NT * 4)) * 32 + lane;
-    const float* xr = xs + ((size_t)((ks * 2 + par) * DS) * (NT * 4)) * 32 + lane;
+    float* xw = xs + ((size_t)((team * 2 + par) * DS + h) * (NT * 4)) * 32 + lane;
+    const float* xr = xs + ((size_t)((team * 2 + par) * DS) * (NT * 4)) * 32 + lane;
 #pragma unroll
     for (int nt = 0; nt < NT; nt++)
 #pragma unroll
@@ -772,7 +781,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
         const int row = i >> 1;
         xw[(nt * 4 + i) * 32] = sg[nt][0][i] * ksc[row][0] + sg[nt][1][i] * ksc[row][1];
       }
-    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + ks), "r"(DS * 32) : "memory");
+    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + team), "r"(DS * 32) : "memory");
 
     const bool sink_tile = base == 0;  // tile 0 of split 0: keys 0..NSINK-1 use the exact fp16 sink rows instead of the 4-bit codes
     uint32_t pbg[NT][GVN][2];
@@ -793,7 +802,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
         float dv[kvrot::NSINK / 4];
 #pragma unroll
         for (int m = 0; m < kvrot::NSINK / 4; m++) {
-          const int c = nt * 8 + (lane >> 2);
+          const int c = (nt0 + nt) * 8 + (lane >> 2);
           const int tq = c < ncols ? c / GRP : 0, hq = c < ncols ? c - tq * GRP : 0;
           const uint4* qv = reinterpret_cast<const uint4*>(qbuf + ((size_t)tq * NH + kvh * GRP + hq) * HD);
           const uint4* kvp_ = reinterpret_cast<const uint4*>(sinkb + ((size_t)(0 * NKV + kvh) * kvrot::NSINK + (lane & 3) + 4 * m) * HD);
@@ -922,12 +931,12 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
   __syncthreads();  // every warp is done with its Q fragments and the score exchange: the merge buffers alias them
   // the warps of one d chunk c (128 d) dump and merge in round c, so the buffer holds one chunk: sacc [KS][NT][8][128]
   float* sacc = smem;
-  float* sm_m = smem + (size_t)KS * NT * 8 * 128;  // [KS][NT][8]
-  float* sm_l = sm_m + KS * NT * 8;
+  float* sm_m = smem + (size_t)KS * NTT * 8 * 128;  // [KS][NTT][8]
+  float* sm_l = sm_m + KS * NTT * 8;
   if (h == 0 && r == 0) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const int w = ks * NT + nt;
+      const int w = ks * NTT + nt0 + nt;
       sm_m[w * 8 + 2 * j] = m_run[nt][0]; sm_m[w * 8 + 2 * j + 1] = m_run[nt][1];
       sm_l[w * 8 + 2 * j] = l_run[nt][0]; sm_l[w * 8 + 2 * j + 1] = l_run[nt][1];
     }
@@ -938,7 +947,7 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
     if (cw == rc) {
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
-        const int w = ks * NT + nt;
+        const int w = ks * NTT + nt0 + nt;
 #pragma unroll
         for (int g = 0; g < NI; g++) {
           const int d0 = r * 16 + 2 * ((NI * h + g) & 7);
@@ -949,18 +958,18 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
       }
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < NT * 8 * 128; e += NW * 32) {
+    for (int e = threadIdx.x; e < NTT * 8 * 128; e += NW * 32) {
       const int dl = e & 127, col = e >> 7;
       if (col >= ncols) continue;
       const int nt_ = col >> 3, cc = col & 7;
       float M = -INFINITY;
 #pragma unroll
-      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NT + nt_) * 8 + cc]);
+      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NTT + nt_) * 8 + cc]);
       float o = 0.f;
       if (M != -INFINITY) {
 #pragma unroll
         for (int k = 0; k < KS; k++) {
-          const int w = k * NT + nt_;
+          const int w = k * NTT + nt_;
           o += exp2f(sm_m[w * 8 + cc] - M) * sacc[(size_t)(w * 8 + cc) * 128 + dl];
         }
       }
@@ -968,17 +977,17 @@ __global__ void __launch_bounds__(32 * DS * KS, 1)
     }
     if (rc == 0) __syncthreads();  // the next round overwrites sacc
   }
-  if (threadIdx.x < NT * 8) {
+  if (threadIdx.x < NTT * 8) {
     const int col = threadIdx.x, nt_ = col >> 3, cc = col & 7;
     if (col < ncols) {
       float M = -INFINITY;
 #pragma unroll
-      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NT + nt_) * 8 + cc]);
+      for (int k = 0; k < KS; k++) M = fmaxf(M, sm_m[(k * NTT + nt_) * 8 + cc]);
       float L = 0.f;
       if (M != -INFINITY) {
 #pragma unroll
         for (int k = 0; k < KS; k++) {
-          const int w = k * NT + nt_;
+          const int w = k * NTT + nt_;
           L += exp2f(sm_m[w * 8 + cc] - M) * sm_l[w * 8 + cc];
         }
       }
@@ -1163,26 +1172,29 @@ cudaError_t launch_split(int T, const void* kv, int ctx_max, float k_scale, floa
   return cudaGetLastError();
 }
 
-template <int NT, int DS, int KS>
+template <int NTG, int NG, int DS, int KS>
 cudaError_t launch_split_i4(int T, const void* kv, int ctx_max, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, cudaStream_t st) {
-  constexpr size_t merge_b = ((size_t)KS * NT * 8 * 128 + (size_t)KS * NT * 16) * sizeof(float);  // one d chunk of every team's partials + (m, l)
-  constexpr size_t loop_b = ((size_t)NT * 16 * 64 + (size_t)KS * 2 * DS * NT * 4 * 32) * sizeof(float);  // Q fragments + score exchange
+  constexpr int NTT = NTG * NG;
+  constexpr size_t merge_b = ((size_t)KS * NTT * 8 * 128 + (size_t)KS * NTT * 16) * sizeof(float);  // one d chunk of every team's partials + (m, l)
+  constexpr size_t loop_b = ((size_t)NTT * 16 * 64 + (size_t)KS * NG * 2 * DS * NTG * 4 * 32) * sizeof(float);  // Q fragments + score exchange
   constexpr size_t smem = merge_b > loop_b ? merge_b : loop_b;
   static bool attr_set = false;
   if (!attr_set) {
-    cudaError_t e = cudaFuncSetAttribute(attn_split_i4_kernel<NT, DS, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    cudaError_t e = cudaFuncSetAttribute(attn_split_i4_kernel<NTG, NG, DS, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
-  attn_split_i4_kernel<NT, DS, KS><<<dim3(S_MAX, NKV), 32 * DS * KS, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part);
+  attn_split_i4_kernel<NTG, NG, DS, KS><<<dim3(S_MAX, NKV), 32 * DS * KS * NG, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part);
   return cudaGetLastError();
 }
-// n-tile count NT >= 2: the int4 path uses the d-split kernel (teams of DSV warps, KSV teams per block), everything else the single-warp kernel (KSO key-parallel warps per n-tile)
-template <bool FP8, bool I4, int NT, int KSO, int DSV, int KSV>
+// int4: the d-split kernel with n-tile groups of NTG tiles (NG = 0: the single-warp kernel with NT n-tiles and KSO key-parallel warps per n-tile); everything else: the single-warp kernel
+template <bool FP8, bool I4, int NT, int KSO, int NTG, int NG, int DSV, int KSV>
 cudaError_t launch_multi(int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part,
                          cudaStream_t st) {
-  if constexpr (I4) return launch_split_i4<NT, DSV, KSV>(T, kv, ctx_max, pos0, qbuf, ml, part, st);
-  else return launch_split<FP8, I4, NT, KSO>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st);
+  if constexpr (I4 && NG > 0) {
+    static_assert(NTG * NG >= NT, "n-tile groups must cover ceil(6 T / 8) n-tiles");
+    return launch_split_i4<NTG, NG, DSV, KSV>(T, kv, ctx_max, pos0, qbuf, ml, part, st);
+  } else return launch_split<FP8, I4, NT, KSO>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st);
 }
 
 template <bool FP8, bool I4>
@@ -1198,14 +1210,14 @@ cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const v
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return e;
   switch (T) {
-    case 1: e = launch_split<FP8, I4, 1, ATTN_KS1>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 2: e = launch_multi<FP8, I4, 2, ATTN_KS2, ATTN_VDS2, ATTN_VKS2>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 3:
-    case 4: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VDS3, ATTN_VKS3>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 5: e = launch_split<FP8, I4, 4, ATTN_KS5>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VDS6, ATTN_VKS6>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 7: e = launch_split<FP8, I4, 6, ATTN_KS7>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    default: e = launch_split<FP8, I4, 6, ATTN_KS8>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 1: e = launch_multi<FP8, I4, 1, ATTN_KS1, ATTN_VC1>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 2: e = launch_multi<FP8, I4, 2, ATTN_KS2, ATTN_VC2>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 3: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC3>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 4: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC4>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 5: e = launch_multi<FP8, I4, 4, ATTN_KS5, ATTN_VC5>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VC6>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 7: e = launch_multi<FP8, I4, 6, ATTN_KS7, ATTN_VC7>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    default: e = launch_multi<FP8, I4, 6, ATTN_KS8, ATTN_VC8>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
   }
   if (e != cudaSuccess) return e;
   attn_reduce_kernel<I4><<<dim3(GRP * T, NKV), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,
