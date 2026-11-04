@@ -68,6 +68,7 @@ class Snap:
     pos: int
     dn: torch.Tensor
     conv: torch.Tensor
+    aux: object = None  # engine-specific extra cache state saved with the snapshot (e.g. an exact recent-token ring); None for engines that have none
 
 
 @dataclass
@@ -99,7 +100,7 @@ class Runner:
         self.lineage = None  # np.int32 array: tokens whose main KV is valid in the device caches (see module docstring)
         self.snaps: list[Snap] = []
         # all snapshot buffers are allocated up front (cudaHostAlloc of 151 MB costs ~20 ms): len(snaps) + len(pool) == max_snaps
-        self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory()) for _ in range(max_snaps)]
+        self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory(), self.e.kv_aux_new() if hasattr(self.e, "kv_aux_new") else None) for _ in range(max_snaps)]
         self.last = Stats()
         self._procs_on = False
         if warmup:
@@ -139,6 +140,8 @@ class Runner:
         s.pos = i
         s.dn.copy_(self.fp.dn_state[:, cur])
         s.conv.copy_(self.fp.dn_conv[:, cur])
+        if s.aux is not None:
+            self.e.kv_aux_save(s.aux)
         self.snaps.append(s)
 
     def _restore(self, s):
@@ -146,6 +149,8 @@ class Runner:
         cur = self._cur()
         fp.dn_state[:, cur].copy_(s.dn)
         fp.dn_conv[:, cur].copy_(s.conv)
+        if s.aux is not None:
+            e.kv_aux_restore(s.aux)
         fp.ds[19] = 0  # DS_PEND (engine_impl.h): the restored state replaces what the lazy DeltaNet ring still held pending from the previous request (the prefill's materialize would replay it on top)
         fp.ds[0] = s.pos
         e.pos = s.pos

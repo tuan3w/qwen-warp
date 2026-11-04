@@ -14,6 +14,7 @@
 //  * fp8 KV is dequantised bit-exactly to fp16 with integer ops (value/256, no cvt instruction on sm_86): the factor 256 and the checkpoint scale
 //    are folded into the score scale / the final output scale.  fp8 path computes in fp16 (q, p fp16), bf16 path in bf16.
 #include "attn.h"
+#include "kvrot.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -56,13 +57,13 @@ constexpr float LOG2E = 1.4426950408889634f;
 // ---- workspace layout (bytes)
 constexpr size_t WS_Q = 0;                                                  // u16 [TMAX][NH][HD]
 constexpr int NCOLS_MAX = GRP * TMAX;                                       // 6 q heads x T rows per kv head
-constexpr size_t WS_QSUM = WS_Q + (size_t)TMAX * NH * HD * 2;              // float [TMAX][NH]: sum of the fp16 q (int4 K epilogue)
-constexpr size_t WS_ML = WS_QSUM + (size_t)TMAX * NH * sizeof(float);      // float2 [NKV][S_MAX][6T]
+constexpr size_t WS_ML = WS_Q + (size_t)TMAX * NH * HD * 2;                // float2 [NKV][S_MAX][6T]
 constexpr size_t WS_PART = WS_ML + (size_t)NKV * S_MAX * NCOLS_MAX * sizeof(float2);  // float [NKV][S_MAX][6T][HD]
 constexpr size_t WS_TOTAL = WS_PART + (size_t)NKV * S_MAX * NCOLS_MAX * HD * sizeof(float);
 
 // Live split geometry from the context length (identical in split and reduce).
 __host__ __device__ __forceinline__ void split_params(int ctx, int& nsplit, int& chunk) {
+  ctx = ctx < 1 ? 1 : ctx;
   int n = (ctx + CH_MIN - 1) / CH_MIN;
   n = n < 1 ? 1 : (n > S_MAX ? S_MAX : n);
   chunk = (((ctx + n - 1) / n) + 15) & ~15;
@@ -81,23 +82,11 @@ __device__ __constant__ double c_inv_freq[32] = {
 // =====================================================================================================================
 // prep: q/k norm + rope, KV write, q to workspace
 // =====================================================================================================================
-// warp-wide min / max over the 32 lanes (the int4 writer's per-row min and scale)
-__device__ __forceinline__ float wmin32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-__device__ __forceinline__ float wmax32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
 template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, const __nv_bfloat16* __restrict__ kk,
                                                         const __nv_bfloat16* __restrict__ vv, const __nv_bfloat16* __restrict__ q_norm,
                                                         const __nv_bfloat16* __restrict__ k_norm, void* kv, int ctx_max, float k_scale,
-                                                        float v_scale, const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf, float* __restrict__ qsum) {
+                                                        float v_scale, const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf) {
   const int lane = threadIdx.x & 31;
   const int gw = blockIdx.x * 4 + (threadIdx.x >> 5);
   const int t = gw >> 5, h = gw & 31;
@@ -133,18 +122,11 @@ __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat
     x[0] = a * cs - b * sn;
     x[1] = b * cs + a * sn;
   }
+  if constexpr (I4) kvrot::wht256(x, lane);  // rotated int4 format (kvrot.cuh): q, k, v rows all live in the rotated basis, scores are unchanged
   if (h < NH) {
     uint16_t* dst = qbuf + ((size_t)t * NH + h) * HD;
 #pragma unroll
     for (int i = 0; i < 8; i++) dst[lane + 32 * i] = (FP8 || I4) ? __half_as_ushort(__float2half_rn(x[i])) : __bfloat16_as_ushort(__float2bfloat16_rn(x[i]));
-    if constexpr (I4) {  // sum of the fp16-rounded q: the int4 K score is s_k * (q . code) + min_k * sum(q)
-      float qs_ = 0.f;
-#pragma unroll
-      for (int i = 0; i < 8; i++) qs_ += __half2float(__float2half_rn(x[i]));
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) qs_ += __shfl_xor_sync(0xffffffffu, qs_, o);
-      if (lane == 0) qsum[t * NH + h] = qs_;
-    }
   } else {
     const int isv = h >= NH + NKV;
     const int kvh = isv ? h - NH - NKV : h - NH;
@@ -155,27 +137,12 @@ __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat
 #pragma unroll
       for (int i = 0; i < 8; i++) dst[lane + 32 * i] = (uint8_t)__nv_cvt_float_to_fp8(x[i] * is, __NV_SATFINITE, __NV_E4M3);
     } else if (I4) {
-      // per token and head, asymmetric 4-bit: x ~ code*s + lo, code 0..15 (s, lo rounded to fp16 first so encoder and decoder agree).  2 codes/byte, natural d
-      // order (low nibble = even d).  A lane owns d = lane + 32*i (fixed parity), so even/odd lanes share a byte: the even lane pulls the odd lane's code via
-      // xor-1 and writes the byte (race-free, 128 B/row).  (s, lo) go to the meta array after the codes: u32 [2][NKV][ctx_max].
-      float lo = x[0], hi = x[0];
-#pragma unroll
-      for (int i = 1; i < 8; i++) { lo = fminf(lo, x[i]); hi = fmaxf(hi, x[i]); }
-      lo = wmin32(lo); hi = wmax32(hi);
-      const __half sh = __float2half_rn(fmaxf(hi - lo, 1e-3f) * (1.f / 15.f)), lh = __float2half_rn(lo);
-      const float sf = __half2float(sh), lf = __half2float(lh), inv = 1.f / sf;
-      uint8_t* dst = reinterpret_cast<uint8_t*>(kv) + (row >> 1);  // row is in elements
-#pragma unroll
-      for (int i = 0; i < 8; i++) {
-        int code = (int)rintf((x[i] - lf) * inv);
-        code = code < 0 ? 0 : (code > 15 ? 15 : code);
-        const int hi_c = __shfl_xor_sync(0xffffffffu, code, 1);  // all 32 lanes must execute the shuffle
-        if (!(lane & 1)) dst[16 * i + (lane >> 1)] = (uint8_t)((hi_c << 4) | code);
-      }
-      if (lane == 0) {
-        uint32_t* meta = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2));
-        meta[(size_t)(isv * NKV + kvh) * ctx_max + pos] = (uint32_t)__half_as_ushort(sh) | ((uint32_t)__half_as_ushort(lh) << 16);
-      }
+      // rotated 4-bit format, see kvrot.cuh: codes [2][NKV][ctx][128] then u32 meta (4 x 8-bit log2 group scale) [2][NKV][ctx_max].
+      uint32_t* meta = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2));
+      kvrot::quant_store(x, lane, reinterpret_cast<uint8_t*>(kv) + (row >> 1), meta + (size_t)(isv * NKV + kvh) * ctx_max + pos);
+      kvrot::sink_store(x, lane, reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(kv) + kvrot::ring_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::RING_R + (pos & (kvrot::RING_R - 1))) * HD);
+      if (pos < kvrot::NSINK)
+        kvrot::sink_store(x, lane, reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(kv) + kvrot::sink_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::NSINK + pos) * HD);
     } else {
       uint16_t* dst = reinterpret_cast<uint16_t*>(kv) + row;
 #pragma unroll
@@ -201,15 +168,23 @@ __device__ __forceinline__ void mma_t(float (&c)[4], uint32_t a0, uint32_t a1, u
 }
 // fp8 e4m3 pair held as bytes [0, b0, 0, b1] -> fp16x2 holding (b0, b1)/256 (exact incl. subnormals: the e4m3 bias is 8 below fp16's, so the value is 2^-8 x the true one).
 __device__ __forceinline__ uint32_t e4m3x2_to_f16x2_div256(uint32_t x) { return (x & 0x80008000u) | ((x >> 1) & 0x3f803f80u); }
-// ---- int4 KV format, per token and head: 128 B of codes (2/byte, low nibble = even d, natural d order) in [2][NKV][ctx][128], then one u32 meta word
-// (fp16 scale | fp16 min << 16) per row in [2][NKV][ctx].  x = code*scale + min, code 0..15.  The mma consumes the integer codes (exact in fp16):
-//   K: S = scale_k * (q . code_k) + min_k * sum(q)        V: O = sum_k (p_k * scale_k) code_k + sum_k p_k * min_k   (the last term is d-independent)
-constexpr uint32_t I4_MAGIC = 0x64006400u;  // fp16 1024.0 in both halves
-// nibble k of both 16-bit halves of w -> fp16x2 holding (n_lo, n_hi), n in 0..15, exact: (n | 0x6400) is 1024 + n
+// ---- int4 KV format (kvrot.cuh), per token and head: the row is Walsh-Hadamard rotated, 128 B of codes (2/byte, low nibble = even d, natural d order) in
+// [2][NKV][ctx][128], then one u32 meta word (4 x 8-bit log2 scale, byte G) per row in [2][NKV][ctx].  y = scale_G * L(n), n = 0..15, G(d) = 2 (d>>7) + ((d&15)>>3).
+// The mma consumes the codebook levels L(n) (companded odd integers, fp16); q is rotated at prep, so scores are unchanged, and the output is un-rotated in the reduce kernel:
+//   K: S = sum_G scale_kG * (q'_G . L(n_k))            V: O' = sum_G sum_k (p_k * scale_kG) L(n_k)_G      (G = group of the d rows of the mma instance)
+constexpr uint32_t I4_MAGIC = 0x64006400u;   // fp16 1024.0 in both halves
+constexpr uint32_t I4_MAGIC15 = 0x640F640Fu;  // fp16 1039.0 in both halves
+constexpr uint32_t I4_B2 = 0x1A251A25u;       // fp16 CUBE_B (kvrot.cuh) in both halves
+constexpr uint32_t I4_ONE2 = 0x3C003C00u;     // fp16 1.0 in both halves
+// nibble k of both 16-bit halves of w (n in 0..15) -> fp16x2 holding the codebook levels (L(n_lo), L(n_hi)), L(n) = u (1 + B u^2), u = 2n - 15.
+// (2n | 0x6400) is 1024 + 2n, minus 1039 gives u exactly; u*u is exact in fp16, the rest rounds to fp16 (kvrot::level agrees to ~2^-11).
 __device__ __forceinline__ uint32_t i4_pair(uint32_t w, int k) {
-  const uint32_t t = ((w >> (4 * k)) & 0x000F000Fu) | I4_MAGIC;
-  uint32_t r;
-  asm("sub.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(I4_MAGIC));
+  const uint32_t t = ((k ? (w >> (4 * k - 1)) : (w << 1)) & 0x001E001Eu) | I4_MAGIC;
+  uint32_t u, uu, f, r;
+  asm("sub.f16x2 %0, %1, %2;\n" : "=r"(u) : "r"(t), "r"(I4_MAGIC15));
+  asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(uu) : "r"(u), "r"(u));
+  asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(f) : "r"(uu), "r"(I4_B2), "r"(I4_ONE2));
+  asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(u), "r"(f));
   return r;
 }
 __device__ __forceinline__ uint32_t pack16(float lo, float hi, bool f16) {
@@ -240,7 +215,7 @@ __device__ __forceinline__ uint2 ld_kv8(const void* p) {  // int4: 8 bytes = 16 
 template <bool FP8, bool I4, int NT, int KS>
 __global__ void __launch_bounds__(32 * NT * KS, 1)
     attn_split_kernel(int T, const void* __restrict__ kv, int ctx_max, float k_scale, float v_scale, const int* __restrict__ pos0p,
-                      const uint16_t* __restrict__ qbuf, const float* __restrict__ qsum, float2* __restrict__ ml, float* __restrict__ part) {
+                      const uint16_t* __restrict__ qbuf, float2* __restrict__ ml, float* __restrict__ part) {
   constexpr int NW = NT * KS;
   constexpr int E = (FP8 || I4) ? 16 : 8;  // elements per 16-byte chunk
   constexpr int ROWB = I4 ? HD / 2 : (FP8 ? HD : HD * 2);  // bytes per token row: 128 (int4) / 256 (fp8) / 512 (bf16)
@@ -253,7 +228,7 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
   extern __shared__ __align__(16) float smem[];
 
   const int pos0 = *pos0p;
-  const int ctx = pos0 + T;
+  const int ctx = I4 ? max(pos0 + T - kvrot::RING_W, 0) : pos0 + T;  // int4: the last RING_W keys are attended exactly by the reduce kernel (kvrot.cuh)
   int nsplit, chunk;
   split_params(ctx, nsplit, chunk);
   const int s = blockIdx.x, kvh = blockIdx.y;
@@ -265,13 +240,14 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
 
   const char* kbase = reinterpret_cast<const char*>(kv) + (size_t)(0 * NKV + kvh) * ctx_max * ROWB;
   const char* vbase = reinterpret_cast<const char*>(kv) + (size_t)(1 * NKV + kvh) * ctx_max * ROWB;
+  const uint16_t* sinkb = reinterpret_cast<const uint16_t*>(reinterpret_cast<const char*>(kv) + (I4 ? kvrot::sink_off(ctx_max) : 0));  // exact fp16 sink rows [2][NKV][NSINK][HD] (int4 only)
   const uint32_t* kmeta = reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(kv) + (size_t)2 * NKV * ctx_max * ROWB) + (size_t)(0 * NKV + kvh) * ctx_max;
   const uint32_t* vmeta = reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(kv) + (size_t)2 * NKV * ctx_max * ROWB) + (size_t)(1 * NKV + kvh) * ctx_max;
   const int ntiles = (kend - kstart + 15) / 16;
   struct Tile {
     typename std::conditional<I4, uint2, uint4>::type k[2][NKB];  // K rows r and r+8, chunk j (int4: 16 codes = one k16 step)
     typename std::conditional<I4, uint2, uint4>::type v[4][NVC];  // V key slots {2j, 2j+1, 2j+8, 2j+9}, chunk r
-    uint32_t km[2], vm[2];                                        // int4 only: (fp16 scale | fp16 min << 16) of keys r and r+8, K and V
+    uint32_t km[2], vm[2];                                        // int4 only: meta words (4 x 8-bit group scale code) of keys r and r+8, K and V
   };
   auto issue = [&](Tile& t, int it) {
     const int base = kstart + it * 16;
@@ -335,30 +311,28 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     lim[e] = min(pos0 + tc, kend - 1);  // key position allowed iff kp <= lim
   }
   const float scl = (FP8 ? k_scale * 256.f : 1.f) * (1.f / 16.f) * LOG2E;
-  float qsm[2] = {0.f, 0.f};  // int4: sum of the fp16 q of this lane's two columns
-  if constexpr (I4) {
-    for (int e = 0; e < 2; e++) {
-      const int c = nt * 8 + 2 * j + e;
-      if (c < ncols) { const int tc = c / GRP; qsm[e] = qsum[tc * NH + kvh * GRP + (c - tc * GRP)]; }
-    }
-  }
-
   float acc[NINST][4];
 #pragma unroll
   for (int i = 0; i < NINST; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
-  float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f}, c_run[2] = {0.f, 0.f};  // c_run: int4 sum_k p_k * min_k
+  float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
 
   auto compute = [&](const Tile& t, int it) {
     const int base = kstart + it * 16;
-    float ksc0 = 0.f, klo0 = 0.f, ksc1 = 0.f, klo1 = 0.f, vsc0 = 0.f, vlo0 = 0.f, vsc1 = 0.f, vlo1 = 0.f;  // int4 per-key scale / min of keys r and r+8
+    float ksc[2][4], vsc[2][4];  // int4: per-key group scales (G = 0..3) of keys r (index 0) and r+8 (index 1), K and V
     if constexpr (I4) {
-      auto f_lo = [](uint32_t m) { return __half2float(__ushort_as_half((unsigned short)(m & 0xffffu))); };
-      auto f_hi = [](uint32_t m) { return __half2float(__ushort_as_half((unsigned short)(m >> 16))); };
-      ksc0 = f_lo(t.km[0]); klo0 = f_hi(t.km[0]); ksc1 = f_lo(t.km[1]); klo1 = f_hi(t.km[1]);
-      vsc0 = f_lo(t.vm[0]); vlo0 = f_hi(t.vm[0]); vsc1 = f_lo(t.vm[1]); vlo1 = f_hi(t.vm[1]);
+#pragma unroll
+      for (int G = 0; G < 4; G++) {
+        ksc[0][G] = kvrot::scale_of((t.km[0] >> (8 * G)) & 255u); ksc[1][G] = kvrot::scale_of((t.km[1] >> (8 * G)) & 255u);
+        vsc[0][G] = kvrot::scale_of((t.vm[0] >> (8 * G)) & 255u); vsc[1][G] = kvrot::scale_of((t.vm[1] >> (8 * G)) & 255u);
+      }
     }
     // ---- S^T = K Q^T
     float sa[4] = {0.f, 0.f, 0.f, 0.f}, sb[4] = {0.f, 0.f, 0.f, 0.f};
+    float sg[4][4];  // int4: one accumulator per scale group (steps (b, u) with G = 2 (b>>1) + (u>>1))
+    if constexpr (I4) {
+#pragma unroll
+      for (int G = 0; G < 4; G++) sg[G][0] = sg[G][1] = sg[G][2] = sg[G][3] = 0.f;
+    }
 #pragma unroll
     for (int sidx = 0; sidx < NSTEP; sidx++) {
       const int b = sidx / (E / 4), u = sidx % (E / 4);
@@ -380,17 +354,57 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
         a0 = k0[2 * u]; a2 = k0[2 * u + 1]; a1 = k1[2 * u]; a3 = k1[2 * u + 1];
       }
       const uint2 q = qs[sidx * 32];
-      mma_t<FP8, I4>((sidx & 1) ? sb : sa, a0, a1, a2, a3, q.x, q.y);
+      if constexpr (I4) mma_t<FP8, I4>(sg[2 * (b >> 1) + (u >> 1)], a0, a1, a2, a3, q.x, q.y);
+      else mma_t<FP8, I4>((sidx & 1) ? sb : sa, a0, a1, a2, a3, q.x, q.y);
     }
     // ---- scores, mask, online softmax (columns e = 0/1 of this lane; rows = keys r, r+8)
     float sc[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) sc[i] = (sa[i] + sb[i]) * scl;
-    if constexpr (I4) {  // S = scale_k * (q . code) + min_k * sum(q); rows r / r+8 are keys, columns e = 0 / 1
-      sc[0] = ((sa[0] + sb[0]) * ksc0 + klo0 * qsm[0]) * scl;
-      sc[1] = ((sa[1] + sb[1]) * ksc0 + klo0 * qsm[1]) * scl;
-      sc[2] = ((sa[2] + sb[2]) * ksc1 + klo1 * qsm[0]) * scl;
-      sc[3] = ((sa[3] + sb[3]) * ksc1 + klo1 * qsm[1]) * scl;
+    if constexpr (I4) {  // S = sum_G scale_kG * (q'_G . (n_k - 8)); rows r / r+8 are keys, columns e = 0 / 1
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const int row = i >> 1;
+        sc[i] = ((sg[0][i] * ksc[row][0] + sg[1][i] * ksc[row][1]) + (sg[2][i] * ksc[row][2] + sg[3][i] * ksc[row][3])) * scl;
+      }
+    }
+    const bool sink_tile = I4 && base == 0;  // tile 0 of split 0: keys 0..NSINK-1 use the exact fp16 sink rows (kvrot.cuh) instead of the 4-bit codes
+    if constexpr (I4) {
+      if (sink_tile) {
+        // exact scores: lane (col = lane>>2, key = (lane&3) + 4m) computes q[col] . k_sink[key]; holder lanes (key r, columns 2j, 2j+1) fetch them by shuffle
+        float dv[kvrot::NSINK / 4];
+#pragma unroll
+        for (int m = 0; m < kvrot::NSINK / 4; m++) {
+          const int c = nt * 8 + (lane >> 2);
+          const int tq = c < ncols ? c / GRP : 0, hq = c < ncols ? c - tq * GRP : 0;
+          const uint4* qv = reinterpret_cast<const uint4*>(qbuf + ((size_t)tq * NH + kvh * GRP + hq) * HD);
+          const uint4* kvp_ = reinterpret_cast<const uint4*>(sinkb + ((size_t)(0 * NKV + kvh) * kvrot::NSINK + (lane & 3) + 4 * m) * HD);
+          float a = 0.f;
+#pragma unroll 4
+          for (int x8 = 0; x8 < HD / 8; x8++) {
+            const uint4 qq = qv[x8], kk8 = kvp_[x8];
+            const uint32_t qw[4] = {qq.x, qq.y, qq.z, qq.w}, kw[4] = {kk8.x, kk8.y, kk8.z, kk8.w};
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+              const float2 qf = __half22float2(*reinterpret_cast<const __half2*>(&qw[w])), kf = __half22float2(*reinterpret_cast<const __half2*>(&kw[w]));
+              a = fmaf(qf.x, kf.x, a);
+              a = fmaf(qf.y, kf.y, a);
+            }
+          }
+          dv[m] = a;
+        }
+        float ex[2];
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          ex[e] = 0.f;
+#pragma unroll
+          for (int m = 0; m < kvrot::NSINK / 4; m++) {
+            const float vsh = __shfl_sync(0xffffffffu, dv[m], (2 * j + e) * 4 + (r & 3));
+            if ((r >> 2) == m) ex[e] = vsh;
+          }
+        }
+        if (r < kvrot::NSINK) { sc[0] = ex[0] * scl; sc[1] = ex[1] * scl; }
+      }
     }
     const int kp_lo = base + r, kp_hi = base + r + 8;
     if (kp_lo > lim[0]) sc[0] = -INFINITY;
@@ -411,18 +425,30 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     const float p0 = exp2f(sc[0] - off0), p1 = exp2f(sc[1] - off1), p2 = exp2f(sc[2] - off0), p3 = exp2f(sc[3] - off1);
     l_run[0] = l_run[0] * al0 + p0 + p2;
     l_run[1] = l_run[1] * al1 + p1 + p3;
+    float pk[I4 ? kvrot::NSINK : 1][2];
     if constexpr (I4) {
-      c_run[0] = c_run[0] * al0 + p0 * vlo0 + p2 * vlo1;
-      c_run[1] = c_run[1] * al1 + p1 * vlo0 + p3 * vlo1;
+      if (sink_tile) {  // exact probabilities of the sink keys (held by lanes 4k + j) go to the exact-V update below; the quantised mma sees p = 0 for them
+#pragma unroll
+        for (int k = 0; k < kvrot::NSINK; k++) {
+          pk[k][0] = __shfl_sync(0xffffffffu, p0, 4 * k + j);
+          pk[k][1] = __shfl_sync(0xffffffffu, p1, 4 * k + j);
+        }
+      }
     }
 #pragma unroll
     for (int i = 0; i < NINST; i++) {
       acc[i][0] *= al0; acc[i][1] *= al1; acc[i][2] *= al0; acc[i][3] *= al1;
     }
     uint32_t pb0, pb1;
-    if constexpr (I4) {  // fold the per-key V scale into P: (p_k * scale_k) multiplies the integer codes
-      pb0 = movmatrix_t(pack16(p0 * vsc0, p1 * vsc0, true));
-      pb1 = movmatrix_t(pack16(p2 * vsc1, p3 * vsc1, true));
+    uint32_t pbg[4][2];
+    if constexpr (I4) {  // fold the per-key, per-group V scale into P: (p_k * scale_kG) multiplies the integer codes of the d rows of group G
+#pragma unroll
+      for (int G = 0; G < 4; G++) {
+        const bool zs = sink_tile && r < kvrot::NSINK;
+        pbg[G][0] = movmatrix_t(pack16(zs ? 0.f : p0 * vsc[0][G], zs ? 0.f : p1 * vsc[0][G], true));
+        pbg[G][1] = movmatrix_t(pack16(p2 * vsc[1][G], p3 * vsc[1][G], true));
+      }
+      pb0 = pb1 = 0;
     } else {
       pb0 = movmatrix_t(pack16(p0, p1, FP8));
       pb1 = movmatrix_t(pack16(p2, p3, FP8));
@@ -462,7 +488,30 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
           a2 = __byte_perm(v2[g], v3[g], 0x5410);
           a3 = __byte_perm(v2[g], v3[g], 0x7632);
         }
-        mma_t<FP8, I4>(acc[c * (E / 2) + g], a0, a1, a2, a3, pb0, pb1);
+        if constexpr (I4) mma_t<FP8, I4>(acc[c * (E / 2) + g], a0, a1, a2, a3, pbg[2 * c + (g >> 2)][0], pbg[2 * c + (g >> 2)][1]);
+        else mma_t<FP8, I4>(acc[c * (E / 2) + g], a0, a1, a2, a3, pb0, pb1);
+      }
+    }
+
+    if constexpr (I4) {
+      if (sink_tile) {  // acc[(c, g)] holds d0 = 128 c + 16 r + 2 g (elements 0/2: d0, d0+1 of column 2j; 1/3: column 2j+1)
+#pragma unroll
+        for (int c = 0; c < NVC; c++) {
+#pragma unroll
+          for (int g = 0; g < E / 2; g++) {
+            const int d0 = c * 8 * E + r * E + 2 * g;
+            float* a = acc[c * (E / 2) + g];
+#pragma unroll
+            for (int k = 0; k < kvrot::NSINK; k++) {
+              const __half2 vh = *reinterpret_cast<const __half2*>(sinkb + ((size_t)(1 * NKV + kvh) * kvrot::NSINK + k) * HD + d0);
+              const float2 vf = __half22float2(vh);
+              a[0] = fmaf(pk[k][0], vf.x, a[0]);
+              a[1] = fmaf(pk[k][1], vf.x, a[1]);
+              a[2] = fmaf(pk[k][0], vf.y, a[2]);
+              a[3] = fmaf(pk[k][1], vf.y, a[3]);
+            }
+          }
+        }
       }
     }
   };
@@ -494,14 +543,6 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     l_run[0] += __shfl_xor_sync(0xffffffffu, l_run[0], o);
     l_run[1] += __shfl_xor_sync(0xffffffffu, l_run[1], o);
   }
-  if constexpr (I4) {
-#pragma unroll
-    for (int o = 4; o < 32; o <<= 1) {
-      c_run[0] += __shfl_xor_sync(0xffffffffu, c_run[0], o);
-      c_run[1] += __shfl_xor_sync(0xffffffffu, c_run[1], o);
-    }
-  }
-  const float cr0 = I4 ? c_run[0] : 0.f, cr1 = I4 ? c_run[1] : 0.f;  // int4: d-independent offset sum_k p_k * min_k, same scale as acc
   __syncthreads();  // every warp is done with its Q fragments: the merge buffers alias them
   float* sacc = smem;                           // [NW][8][HD]
   float* sm_m = smem + (size_t)NW * 8 * HD;     // [NW][8]
@@ -516,8 +557,8 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     for (int g = 0; g < E / 2; g++) {
       const int d0 = c * 8 * E + r * E + 2 * g;
       const float* a = acc[c * (E / 2) + g];
-      *reinterpret_cast<float2*>(sacc + (size_t)(wid * 8 + 2 * j) * HD + d0) = make_float2(a[0] + cr0, a[2] + cr0);
-      *reinterpret_cast<float2*>(sacc + (size_t)(wid * 8 + 2 * j + 1) * HD + d0) = make_float2(a[1] + cr1, a[3] + cr1);
+      *reinterpret_cast<float2*>(sacc + (size_t)(wid * 8 + 2 * j) * HD + d0) = make_float2(a[0], a[2]);
+      *reinterpret_cast<float2*>(sacc + (size_t)(wid * 8 + 2 * j + 1) * HD + d0) = make_float2(a[1], a[3]);
     }
   }
   __syncthreads();
@@ -560,17 +601,77 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
 // =====================================================================================================================
 // reduce partials, 1/l, v scale, sigmoid gate
 // =====================================================================================================================
+template <bool I4>
 __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, float vscale_eff,
                                                           const int* __restrict__ pos0p, const float2* __restrict__ ml,
-                                                          const float* __restrict__ part, __nv_bfloat16* __restrict__ out) {
+                                                          const float* __restrict__ part, __nv_bfloat16* __restrict__ out,
+                                                          const void* __restrict__ kv, int ctx_max, const uint16_t* __restrict__ qbuf) {
   static_assert(S_MAX <= 64, "reduce kernel keeps two split weights per lane");
+  static_assert(kvrot::RING_W == 128 || kvrot::RING_W == 256, "ring scores: 256 / RING_W threads per key");
+  constexpr int TPK = 256 / kvrot::RING_W;
   __shared__ float wn[64];
   __shared__ float4 red[3][64];
+  __shared__ float wh[I4 ? HD : 1];  // int4: the merged output in the rotated basis, un-rotated in place
+  __shared__ float rs[I4 ? kvrot::RING_W : 1];  // int4: exact-ring probabilities exp2(s - M_r)
+  __shared__ float rred[I4 ? 20 : 1];            // ring block reductions: [0..8) max, [8..16) sum, 16 = M_r, 17 = L_r, 18 = merge weight of the ring
   const int ncols = GRP * T;
   const int c = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x;
-  const int ctx = *pos0p + T;
+  const int pos0 = *pos0p;
+  const int ctx = I4 ? max(pos0 + T - kvrot::RING_W, 0) : pos0 + T;  // keys covered by the split kernels; int4: the last RING_W keys are the exact ring
   int nsplit, chunk;
   split_params(ctx, nsplit, chunk);
+  const int dl = tid & 63, sg = tid >> 6;  // float4 index over d, split group
+  const int t = c / GRP, head = kvh * GRP + (c - t * GRP);
+  uint2 vr[I4 ? kvrot::RING_W / 4 : 1];
+  if constexpr (I4) {
+    // ---- exact ring attention for this (column, kv head): keys kreg .. kreg + RING_W - 1 (masked beyond this column's position), fp16 rotated rows
+    const uint16_t* ring = reinterpret_cast<const uint16_t*>(reinterpret_cast<const char*>(kv) + kvrot::ring_off(ctx_max));
+    const uint16_t* ringK = ring + (size_t)(0 * NKV + kvh) * kvrot::RING_R * HD;
+    const uint16_t* ringV = ring + (size_t)(1 * NKV + kvh) * kvrot::RING_R * HD;
+    const int kreg = ctx;
+#pragma unroll
+    for (int u = 0; u < kvrot::RING_W / 4; u++) vr[u] = *reinterpret_cast<const uint2*>(ringV + (size_t)((kreg + sg + 4 * u) & (kvrot::RING_R - 1)) * HD + dl * 4);
+    const int ki = tid / TPK, hf = tid % TPK, kp = kreg + ki;
+    const uint4* kr = reinterpret_cast<const uint4*>(ringK + (size_t)(kp & (kvrot::RING_R - 1)) * HD + hf * (HD / TPK));
+    const uint4* qr = reinterpret_cast<const uint4*>(qbuf + ((size_t)t * NH + head) * HD + hf * (HD / TPK));
+    float a = 0.f;
+#pragma unroll 4
+    for (int x8 = 0; x8 < HD / (8 * TPK); x8++) {
+      const uint4 qq = qr[x8], kk8 = kr[x8];
+      const uint32_t qw[4] = {qq.x, qq.y, qq.z, qq.w}, kw[4] = {kk8.x, kk8.y, kk8.z, kk8.w};
+#pragma unroll
+      for (int w = 0; w < 4; w++) {
+        const float2 qf = __half22float2(*reinterpret_cast<const __half2*>(&qw[w])), kf = __half22float2(*reinterpret_cast<const __half2*>(&kw[w]));
+        a = fmaf(qf.x, kf.x, a);
+        a = fmaf(qf.y, kf.y, a);
+      }
+    }
+    if (TPK == 2) a += __shfl_xor_sync(0xffffffffu, a, 1);
+    const float sc = (kp <= pos0 + t) ? a * (LOG2E / 16.f) : -INFINITY;
+    float mx = sc;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((tid & 31) == 0) rred[tid >> 5] = mx;
+    __syncthreads();
+    float M = rred[0];
+#pragma unroll
+    for (int i = 1; i < 8; i++) M = fmaxf(M, rred[i]);
+    const float p = (sc == -INFINITY) ? 0.f : exp2f(sc - M);
+    if (hf == 0) rs[ki] = p;
+    float ps = hf == 0 ? p : 0.f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+    if ((tid & 31) == 0) rred[8 + (tid >> 5)] = ps;
+    __syncthreads();
+    if (tid == 0) {
+      float L = 0.f;
+#pragma unroll
+      for (int i = 0; i < 8; i++) L += rred[8 + i];
+      rred[16] = M;
+      rred[17] = L;
+    }
+    __syncthreads();
+  }
   const float2* mlp = ml + (size_t)kvh * S_MAX * ncols + c;
   if (tid < 32) {  // normalised merge weights w_s = exp2(m_s - M) / sum_s' exp2(m_s' - M) l_s'
     float m[2], l[2];
@@ -584,6 +685,8 @@ __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bflo
     float M = fmaxf(m[0], m[1]);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float mr = -INFINITY, lr = 0.f;
+    if constexpr (I4) { mr = rred[16]; lr = rred[17]; M = fmaxf(M, mr); }
     float w[2], L = 0.f;
 #pragma unroll
     for (int i = 0; i < 2; i++) {
@@ -592,12 +695,14 @@ __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bflo
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    const float wr = (mr == -INFINITY) ? 0.f : exp2f(mr - M);
+    L += wr * lr;
     const float invL = 1.f / L;
     wn[tid] = w[0] * invL;
     wn[tid + 32] = w[1] * invL;
+    if constexpr (I4) { if (tid == 0) rred[18] = wr * invL; }
   }
   __syncthreads();
-  const int dl = tid & 63, sg = tid >> 6;  // float4 index over d, split group
   const float4* pp = reinterpret_cast<const float4*>(part + ((size_t)kvh * S_MAX * ncols + c) * HD) + dl;
   float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll 4
@@ -605,6 +710,15 @@ __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bflo
     const float4 v = pp[(size_t)sp * ncols * (HD / 4)];
     const float w = wn[sp];
     o.x += w * v.x; o.y += w * v.y; o.z += w * v.z; o.w += w * v.w;
+  }
+  if constexpr (I4) {  // exact ring part: sum_i p_i V[kreg + i], this thread's key group sg (i = sg + 4u), dims 4 dl .. 4 dl + 3
+    const float wr = rred[18];
+#pragma unroll
+    for (int u = 0; u < kvrot::RING_W / 4; u++) {
+      const float pw = wr * rs[sg + 4 * u];
+      const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&vr[u].x)), v23 = __half22float2(*reinterpret_cast<const __half2*>(&vr[u].y));
+      o.x = fmaf(pw, v01.x, o.x); o.y = fmaf(pw, v01.y, o.y); o.z = fmaf(pw, v23.x, o.z); o.w = fmaf(pw, v23.y, o.w);
+    }
   }
   if (sg > 0) red[sg - 1][dl] = o;
   __syncthreads();
@@ -614,7 +728,24 @@ __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bflo
       const float4 v = red[k][dl];
       o.x += v.x; o.y += v.y; o.z += v.z; o.w += v.w;
     }
-    const int t = c / GRP, head = kvh * GRP + (c - t * GRP);
+  }
+  if constexpr (I4) {
+    // the cache holds the Walsh-Hadamard rotated V rows: O = H O' / 16 (H/16 is symmetric orthogonal), 8 butterfly stages in shared memory
+    if (sg == 0) *reinterpret_cast<float4*>(wh + dl * 4) = o;
+    __syncthreads();
+#pragma unroll
+    for (int bit = 0; bit < 8; bit++) {
+      if (tid < HD / 2) {
+        const int lo = ((tid >> bit) << (bit + 1)) | (tid & ((1 << bit) - 1));
+        const float a = wh[lo], b = wh[lo + (1 << bit)];
+        wh[lo] = a + b;
+        wh[lo + (1 << bit)] = a - b;
+      }
+      __syncthreads();
+    }
+    const float g = __bfloat162float(q_proj[(size_t)t * QG_STRIDE + head * 2 * HD + HD + tid]);
+    out[(size_t)t * (NH * HD) + head * HD + tid] = __float2bfloat16_rn(wh[tid] * 0.0625f * vscale_eff / (1.f + expf(-g)));
+  } else if (sg == 0) {
     const uint2 gb = *reinterpret_cast<const uint2*>(q_proj + (size_t)t * QG_STRIDE + head * 2 * HD + HD + dl * 4);
     const float g0 = __uint_as_float(gb.x << 16), g1 = __uint_as_float(gb.x & 0xffff0000u);
     const float g2 = __uint_as_float(gb.y << 16), g3 = __uint_as_float(gb.y & 0xffff0000u);
@@ -639,8 +770,7 @@ cudaError_t launch_split(int T, const void* kv, int ctx_max, float k_scale, floa
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
-  const float* qsum = reinterpret_cast<const float*>(reinterpret_cast<const char*>(qbuf) + (WS_QSUM - WS_Q));  // qbuf = ws + WS_Q
-  attn_split_kernel<FP8, I4, NT, KS><<<dim3(S_MAX, NKV), NW * 32, smem, st>>>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, qsum, ml, part);
+  attn_split_kernel<FP8, I4, NT, KS><<<dim3(S_MAX, NKV), NW * 32, smem, st>>>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part);
   return cudaGetLastError();
 }
 
@@ -653,7 +783,7 @@ cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const v
   float* part = reinterpret_cast<float*>(w + WS_PART);
   attn_prep_kernel<FP8, I4><<<T * 8, 128, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
                                                    (const __nv_bfloat16*)q_norm, (const __nv_bfloat16*)k_norm, kv, ctx_max, k_scale, v_scale,
-                                                   pos0, qbuf, reinterpret_cast<float*>(w + WS_QSUM));
+                                                   pos0, qbuf);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return e;
   switch (T) {
@@ -667,8 +797,8 @@ cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const v
     default: e = launch_split<FP8, I4, 6, ATTN_KS8>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
   }
   if (e != cudaSuccess) return e;
-  attn_reduce_kernel<<<dim3(GRP * T, NKV), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,
-                                                         (__nv_bfloat16*)out);
+  attn_reduce_kernel<I4><<<dim3(GRP * T, NKV), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,
+                                                         (__nv_bfloat16*)out, kv, ctx_max, qbuf);
   return cudaGetLastError();
 }
 
@@ -678,10 +808,10 @@ extern "C" {
 
 size_t swiftmk_attn_ws_bytes(void) { return WS_TOTAL; }
 
-// kv_dtype: 0 = bf16 (2 B/elem), 1 = fp8 (1 B/elem), 2 = int4: per token and head 128 B of codes + a 4 B (fp16 scale, fp16 min) meta word (4.125 bit/elem).
+// kv_dtype: 0 = bf16 (2 B/elem), 1 = fp8 (1 B/elem), 2 = int4: per token and head 128 B of codes + a 4 B meta word (4 x 8-bit log2 group scale, rotated rows, kvrot.cuh; 4.125 bit/elem).
 // Layout: codes [K|V][NKV][ctx_max][128] then meta u32 [K|V][NKV][ctx_max].
 size_t swiftmk_attn_kv_bytes(int ctx_max, int kv_dtype) {
-  if (kv_dtype == 2) return (size_t)2 * NKV * (size_t)ctx_max * (HD / 2 + 4);
+  if (kv_dtype == 2) return kvrot::ring_off(ctx_max) + kvrot::RING_BYTES;  // + fixed fp16 sink rows and exact recent-token ring
   return (size_t)2 * NKV * (size_t)ctx_max * HD * (kv_dtype == 0 ? 2 : 1);
 }
 

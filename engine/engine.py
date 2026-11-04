@@ -89,6 +89,21 @@ class Engine:
         smk.check(self.lib.smk_engine_reset(self.h, self.st), "reset")
         self.pos = 0
 
+    # ---- exact sink + ring buffers of the int4 KV cache (src/kvrot.cuh): state outside the per-token cache that a prefix snapshot must carry
+    def kv_aux_new(self):
+        """Pinned host uint8 tensor big enough for all layers' sink + ring buffers (0 bytes for bf16 / fp8 caches); one per snapshot slot."""
+        return torch.empty(int(self.lib.swiftmk_kv_aux_bytes(self.h)), dtype=torch.uint8, pin_memory=True)
+
+    def kv_aux_save(self, t):
+        """Copy the device sink + ring buffers into t (synchronises the engine stream)."""
+        assert t.numel() == self.lib.swiftmk_kv_aux_bytes(self.h) and t.is_pinned()
+        smk.check(self.lib.swiftmk_kv_aux_copy(self.h, C.c_void_p(t.data_ptr()), 0, self.st), "kv_aux_save")
+
+    def kv_aux_restore(self, t):
+        """Copy t back into the device sink + ring buffers, ordered on the engine stream."""
+        assert t.numel() == self.lib.swiftmk_kv_aux_bytes(self.h) and t.is_pinned()
+        smk.check(self.lib.swiftmk_kv_aux_copy(self.h, C.c_void_p(t.data_ptr()), 1, self.st), "kv_aux_restore")
+
     def _step(self, toks, head, graph=True):
         T = len(toks)
         arr = (C.c_int * T)(*toks)
