@@ -98,6 +98,7 @@ class Runner:
         # all snapshot buffers are allocated up front (cudaHostAlloc of 151 MB costs ~20 ms): len(snaps) + len(pool) == max_snaps
         self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory()) for _ in range(max_snaps)]
         self.last = Stats()
+        self._procs_on = False
         self._side = torch.cuda.Stream()  # K10: the snapshot D2H copy of a short (folded) prompt runs here, overlapped with the first-token chunk (see _snapshot)
         self._snap_ev = None
         self._snap_pending = None
@@ -280,7 +281,9 @@ class Runner:
             e.set_sampling(temperature=1.0, top_k=1, top_p=1.0, seed=0)
         else:
             e.set_sampling(0.0)
-        e.set_procs(**(procs or {}))
+        if procs or self._procs_on:  # requests without processors touch nothing (a previous request's processors are switched off once)
+            e.set_procs(**(procs or {}))
+            self._procs_on = bool(procs)
         snap = self._choose(ids)
         if snap is None:
             self._free_snaps([])
