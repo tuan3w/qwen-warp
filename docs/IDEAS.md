@@ -7,11 +7,17 @@ open an issue so others know. Back to the [README](../README.md).
 |---|---|---|
 | [A rotated 4-bit KV cache](#a-rotated-4-bit-kv-cache) | measured as bf16 fake-quant: about 2x lower perplexity cost on this 27B; no kernel, no speed number | a decode kernel and a speed measurement |
 | [Why the 4-bit cache missed a needle at 100k](#why-the-4-bit-cache-missed-a-needle-at-100k) | one miss in two experiments, cause unknown | more needle runs, a per-layer look |
-| [Multi-turn agentic task success per KV dtype](#multi-turn-agentic-task-success-per-kv-dtype) | not measured at all | an agent benchmark run three times |
+| [Multi-turn agentic task success per KV dtype](#multi-turn-agentic-task-success-per-kv-dtype) | agent tasks not measured; the tool-call rate of one small schema was ([Usage](USAGE.md#tool-calls)) | an agent benchmark run three times |
 | [A non-uniform weight codebook](#a-non-uniform-weight-codebook) | helps accuracy on a 4B model; the extra bytes alone bound the 27B step at about +17% | a kernel; likely a dead end at this size |
 | [A better quantized model](#a-better-quantized-model-if-one-appears) | nothing to measure yet | kernel work if the format changes |
 | [Faster long prefill](#faster-long-prefill) | about 960 tok/s at 262k | profiling first |
 | [Repeating the HyperQwen reference measurement](#repeating-the-hyperqwen-reference-measurement) | one pinned build, single runs | a few hours of runs |
+| [A thinking token budget](#a-thinking-token-budget) | `thinking_token_budget` is HTTP 400; `reasoning_effort` is only a prompt hint; a design sketch fits the existing processors | a kernel rule, an exactness test, a quality measurement at cut-off budgets |
+| [Log-probabilities](#log-probabilities-through-an-extra-bf16-pass) | HTTP 400; the head returns exact logits for 64 candidates only | an extra bf16 pass for requests that ask, and its cost |
+| [bad_words and structured output](#bad_words-and-structured-output) | HTTP 400; each needs device-side state per verify row | a matcher or a grammar automaton in the cycle |
+| [Processors on the draft head](#logit-processors-on-the-draft-head) | the draft proposals ignore them; -15% tok/s with five of them together at T 0.7 | apply them to the draft logits, keep the exactness test green |
+| [Why bf16 KV is below a reference service on tool calls](#why-bf16-kv-is-below-a-reference-service-on-tool-calls) | 93% against 98%, cause not isolated | a controlled comparison on identical contexts |
+| [Upgrading vLLM](#upgrading-vllm) | pinned to 0.30.0; 0.33.0 exists; the client and the tool-schema hook use internals | a scratch environment and `make test` |
 
 Out of scope: other models, other GPUs, batching. (If you try another GPU, the build takes `ARCH=-arch=sm_XX`, but nothing outside sm_86 has been tried.)
 
@@ -37,6 +43,8 @@ The CUDA fake-quant was checked against a torch reference on 65,536 real K/V row
 
 **To settle it.** Write the decode kernel (lookup-table dequant, rotation folded into q and the output), measure speed against the current cache, then perplexity at 32k and 98k.
 
+**Tool calls.** How a rotated cache behaves on tool calls is not measured. The 4-bit cache's well-formed tool-call rate depends on the key order of the tool schema ([Usage](USAGE.md#tool-calls)); whether rotation changes that is open.
+
 ## Why the 4-bit cache missed a needle at 100k
 
 The 4-bit arm missed a planted needle at 100k tokens in the speed sweep and found it at 32k, 64k, 130k and 190k; in a separate test it got 7 of 8 needles at about 100k (fp8: 8 of 8). That could be noise
@@ -44,8 +52,8 @@ at this sample size or a real failure mode of one position range. **To settle it
 
 ## Multi-turn agentic task success per KV dtype
 
-The cache is aimed at long agent sessions, but quality was only measured with single-shot coding and retrieval proxies. **To settle it:** run an edit-and-test agent benchmark with bf16, fp8 and
-4-bit caches, several runs each, and compare task success and the number of tool-call errors.
+The cache is aimed at long agent sessions, but quality was only measured with single-shot coding and retrieval proxies and, for tool calls, one small schema in single-turn requests ([Performance](PERFORMANCE.md#tool-calls)).
+**To settle it:** run an edit-and-test agent benchmark with bf16, fp8 and 4-bit caches, several runs each, and compare task success and the number of tool-call errors; include a six-tool coding-agent set and second turns, which were not measured.
 
 ## A non-uniform weight codebook
 
@@ -68,6 +76,48 @@ Cold prefill is 1,830 tok/s at 16k and about 960 tok/s at 262k, so a 190k prompt
 
 The reference numbers describe one HyperQwen build and single runs. A repeat with repeats per cell, a newer build, its DFlash2 preset if it starts, and a second power limit would be a better reference.
 This is a measurement exercise, not a contest.
+
+## A thinking token budget
+
+`thinking_token_budget` (a hard cap on the thinking length, then a forced `</think>`) returns HTTP 400 today. `reasoning_effort` does not replace it: it is only a prompt hint, and on a stock vLLM server of the same model the median reasoning length
+over 18 requests per setting was 0 (`none`, thinking off), 279 (`low`), 269 (`medium`), 290 (`xhigh`) and 256 (unset) tokens, with no measurable shortening ([Usage](USAGE.md#thinking-and-reasoning-output)).
+
+**Sketch.** It fits the per-request processor state (`engine/src/proc.h`): a generated-token counter and an "end of thinking seen" flag, both updated where `proc_note` updates the penalty counts, and a rule in `proc_logit`:
+"counter >= N and the flag is not set: restrict the row to the forced token". A forced multi-token tail would index a small device array by `counter - N`. Under speculative decoding, verify row t uses `counter + t` and scans the draft tokens
+for the flag exactly as the penalty counts do. Not implemented, not measured.
+
+**To settle it.** Implement the rule, extend `tests/test_spec_procs.py` (the emitted stream must match the exact autoregressive joint, with a broken variant that must fail), then measure answer quality at cut-off budgets.
+
+## Log-probabilities through an extra bf16 pass
+
+`logprobs`, `prompt_logprobs` and `logprob_token_ids` return HTTP 400. The quantised head gives exact (bf16-rescored) logits only for its top-64 candidates; the other logits are int4 approximations, so a full log-softmax is not available.
+**Idea:** for requests that ask for log-probabilities, run an extra bf16 pass over the 248k vocabulary per row. [INFERENCE] It would probably sit outside the CUDA-graph cycle so that other requests keep their speed; its cost was not estimated or measured.
+**To settle it.** Build the pass, check it against a torch reference, and measure the per-token cost for a request with `logprobs` on.
+
+## bad_words and structured output
+
+Both return HTTP 400. `bad_words` with multi-token sequences needs a matcher over the generated history inside the verify rows, draft tokens included (single-token words could reuse the `logit_bias` and `allowed_token_ids` machinery).
+Structured output needs a grammar state machine per token and per verify row on the device; a host round trip per token would defeat the CUDA-graph cycle. Neither was prototyped. **To settle it.** For `bad_words`, a matcher
+in `engine/src/proc.cu` and a test like `tests/test_spec_procs.py`; for structured output, decide the grammar subset first (JSON schema only?) and measure the per-token cost.
+
+## Logit processors on the draft head
+
+The draft proposals ignore the request's processors. That keeps the acceptance exact for any proposal, but it lowers the number of accepted tokens: at T 0.7 and top_k 20, five processors together took the server log from 3.16 to 2.75 tokens per cycle
+(160 to 136 tok/s, -15%); `repetition_penalty` 1.1 alone: 2.90 (150 tok/s); the other single ones cost little (8 prompts x 200 tokens). **Idea:** apply the processors to the draft head's logits too, which should recover part of that
+[INFERENCE: not tried]. **To settle it.** Do it, keep `tests/test_spec_procs.py` and `tests/test_proc_model.py` green, and repeat the acceptance measurement.
+
+## Why bf16 KV is below a reference service on tool calls
+
+A stock vLLM service behind a gateway (its rendered prompt had `function.parameters` key-sorted) gave a well-formed tool call in 98.3% of 400 requests (pooled over four temperatures); the bf16-KV engine with sorted keys gave 93% (139/150). On identical contexts the exact
+log-probability gap between `<` and `<|im_start|>` after `<tool_call>` is 13.7 nats on the service (minimum 8.6, n = 70) and 5.7 on the engine (minimum -1.6; fp8 5.8; fast against chunked prefill differ by 0.4 only): the engine's hidden state is less sharp there.
+The sampler is exact ([Performance](PERFORMANCE.md#tool-calls)), so the gap is upstream of it. Candidates, none tested: the W4A16 weights of this checkpoint against the service's unknown weights, and KV or activation numerics.
+**To settle it.** Compare the same contexts through a path whose precision you can change (the same checkpoint on stock vLLM, an unquantised head, higher-precision accumulation) and see which one moves the gap.
+
+## Upgrading vLLM
+
+The environment pins `vllm==0.30.0` (`pyproject.toml`, `uv.lock`); 0.33.0 exists (PyPI, 2026-11-04). The engine-core client (`server/smk_core_client.py`: `EngineCoreClient.make_async_mp_client`, `SamplingParams._validate_spec_decode`) and the
+tool-schema hook (`server/tool_schema.py`: `vllm.renderers.hf.safe_apply_chat_template`) depend on vLLM internals of 0.30.0; no other version was tried. **To settle it.** In a scratch environment, bump vLLM (and whatever torch it needs), run `make test`, and
+fix what breaks.
 
 ## How to help
 
