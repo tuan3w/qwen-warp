@@ -91,8 +91,9 @@ class Engine:
 
     # ---- exact sink + ring buffers of the int4 KV cache (src/kvrot.cuh): state outside the per-token cache that a prefix snapshot must carry
     def kv_aux_new(self):
-        """Pinned host uint8 tensor big enough for all layers' sink + ring buffers (0 bytes for bf16 / fp8 caches); one per snapshot slot."""
-        return torch.empty(int(self.lib.swiftmk_kv_aux_bytes(self.h)), dtype=torch.uint8, pin_memory=True)
+        """Pinned host uint8 tensor big enough for all layers' sink + ring buffers, one per snapshot slot; None for the bf16 / fp8 caches (no such buffers)."""
+        n = int(self.lib.swiftmk_kv_aux_bytes(self.h))
+        return torch.empty(n, dtype=torch.uint8, pin_memory=True) if n else None
 
     def kv_aux_save(self, t):
         """Copy the device sink + ring buffers into t (synchronises the engine stream)."""
