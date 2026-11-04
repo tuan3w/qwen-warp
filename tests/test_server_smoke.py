@@ -38,8 +38,9 @@ def render(tok, messages, **kw):
 
 
 def long_doc(tok, n):
-    raw = (ENGINE / "weights.py").read_text() + "\n\n" + (ENGINE / "prefill.py").read_text()  # real text that ships with the repo (files the sampling work does not edit: a changed prompt can hit a different near-tie between the server and the direct-engine segmentation)
-    return tok.decode(tok(raw, add_special_tokens=False)["input_ids"][:n])
+    """The first n (<= 1500) tokens of a fixed text (tests/long_doc.txt: the first 1500 tokens of engine/spec.py + engine/prefill.py as of a663935).  Pinned, not read from the repo: whether a greedy id flips at a near-tie between
+    the server's and the direct engine's verify widths depends on the exact text (a663935 itself diverges at index 29 / 49 on two other documents), so the prompt must not change with the sources."""
+    return tok.decode(tok((HERE / "long_doc.txt").read_text(), add_special_tokens=False)["input_ids"][:n])
 
 
 # ------------------------------------------------------------------------------------------------ 1. direct engine reference

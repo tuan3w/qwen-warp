@@ -1,0 +1,90 @@
+"""swift-mk speculative driver: Engine + packed int4 MTP head + on-device draft / verify / accept cycle graph (include/mtp.h).
+
+  from spec import SpecEngine;  e = SpecEngine(ctx_max=4096);  toks = e.generate(ids, 128, k=3)
+Needs an RTX 3090 (sm_86; no other GPU has been tested).
+"""
+import ctypes as C
+import time
+
+import torch
+
+from engine import Engine, smk, pack  # noqa: F401
+import pack_mtp
+
+RING = 4096
+SS_N = 64
+PMAX = 7  # K11: chain k <= 3 + prompt-lookup tail <= 4 (verify rows <= 8; needs Engine(tmax=8))
+
+
+class MtpW(C.Structure):
+    _fields_ = [("layer", smk.LayerW)] + [(n, C.c_void_p) for n in ("fc_w", "fc_s", "pre_e", "pre_h", "norm", "head_w", "head_s", "head_ids")] + [("head_nv", C.c_int)]
+
+
+class PldCfg(C.Structure):
+    _fields_ = [(n, C.c_int) for n in ("n", "min_len", "max_tail", "cap", "back", "longest")]
+
+
+class PldOpts(C.Structure):
+    _fields_ = [("cfg", PldCfg), ("force_n", C.c_int), ("force_tok", C.c_int * 4), ("reserved", C.c_int * 6)]
+
+
+def make_pld(n=2, min_len=3, max_tail=4, cap=64, back=64, longest=1, force_tail=()):
+    """E6's best cell (n=2 longest suffix match of the chain's last two drafts, agreement >= 3, tail <= 4)."""
+    ft = list(force_tail)[:4]  # TEST ONLY: every cycle carries exactly these tail tokens
+    return PldOpts(PldCfg(n, min_len, max_tail, cap, back, longest), len(ft), (C.c_int * 4)(*(ft + [0] * (4 - len(ft)))))
+
+
+class Sampling(C.Structure):
+    _fields_ = [("temperature", C.c_float), ("top_k", C.c_int), ("top_p", C.c_float), ("draft_sample", C.c_int), ("draft_temperature", C.c_float), ("draft_top_k", C.c_int),
+                ("draft_top_p", C.c_float), ("test_flags", C.c_int), ("seed", C.c_ulonglong)]
+
+
+def make_sampling(temperature=0.0, top_k=20, top_p=1.0, draft_sample=1, draft_temperature=0.0, draft_top_k=0, draft_top_p=0.0, seed=0, test_flags=0):
+    return Sampling(temperature, top_k, top_p, draft_sample, draft_temperature, draft_top_k, draft_top_p, test_flags, seed)
+
+
+def setup_spec_api(lib):
+    vp, ci, cu = C.c_void_p, C.c_int, C.c_uint
+    lib.smk_spec_create.argtypes = [vp, C.POINTER(MtpW), ci]
+    lib.smk_spec_create.restype = vp
+    lib.smk_spec_destroy.argtypes = [vp]
+    lib.smk_spec_bytes.argtypes = [vp]
+    lib.smk_spec_bytes.restype = C.c_size_t
+    sig = {
+        "smk_spec_reset": [vp, vp],
+        "smk_spec_reset_counters": [vp, vp],
+        "smk_spec_prefill_chunk": [vp, ci, C.POINTER(ci), ci, vp],
+        "smk_spec_start": [vp, ci, vp],
+        "smk_spec_set_force": [vp, C.POINTER(ci), ci, vp],
+        "smk_spec_run": [vp, ci, ci, vp, C.POINTER(ci), C.POINTER(ci)],
+        "smk_spec_pld_config": [vp, C.POINTER(PldOpts)],
+        "smk_spec_pld_begin": [vp, C.POINTER(ci), ci, vp],
+        "smk_spec_pld_prewarm": [vp],
+        "smk_spec_run_pld": [vp, ci, vp, C.POINTER(ci), C.POINTER(ci)],
+        "smk_spec_pld_stats": [vp, C.POINTER(C.c_longlong)],
+        "smk_test_trials_pld": [vp, ci, vp, ci, vp, C.POINTER(Sampling), ci, C.POINTER(ci), ci, ci, cu, C.POINTER(ci), C.POINTER(ci)],
+        "smk_spec_launch": [vp, ci, ci, ci, vp],
+        "smk_spec_read": [vp, ci, vp, C.c_size_t],
+        "smk_spec_set_sampling": [vp, C.POINTER(Sampling), vp],
+        "smk_spec_sample_first": [vp, vp],
+        "smk_spec_plain_run": [vp, ci, C.POINTER(ci), vp],
+        "smk_spec_snapshot": [vp, vp],
+        "smk_spec_restore": [vp, vp],
+        "smk_test_draw": [vp, ci, cu, ci, C.POINTER(ci)],
+        "smk_test_dist": [vp, ci, ci, vp, C.POINTER(Sampling), ci, C.POINTER(ci), C.POINTER(ci), C.POINTER(C.c_float)],
+        "smk_test_trials": [vp, ci, vp, ci, vp, C.POINTER(Sampling), ci, ci, cu, C.POINTER(ci), C.POINTER(ci)],
+        "smk_test_philox": [C.POINTER(cu), C.POINTER(cu), C.POINTER(cu)],
+    }
+    for n, a in sig.items():
+        f = getattr(lib, n)
+        f.argtypes, f.restype = a, ci
+
+
+class SpecEngine(Engine):
+    def __init__(self, ctx_max=4096, kv_fp8=0, quant="int4clip", head_quant="int4", head_mode=0, nv=None, verbose=True, **kw):
+        if head_mode == 1:  # the MTP draft head is the full BF16 lm_head: it must stay on the GPU
+            kw["host_tables"] = False
+        super().__init__(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=verbose, **kw)
+        setup_spec_api(self.lib)
+        t0 = time.time()
+        self.M = pack_mtp.load_mtp(self.G, quant=quant, head_quant=head_quant, nv=nv,
