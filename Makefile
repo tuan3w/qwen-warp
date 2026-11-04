@@ -14,5 +14,8 @@ engine:
 test:
 	uv run tests/test_kv_dtypes.py
 	uv run tests/test_host_tables.py
+	uv run tests/test_tool_schema.py
+	uv run tests/test_sampler_dist.py
+	uv run tests/test_tool_call_rate.py
 	uv run tests/test_server_smoke.py
 	uv run tests/test_server_smoke.py --profile long --port 8012

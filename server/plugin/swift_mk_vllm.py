@@ -4,7 +4,7 @@
       --speculative-config '{"method":"mtp","num_speculative_tokens":3}' --kv-cache-dtype auto --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice
 
 The entry point is discovered through the dist-info directory next to this file (put the directory on PYTHONPATH; nothing is pip-installed).  Engine settings come from the stock
-flags (--max-model-len, --kv-cache-dtype, --speculative-config); VLLM_SWIFT_MK_STREAM_CYCLES (default 2) and VLLM_SWIFT_MK_SNAPSHOTS (default 4) and VLLM_SWIFT_MK_PLD (prompt-lookup tail: 0 / 1 / auto, default auto) are the engine knobs; VLLM_SWIFT_MK_HOST_TABLES=1 = --host-tables.
+flags (--max-model-len, --kv-cache-dtype, --speculative-config); VLLM_SWIFT_MK_STREAM_CYCLES (default 2) and VLLM_SWIFT_MK_SNAPSHOTS (default 4) and VLLM_SWIFT_MK_PLD (prompt-lookup tail: 0 / 1 / auto, default auto) are the engine knobs; VLLM_SWIFT_MK_HOST_TABLES=1 = --host-tables; VLLM_SWIFT_MK_SORT_TOOL_SCHEMA=0 = --sort-tool-schema off (default on).
 Without VLLM_SWIFT_MK=1 this plugin does nothing.
 """
 import os
@@ -19,4 +19,5 @@ def register():
     import smk_core_client
 
     smk_core_client.install(stream_cycles=int(os.environ.get("VLLM_SWIFT_MK_STREAM_CYCLES", "2")), snapshots=int(os.environ.get("VLLM_SWIFT_MK_SNAPSHOTS", "4")),
-                            prompt_lookup={"0": False, "1": True}.get(os.environ.get("VLLM_SWIFT_MK_PLD", "auto"), "auto"), host_tables=os.environ.get("VLLM_SWIFT_MK_HOST_TABLES", "0") == "1")
+                            prompt_lookup={"0": False, "1": True}.get(os.environ.get("VLLM_SWIFT_MK_PLD", "auto"), "auto"), host_tables=os.environ.get("VLLM_SWIFT_MK_HOST_TABLES", "0") == "1",
+                            sort_tool_schema=os.environ.get("VLLM_SWIFT_MK_SORT_TOOL_SCHEMA", "1") != "0")

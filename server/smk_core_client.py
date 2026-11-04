@@ -18,6 +18,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.metrics.stats import PrefillStats
 
+import tool_schema
 from smk_runner import GenParams, Runner, STOP
 
 logger = init_logger("vllm.swift_mk")
@@ -66,7 +67,7 @@ def to_gen_params(sp) -> GenParams:
                      temperature=0.0 if greedy else sp.temperature, top_k=sp.top_k, top_p=sp.top_p, seed=sp.seed)
 
 
-OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False)
+OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False, sort_tool_schema=True)
 # The prompt-lookup tail needs the 9-slot DeltaNet ring (+0.62 GiB).  Largest --max-model-len measured to start AND serve on a 23.56 GiB card, keyed by (kv dtype, host tables):
 # bf16 KV 28672 (30720 OOM), fp8 KV 53248 (57344 OOM), int4 KV + host tables 196608 (a 190k prompt served).  Combinations not listed are unmeasured: "auto" then
 # leaves the tail off (pass --prompt-lookup 1 to force it).
@@ -217,6 +218,8 @@ class SwiftCoreClient(EngineCoreClient):
 def install(**options):
     """Make vLLM's AsyncLLM build SwiftCoreClient instead of spawning an EngineCore process."""
     OPTIONS.update(options)
+    if OPTIONS["sort_tool_schema"]:
+        tool_schema.install()
 
     def make(vllm_config, executor_class, log_stats, client_addresses=None, client_count=1, client_index=0, renderer=None):
         return SwiftCoreClient(vllm_config, executor_class, log_stats, client_addresses, client_count, client_index, renderer)

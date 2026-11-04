@@ -34,6 +34,8 @@ def parse_args(argv=None):
     g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.62 GiB for the 9-slot DeltaNet ring: "
                    "--max-model-len <= 28672 with bf16 KV / 53248 with fp8 KV).  auto (default) = on iff --max-model-len fits; the default --max-model-len is 28672 (32768 with --prompt-lookup 0)")
     g.add_argument("--host-tables", action="store_true", help="keep the bf16 embedding + rescoring lm_head (4.7 GiB) in pinned host memory (bit-identical decode, ~free): VRAM for ~190k more KV tokens with int4 KV")
+    g.add_argument("--sort-tool-schema", default="on", choices=["on", "off"], help="render the keys of every tool's function.parameters in sorted order (properties, required, type): the model returns a well-formed tool call "
+                   "more often than with the type-first order most clients send (server/tool_schema.py); off = render the schemas exactly as sent")
     g.add_argument("--profile", default="default", choices=["default", "long"], help="long = --kv-cache-dtype int4_per_token_head --host-tables and a default --max-model-len of 196608 (explicit flags win)")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
                         language_model_only=True, disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
@@ -60,7 +62,7 @@ def main(argv=None):
     args = parse_args(argv)
     import smk_core_client
 
-    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables)
+    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on")
     from vllm.entrypoints.launchers.api_server.entry import run_server
 
     uvloop.run(run_server(args))
