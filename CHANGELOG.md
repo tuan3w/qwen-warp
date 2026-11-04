@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Docker: `Dockerfile`, `docker-compose.yml`, `.env.example` and an entrypoint (`PROFILE`, `EXTRA_ARGS`, `MODEL_DIR`, `PORT`); the checkpoint is mounted, not baked in. Checked once: the image built, the container became healthy and answered a chat request with `--profile long`.
+- `server/serve.py` honours `$SWIFT_MODEL` as the default model path (the README already documented it).
+- Docs: the HyperQwen measurements are a reference point, not a competition, and now name the exact build they describe (image digest and source revision). The roadmap became "Ideas to explore", with the 27B result for a rotated 4-bit KV cache (about 2x lower perplexity cost, not the 10x seen on a 2B proxy).
+
 ## 0.2.0 - 2026-11-04
 
 Serving-only rework (commit 6d0e932 and the docs commits after it).
@@ -9,6 +15,6 @@ Serving-only rework (commit 6d0e932 and the docs commits after it).
 - MTP speculative decoding (k <= 3) with an optional prompt-lookup tail; exact speculative sampling.
 - OpenAI-compatible server on vLLM's frontend with an in-process engine client; multi-turn prefix reuse via DeltaNet state snapshots.
 - Torch stack locked to the +cu130 builds (`uv.lock`).
-- Performance tables against HyperQwen (`docs/PERFORMANCE.md`): single runs, caveats listed there.
+- Reference measurements next to HyperQwen (`docs/PERFORMANCE.md`): single runs, one pinned HyperQwen build, caveats listed there.
 
 Known limits: RTX 3090 only, one model, batch size 1, text only; the 4-bit cache drifts from bf16 output earlier than fp8 does.

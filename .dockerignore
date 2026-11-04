@@ -1,0 +1,8 @@
+.git
+.venv
+.github
+engine/build
+**/__pycache__
+**/*.pyc
+tests
+docs

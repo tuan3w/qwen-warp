@@ -1,0 +1,35 @@
+# docker compose up --build        (first build downloads ~8 GB of Python wheels)
+# Settings are read from the environment or a .env file next to this file, see .env.example.
+services:
+  qwen-warp:
+    build: .
+    image: qwen-warp:local
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      PROFILE: ${PROFILE:-long}
+      EXTRA_ARGS: ${EXTRA_ARGS:-}
+    volumes:
+      # the INT4 checkpoint (ukisai/Swift-1.5-Qwen3.8-27b-INT4), read-only; scripts/fetch_model.sh downloads it
+      - ${MODEL_DIR:-${HOME}/models/swift-1.5-int4}:/models/swift-1.5-int4:ro
+      # Triton / vLLM compile caches: the first start is slower without them
+      - cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1  # the engine pins host memory (host tables, DeltaNet snapshots)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+volumes:
+  cache:

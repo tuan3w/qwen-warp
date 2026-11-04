@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-DEFAULT_MODEL = os.path.expanduser("~/models/swift-1.5-int4")
+DEFAULT_MODEL = os.environ.get("SWIFT_MODEL", os.path.expanduser("~/models/swift-1.5-int4"))
 DEFAULT_MAX_MODEL_LEN = 32768
 DEFAULT_MAX_MODEL_LEN_PLD = 28672  # the prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.62 GiB, measured limit with bf16 KV
 LONG_MAX_MODEL_LEN = 196608  # --profile long: measured to start and serve with the prompt-lookup tail on a 24 GB card (262144 works with --prompt-lookup 0)

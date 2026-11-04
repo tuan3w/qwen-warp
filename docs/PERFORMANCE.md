@@ -63,10 +63,12 @@ Cold prefill: 1,830 tok/s at 16k, falling to 964 tok/s at 262k (178 s for a 190k
 
 Decode slows from 120 to 91 tok/s between 32k and 190k. [INFERENCE] This is the attention scan over a longer cache, since the weight reads are the same at every length; no profile was taken to separate it.
 
-## 4. Comparison with HyperQwen
+## 4. HyperQwen as a reference point
 
-[HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) was run unmodified from its public image `ghcr.io/syv-ai/hyperqwen:latest` on the same card, power limit,
-checkpoint, client and prompts. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
+This is a reference point, not a competition: [HyperQwen](https://github.com/syv-ai/hyperqwen) (syv-ai) is a general project for several models and GPUs, and it changes quickly.
+The numbers below describe **one build only**: its public image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`
+(OCI revision label `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04, tag `latest` at the time), run unmodified on the same card, power limit,
+checkpoint, client and prompts. A newer build may be faster or slower. Decode tok/s at 32k / 64k / 100k / 130k / 190k:
 
 ```
 Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
@@ -75,8 +77,8 @@ ours int4 KV, --prompt-lookup 0             120   128   103   101    91
 ours fp8 KV                                 117   117   108    98   n/s
 HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
 HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
-Speedup, --profile long vs mtp-long       1.30x 1.33x 1.34x 1.50x   n/s
-Speedup, --profile long vs mtp-huge       2.10x 2.21x 2.74x 3.29x 3.48x
+Ratio, --profile long / mtp-long         1.30x 1.33x 1.34x 1.50x   n/s
+Ratio, --profile long / mtp-huge         2.10x 2.21x 2.74x 3.29x 3.48x
 
 Short prompts (385 tokens), tokens/s       code prose  math
 ours int4 KV, --prompt-lookup 0             166   105   156
@@ -84,8 +86,8 @@ ours int4 KV + prompt lookup                170   105   173
 ours fp8 KV                                 164   101   163
 HyperQwen mtp-long                          118    79   121
 HyperQwen mtp-huge                          122    82   128
-Speedup, int4 vs mtp-long                 1.41x 1.33x 1.29x
-Speedup, int4 vs mtp-huge                 1.36x 1.28x 1.22x
+Ratio, int4 / mtp-long                  1.41x 1.33x 1.29x
+Ratio, int4 / mtp-huge                  1.36x 1.28x 1.22x
 
 Cold prefill, seconds to first token        32k   64k  100k  130k  190k
 ours int4 KV                                 18    41    73   104   178
@@ -101,9 +103,9 @@ HyperQwen mtp-huge                             242       -2
 ours int4 KV, --prompt-lookup 0                241       -3   (-1.1 pts, p = 0.45, not significant)
 ```
 
-`n/s` = not served in that run. Speedups are our decode tok/s divided by HyperQwen's in the same column. **What "faster" covers:** single-stream decode speed on this card.
-Against `mtp-long` it is 1.3x to 1.5x at 32k to 130k (that preset was not served at 190k); against `mtp-huge`, the only HyperQwen preset served at 190k, it is 2.1x to 3.5x across
-32k to 190k (91 to 94 tok/s against 27). On short prompts it is 1.2x to 1.4x. **What it does not cover:** prefill (within about 10%, no real win) and quality (within noise across all arms).
+`n/s` = not served in that run. Ratios are our decode tok/s divided by HyperQwen's in the same column. **What the ratios cover:** single-stream decode speed on this card.
+Against `mtp-long` the ratio is 1.3x to 1.5x at 32k to 130k (that preset was not served at 190k); against `mtp-huge`, the only HyperQwen preset served at 190k, it is 2.1x to 3.5x across
+32k to 190k (91 to 94 tok/s against 27). On short prompts it is 1.2x to 1.4x. **What they do not cover:** prefill (within about 10%) and quality (within noise across all arms).
 
 Caveats, all of which matter:
 

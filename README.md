@@ -3,8 +3,8 @@
 **Fast long-context inference for Swift-1.5-Qwen3.8-27B on a single RTX 3090.**
 
 A CUDA decode engine with a 4-bit KV cache and MTP speculative decoding, behind an OpenAI-compatible API. It holds the model's full
-262,144-token context in 24 GB, and on the same card it decodes 1.3x to 1.5x faster than HyperQwen's `mtp-long` and 2.1x to 3.5x faster than its
-long-context preset `mtp-huge` (32k to 190k tokens of context; single runs, caveats in [Performance](#performance)).
+262,144-token context in 24 GB and decodes at 105 to 166 tok/s on short prompts and 91 to 128 tok/s from 32k to 190k tokens of context (single runs;
+caveats in [Performance](#performance)). For orientation it is measured next to [HyperQwen](https://github.com/syv-ai/hyperqwen), a different and more general project; that is a reference point, not a competition.
 
 > **Goal:** push the performance of Qwen3.8-27B (Swift-1.5) on one RTX 3090. The code is shared as a reference to learn from and borrow ideas from, not as a general
 > inference stack: there are no plans to support other models or other GPUs.
@@ -73,6 +73,8 @@ pinned host memory (bit-identical decode) so that VRAM goes to the cache. Explic
 ## Performance
 
 Same RTX 3090 at 350 W, same checkpoint, client and prompts, batch size 1, greedy decoding. Single runs; `n/s` = not served in that run.
+HyperQwen changes quickly, so its numbers describe one build only: image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`
+(source revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04). A newer HyperQwen may well be faster or slower than shown.
 
 ```
 Decode, tokens/s by prompt length           32k   64k  100k  130k  190k
@@ -81,13 +83,13 @@ ours int4 KV, --prompt-lookup 0             120   128   103   101    91
 ours fp8 KV                                 117   117   108    98   n/s
 HyperQwen mtp-long (fp8/int8 KV)             94    88    80    68   n/s
 HyperQwen mtp-huge (4/2-bit KVarN)           58    53    39    31    27
-Speedup, --profile long vs mtp-long       1.30x 1.33x 1.34x 1.50x   n/s
-Speedup, --profile long vs mtp-huge       2.10x 2.21x 2.74x 3.29x 3.48x
+Ratio, --profile long / mtp-long          1.30x 1.33x 1.34x 1.50x   n/s
+Ratio, --profile long / mtp-huge          2.10x 2.21x 2.74x 3.29x 3.48x
 
 Short prompts, tokens/s                    code prose  math
 ours int4 KV, --prompt-lookup 0             166   105   156
 HyperQwen mtp-long                          118    79   121
-Speedup, int4 vs mtp-long                 1.41x 1.33x 1.29x
+Ratio, int4 / mtp-long                    1.41x 1.33x 1.29x
 
 Coding pass@1, 283 tasks                 passed
 bf16 reference                              244
@@ -96,7 +98,7 @@ HyperQwen mtp-long                          244
 HyperQwen mtp-huge                          242
 ```
 
-"Faster" here means single-stream decode speed. Prefill is within about 10% of HyperQwen (no win), and coding accuracy is within noise across all arms.
+The ratios compare single-stream decode speed only, on the pinned HyperQwen build above. Prefill is within about 10% of it, and coding accuracy is within noise across all arms.
 Cold prefill is 1,830 tok/s at 16k falling to about 960 tok/s at 262k, so a 190k prompt takes about 3 minutes; later turns reuse the cached prefix.
 
 Read the numbers with these caveats:
@@ -158,4 +160,4 @@ tests/     checkpoint-only tests         docs/  architecture and performance not
 ## Credits and license
 
 MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. Third-party credits and what was and was not taken from each: [NOTICE](NOTICE).
-It was compared against [HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware.
+It was measured next to [HyperQwen](https://github.com/syv-ai/hyperqwen) on identical hardware, using its public image revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`. We are not competing with it: it is a general serving stack for several models and GPUs, and this engine is a single-purpose reference for one model on one card. Thanks to its authors for publishing their work and benchmarks.

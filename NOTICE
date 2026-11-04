@@ -37,9 +37,11 @@ Third-party projects: credits and what was taken
     one-liners (warp-shuffle sum, lane/warp index, mma.sync operand list). No open-jet file is
     included, so the AGPL does not apply to this repository.
 
-  HyperQwen (syv-ai, Apache-2.0): comparison target only. Its public container image was
-    run unmodified as a baseline on the same hardware; none of its patches, scripts or model
-    files are included.
+  HyperQwen (syv-ai, Apache-2.0): reference point for measurements only, not a competitor. Its
+    public container image was run unmodified on the same hardware: ghcr.io/syv-ai/hyperqwen
+    @sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8, OCI revision
+    bd6c5e2f11628483109031d99d1cc4a7d22b1a26, built 2026-10-04 (the project changes quickly).
+    None of its patches, scripts or model files are included.
 
   vLLM (Apache-2.0): used as a library and as the baseline. server/ drives vLLM's AsyncLLM and
     OpenAI frontend through an in-process engine-core client and a plugin; no vLLM file is
