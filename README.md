@@ -2,8 +2,8 @@
 
 **Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s.**
 
-I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt** and fits the model's full 262,144-token context in 24 GB.
-At long context (32k to 190k), on the same card, the same day and the same prompts, it is **1.2x to 1.3x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s `mtp-long` and 1.9x to 3.6x faster than its `mtp-huge`**. On short prompts, HyperQwen's DFlash2 preset is faster than this engine (about 1.5x on code); I did not measure DFlash2 at long context.
+I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
+At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than this engine (about 1.5x on code); I did not measure DFlash2 at long context.
 I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
 
 ## Numbers
