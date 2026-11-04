@@ -29,8 +29,8 @@ make room for a 262,144-token context.
 | Path | What is in it |
 |---|---|
 | `engine/` | the CUDA kernels (`src/`), C headers (`include/`), Python drivers, the draft-vocabulary lists, and its own `Makefile` |
-| `server/` | `serve.py` (entry point), the vLLM engine-core client, the engine driver, a small vLLM plugin |
-| `tests/` | three tests that need only the checkpoint and the GPU ([what they check](GETTING_STARTED.md#4-verify-it-works)) |
+| `server/` | `serve.py` (entry point), the vLLM engine-core client, the engine driver, the tool-schema hook (`tool_schema.py`), a small vLLM plugin |
+| `tests/` | the tests `make test` runs, most of them need the checkpoint and the GPU, a few neither ([what they check](GETTING_STARTED.md#4-verify-it-works)) |
 | `scripts/` | `fetch_model.sh` (weights download), `check_repo.sh` (checks that need no GPU, run by CI) |
 | `docs/` | this documentation |
 | `Dockerfile`, `docker-compose.yml`, `docker/`, `.env.example` | the container image, its compose file, its entrypoint and its settings |
@@ -43,8 +43,9 @@ make room for a 262,144-token context.
 | Layer | File | Role |
 |---|---|---|
 | Server | `server/serve.py` | vLLM 0.30 OpenAI frontend (`run_server`) with our engine-core client |
-| | `server/smk_core_client.py` | in-process vLLM `EngineCoreClient`: maps the vLLM config to engine settings, FIFO queue, abort, streaming |
-| | `server/smk_runner.py` | engine driver: fast prefill, MTP cycles, sampling, DeltaNet snapshots for multi-turn prefix reuse |
+| | `server/smk_core_client.py` | in-process vLLM `EngineCoreClient`: maps the vLLM config to engine settings, checks the length against the free GPU memory (`vram_need_mib`), rejects unsupported parameters, FIFO queue, abort, streaming |
+| | `server/smk_runner.py` | engine driver: fast prefill (a plan that depends on the prompt only), MTP cycles, sampling, DeltaNet snapshots for multi-turn prefix reuse |
+| | `server/tool_schema.py` | sorts the keys of every tool's `function.parameters` before vLLM's chat template renders them (`--sort-tool-schema`) |
 | | `server/plugin/` | a small vLLM plugin |
 | Engine (Python) | `engine/spec.py` | `SpecEngine`: MTP speculative decoding (k <= 3, plus a prompt-lookup tail) on top of `Engine` |
 | | `engine/prefill.py` | `FastPrefill`: chunked prefill writing the engine's caches |
@@ -55,6 +56,7 @@ make room for a 262,144-token context.
 | | `engine/src/attn.cu` | attention and the KV cache |
 | | `engine/src/head_q.cu` | quantised lm_head |
 | | `engine/src/mtp.cu`, `mtp_sample.cu`, `pld.cu` | MTP, sampling, prompt lookup |
+| | `engine/src/proc.cu`, `proc.h` | request-level logit processors (penalties, `logit_bias`, `min_tokens`, `allowed_token_ids`, `min_p`) inside the sampling graphs |
 | | `engine/src/engine.cu`, `misc.cu`, `prefill.cu` | engine glue, norms and misc ops, prefill kernels |
 
 All kernel entry points take a `cudaStream_t` and can be captured in a CUDA graph: no host sync, no dynamic allocation, device-side scalars for position and context length,
@@ -75,9 +77,10 @@ so one captured graph serves every step.
 | Piece | What it does |
 |---|---|
 | **MTP** | the checkpoint's own MTP layer, packed to int4 offline, plus a restricted-vocabulary int4 draft head (`engine/draft_vocab_*.npy`). One cycle drafts k <= 3 tokens and verifies them in one pass |
-| **Exact sampling** | speculative sampling is exact, so drafts change the speed, not the output distribution |
-| **Prompt-lookup tail** (`pld.cu`) | a host n-gram proposer adds up to 4 more rows to the verification pass (up to 8 rows). It needs a 9-slot DeltaNet ring (+0.62 GiB), which is why `--prompt-lookup auto` only turns it on where the combination was measured to fit (`PLD_MAX_LEN` in `server/smk_core_client.py`) |
-| **Exact rescoring head** | draft and verify use a quantised lm_head (int4 or int8) whose top-R candidates are rescored with the bf16 head, so the output ids equal what the bf16 head would give. This is also why the bf16 table can live in host memory: only the R candidate rows are read per step |
+| **Exact sampling** | speculative sampling is exact in distribution, so drafts change the speed, not the output distribution. A seeded request is reproducible for a fixed configuration, but another `--num-speculative-tokens` or `--prompt-lookup` draws different tokens ([Usage](USAGE.md#seeds-and-reproducibility)); greedy ids are deterministic for a fixed configuration, and across configurations they can differ at a bf16 near-tie on long prompts |
+| **Logit processors** | the processors (`proc.cu`) run on every verify row, with the draft tokens before the row counted as generated, so they stay exact under speculation (stock vLLM refuses `min_p` and `logit_bias` there). Draft proposals ignore them, which lowers acceptance. Order and costs: [Usage](USAGE.md#sampling-parameters) |
+| **Prompt-lookup tail** (`pld.cu`) | a host n-gram proposer adds up to 4 more rows to the verification pass (up to 8 rows). It needs a 9-slot DeltaNet ring (+0.56 GiB, 0.67 GiB with `--host-tables`), which is why `--prompt-lookup auto` turns it on only where the length leaves 256 MiB of the free GPU memory next to it (`vram_need_mib` in `server/smk_core_client.py`) |
+| **Exact rescoring head** | draft and verify use a quantised lm_head (int4 or int8) whose top-R candidates are rescored with the bf16 head (R = 16 for greedy, 64 for sampling), so the output ids equal what the bf16 head would give. This is also why the bf16 table can live in host memory: only the R candidate rows are read per step |
 
 ## The 4-bit KV cache
 
@@ -103,8 +106,9 @@ to the KV cache. Decode output is bit-identical (`tests/test_host_tables.py`). I
 | Behaviour | Detail |
 |---|---|
 | Concurrency | one request decodes at a time; the rest queue FIFO; a client disconnect aborts the running request |
-| Prefix reuse | DeltaNet states are snapshotted at chat-turn boundaries (`--snapshots N`, 151 MB of pinned host RAM each); a follow-up turn reuses the cached prefix and reports `cached_tokens` |
-| API | chat and text completions, streaming, stop strings, seeds and the supported sampling parameters, tool calls (`qwen3_coder` parser), reasoning output (`qwen3` parser). Details: [Usage](USAGE.md) |
+| Start-up memory check | the server reads the free GPU memory at start, compares it with a fitted model of what the engine needs (fixed part + KiB per token x length) and refuses a length that does not fit before any weight is loaded ([Usage](USAGE.md#memory-and-context)) |
+| Prefix reuse | DeltaNet states are snapshotted at the last two cut points of a prefill plan that depends on the prompt only (`--snapshots N`, 151 MB of pinned host RAM each); a follow-up turn reuses the cached prefix and reports `cached_tokens`; a resumed prefill is bit-identical to a cold one |
+| API | chat and text completions, streaming, stop strings, seeds and the supported sampling parameters, tool calls (`qwen3_coder` parser), reasoning output (`qwen3` parser, field `reasoning`). Details: [Usage](USAGE.md) |
 
 ## Design choices and what they cost
 
@@ -114,4 +118,5 @@ to the KV cache. Decode output is bit-identical (`tests/test_host_tables.py`). I
 | Batch size 1 | the goal is single-stream decode speed on one card | no batching, concurrent requests queue |
 | One GPU generation (sm_86) | kernels use its instruction set directly (mma.sync, cp.async, lop3) | no portability |
 | Exact speculative sampling | drafts never change the output distribution | no approximate-acceptance speedup |
-| 4-bit KV cache without rotation | simplest format that makes 262k fit | lossy: [rotation was measured](IDEAS.md#a-rotated-4-bit-kv-cache) and only helps about 2x |
+| 4-bit KV cache without rotation | simplest format that makes 262k fit | lossy: [rotation was measured](IDEAS.md#a-rotated-4-bit-kv-cache) and only helps about 2x; the well-formed tool-call rate of a minimal schema fell to 39% as clients send it ([Usage](USAGE.md#tool-calls)) |
+| Tool schemas rendered with sorted keys (`--sort-tool-schema`, on by default) | lifts that rate to 87% on the 4-bit cache without touching the engine or the sampler | the prompt differs from what a client sent (not its JSON or the call); `off` renders the schema as sent |
