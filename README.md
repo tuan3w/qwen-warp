@@ -2,8 +2,8 @@
 
 **Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s.**
 
-I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt**, fits the model's full 262,144-token context in 24 GB,
-and on the same card, the same day and the same prompts it is **1.2x to 1.3x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s `mtp-long` and 1.9x to 3.6x faster than its `mtp-huge`** (single-stream decode; table below).
+I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. It decodes **94 to 133 tokens/s with 32k to 262k tokens in the prompt** and fits the model's full 262,144-token context in 24 GB.
+At long context (32k to 190k), on the same card, the same day and the same prompts, it is **1.2x to 1.3x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s `mtp-long` and 1.9x to 3.6x faster than its `mtp-huge`**. On short prompts, HyperQwen's DFlash2 preset is faster than this engine (about 1.5x on code); I did not measure DFlash2 at long context.
 I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
 
 ## Numbers
@@ -32,6 +32,8 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
 | *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
 | **speedup**, qwen-warp 4-bit KV vs `mtp-long` | **1.27x** | **1.22x** | **1.21x** |
+| *reference:* HyperQwen DFlash2 (earlier session, 2026-11-01, same card and 350 W) | 254 | 103 | 225 |
+| qwen-warp 4-bit KV vs DFlash2 (different days) | 0.67x | 1.05x | 0.72x |
 
 | | |
 |---|---|
@@ -39,7 +41,7 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
 | Ready after | 21 to 30 s |
 | Quality of the 4-bit cache | perplexity +0.26% at 98k; coding pass@1 241 against 244 of 283 tasks (not significant). It missed the planted needle at 100k in the speed sweeps (fp8 found it every time). Tool calls are sensitive to it: [what was measured](docs/USAGE.md#tool-calls) |
-| Not measured | multi-turn agent task success, other GPUs, other power limits |
+| Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and many concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine serves one request at a time) |
 
 HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
 
