@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 #include <math.h>
 
+#include "attn.h"
 #include "engine_impl.h"
 #include "kvrot.cuh"
 #include "mtp.h"
@@ -368,6 +369,18 @@ cudaError_t swiftmk_kv_aux_copy(smk_engine* e, void* host, int dir, cudaStream_t
     if (r != cudaSuccess) return r;
   }
   return dir == 0 ? cudaStreamSynchronize(st) : cudaSuccess;
+}
+
+// Host prefix cache (attn.h "chunk" format): KV rows [a, a + m) of all 16 attention layers, layer after layer.  Bytes of the packed host buffer of one m-row chunk.
+size_t swiftmk_kv_range_bytes(smk_engine* e, int m) { return (size_t)16 * swiftmk_attn_kv_range_bytes(e->kv_dtype, m); }
+// dir 0: device -> host, 1: host (pinned) -> device; copies rows [r0, r1) of the chunk to / from device rows dev_row0 + r0 ..; stream ordered, no synchronisation (the caller syncs).
+cudaError_t swiftmk_kv_range_copy(smk_engine* e, void* host, int m, int dev_row0, int r0, int r1, int dir, cudaStream_t st) {
+  const size_t per = swiftmk_attn_kv_range_bytes(e->kv_dtype, m);
+  for (int l = 0; l < 16; l++) {
+    cudaError_t r = swiftmk_attn_kv_range_copy(e->kv + (size_t)l * e->kv_layer_bytes, e->ctx_max, e->kv_dtype, (char*)host + (size_t)l * per, m, dev_row0, r0, r1, dir, st);
+    if (r != cudaSuccess) return r;
+  }
+  return cudaSuccess;
 }
 
 void* smkp_engine_ptr(smk_engine* e, int what) {

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Host prefix cache: the GPU still holds one conversation, but a request that does not continue it no longer destroys it. The engine spills the conversation's KV rows and snapshots to pinned host memory (`--prefix-cache-gb`, default 6 GiB, LRU) and restores a stored conversation when a later request continues it. Agents interleave a long main conversation with helper calls and subagents; on a replayed agent trace (12k-token system prompt, 6 turns, helper requests, 2x2 parallel subagents) the trace takes 40 s instead of 121 s and the median first-token delay of the main turns drops from 8.6 s to 1.1 s. A resumed request is bit-identical to a cold one.
+- `--system-checkpoint on|off` (default on): one extra snapshot at the end of each long system prompt, so parallel agents sharing a system prompt resume there.
+- Engine API `swiftmk_kv_range_bytes/copy` and `smk_spec_mtpkv_range_bytes/copy` (copy a row range of the KV cache to and from pinned host memory for bf16, fp8 and int4).
+
+### Changed
+
+- `--snapshots` defaults to 16 (was 4): it now counts the buffers of the GPU conversation and of the host cache together; they are allocated on demand beyond the first four.
+
 ## 0.4.0 - 2026-11-05
 
 ### Changed

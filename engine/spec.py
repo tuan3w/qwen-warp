@@ -103,6 +103,10 @@ def setup_spec_api(lib):
     for n, a in sig.items():
         f = getattr(lib, n)
         f.argtypes, f.restype = a, ci
+    lib.smk_spec_mtpkv_range_bytes.argtypes = [vp, ci]
+    lib.smk_spec_mtpkv_range_bytes.restype = C.c_size_t
+    lib.smk_spec_mtpkv_range_copy.argtypes = [vp, vp, ci, ci, ci, ci, ci, vp]
+    lib.smk_spec_mtpkv_range_copy.restype = ci
 
 
 class SpecEngine(Engine):
@@ -145,6 +149,14 @@ class SpecEngine(Engine):
         smk.check(self.lib.smk_spec_reset(self.sp, self.st), "spec_reset")
         smk.check(self.lib.smk_spec_set_force(self.sp, None, 0, self.st), "set_force")
         self._emitted = 0
+
+    # ---- host prefix cache: rows [a, a + m) of the MTP layer's KV as a packed pinned chunk (include/attn.h)
+    def mtp_chunk_new(self, m):
+        return torch.empty(int(self.lib.smk_spec_mtpkv_range_bytes(self.sp, m)), dtype=torch.uint8, pin_memory=True)
+
+    def mtp_chunk_copy(self, t, m, dev_row0, r0, r1, to_host):
+        assert t.numel() == self.lib.smk_spec_mtpkv_range_bytes(self.sp, m) and t.is_pinned()
+        smk.check(self.lib.smk_spec_mtpkv_range_copy(self.sp, C.c_void_p(t.data_ptr()), m, dev_row0, r0, r1, 0 if to_host else 1, self.st), "mtp_chunk_copy")
 
     def reset_counters(self):
         """Zero the device counters (philox cycle counter, emitted count, histogram) and the output ring but keep the MTP KV (prefix reuse); the engine state is not touched."""

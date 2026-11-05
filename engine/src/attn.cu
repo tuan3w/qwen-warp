@@ -1322,6 +1322,39 @@ size_t swiftmk_attn_kv_bytes(int ctx_max, int kv_dtype) {
   return (size_t)2 * NKV * (size_t)ctx_max * HD * (kv_dtype == 0 ? 2 : 1);
 }
 
+// ---- prefix spill / restore (see attn.h): rows are contiguous per plane in every layout, so a row range is 8 (bf16, fp8) or 16 (int4: codes + meta) plain copies
+size_t swiftmk_attn_kv_range_bytes(int kv_dtype, int m) {
+  const size_t row = kv_dtype == 0 ? (size_t)HD * 2 : kv_dtype == 1 ? (size_t)HD : (size_t)HD / 2 + 4;  // int4: 128 code bytes + one u32 meta word per row
+  return (size_t)2 * NKV * (size_t)m * row;
+}
+
+cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype, void* host, int m, int dev_row0, int r0, int r1, int dir, cudaStream_t stream) {
+  if (kv_dtype < 0 || kv_dtype > 2 || m < 0 || r0 < 0 || r1 < r0 || r1 > m || dev_row0 < 0 || dev_row0 + r1 > ctx_max) return cudaErrorInvalidValue;
+  if (r1 == r0) return cudaSuccess;
+  const int planes = 2 * NKV;
+  const size_t code = kv_dtype == 0 ? (size_t)HD * 2 : kv_dtype == 1 ? (size_t)HD : (size_t)HD / 2;  // bytes of one row's code / value payload
+  const cudaMemcpyKind kind = dir == 0 ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+  char* dev = (char*)layer_kv;
+  char* hst = (char*)host;
+  for (int p = 0; p < planes; p++) {
+    char* d = dev + ((size_t)p * ctx_max + dev_row0 + r0) * code;
+    char* h = hst + ((size_t)p * m + r0) * code;
+    cudaError_t r = dir == 0 ? cudaMemcpyAsync(h, d, (size_t)(r1 - r0) * code, kind, stream) : cudaMemcpyAsync(d, h, (size_t)(r1 - r0) * code, kind, stream);
+    if (r != cudaSuccess) return r;
+  }
+  if (kv_dtype == 2) {  // meta words: u32 [plane][ctx_max] after the code region (kvrot.cuh layout), packed [plane][m] after the code part of the chunk
+    char* dmeta = dev + (size_t)planes * ctx_max * code;
+    char* hmeta = hst + (size_t)planes * m * code;
+    for (int p = 0; p < planes; p++) {
+      char* d = dmeta + ((size_t)p * ctx_max + dev_row0 + r0) * 4;
+      char* h = hmeta + ((size_t)p * m + r0) * 4;
+      cudaError_t r = dir == 0 ? cudaMemcpyAsync(h, d, (size_t)(r1 - r0) * 4, kind, stream) : cudaMemcpyAsync(d, h, (size_t)(r1 - r0) * 4, kind, stream);
+      if (r != cudaSuccess) return r;
+    }
+  }
+  return cudaSuccess;
+}
+
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
                               int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, void* out, void* ws,
                               cudaStream_t stream) {

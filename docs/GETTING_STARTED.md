@@ -16,7 +16,7 @@ Contents: [1. Prerequisites](#1-prerequisites) | [2. Get the weights](#2-get-the
 | uv | a recent version; it installs Python 3.12 and every locked dependency | `uv --version` | native, and the weights download |
 | C compiler | a normal `gcc`/`build-essential`: Triton compiles small C stubs at run time | `gcc --version` | native |
 | Disk | weights 19 GB, plus about 8 GB for the environment (native) or about 24 GB for the image (Docker) | `df -h` | both |
-| Host RAM | about 5 GiB of **pinned** memory in the long-context profile (4.7 GiB of tables plus 151 MB per multi-turn snapshot, 183 MB with the 4-bit cache, 4 snapshots by default) | `free -g` | both |
+| Host RAM | about 5 GiB of **pinned** memory in the long-context profile (4.7 GiB of tables plus 151 MB per multi-turn snapshot, 183 MB with the 4-bit cache, up to 16 snapshots by default, plus up to 6 GiB for the KV rows of other conversations, `--prefix-cache-gb`; both fill on demand) | `free -g` | both |
 | Hugging Face account | to accept the checkpoint's licence | | both |
 
 The server uses almost the whole card. If a desktop or another job holds VRAM, free it first: a desktop alone takes about 0.6 GiB. The server measures the free GPU memory when it starts and sizes the

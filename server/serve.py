@@ -31,7 +31,9 @@ def parse_args(argv=None):
     g = parser.add_argument_group("swift-mk")
     g.add_argument("--num-speculative-tokens", type=int, default=None, choices=[0, 1, 2, 3], help="MTP drafts per cycle (0 = plain decode; default 3 unless --speculative-config is given)")
     g.add_argument("--stream-cycles", type=int, default=2, help="speculative cycles per host sync = streaming granularity (one cycle ~ 24 ms, 1-4 tokens)")
-    g.add_argument("--snapshots", type=int, default=4, help="DeltaNet state snapshots kept for multi-turn prefix reuse (151 MB pinned host RAM each, 183 MB with the 4-bit KV cache; 0 = off)")
+    g.add_argument("--snapshots", type=int, default=16, help="DeltaNet state snapshots kept for multi-turn prefix reuse, in total over the device lineage and the host prefix cache (151 MB pinned host RAM each, 183 MB with the 4-bit KV cache; 0 = off)")
+    g.add_argument("--system-checkpoint", default="on", choices=["on", "off"], help="one extra state snapshot per long prompt at the end of its system prompt (the first chat-turn boundary after 1,024 tokens), so parallel agents that share a system prompt and differ after it resume there; costs one 183 MB snapshot per conversation")
+    g.add_argument("--prefix-cache-gb", type=float, default=6.0, help="pinned host RAM budget for the KV rows of OTHER conversations (spilled from the GPU when a request does not continue the cached one, restored when one does; agents interleave a main conversation, helper calls and subagents); ~21 KB per token with the 4-bit KV cache, 37 KB with fp8, 70 KB with bf16; 0 = one cached conversation only")
     g.add_argument("--prompt-lookup", default="auto", choices=["0", "1", "auto"], help="K11: MTP chain + prompt-lookup (n-gram) tail, verify up to 8 rows per cycle (needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring; "
                    "auto (default) = on iff --max-model-len leaves 256 MiB of the free GPU memory next to it, e.g. up to 23k with bf16 KV, 42k with fp8 KV, any length with int4 KV + --host-tables); "
                    "the default --max-model-len is 20480 (28672 with --prompt-lookup 0)")
@@ -64,7 +66,7 @@ def main(argv=None):
     args = parse_args(argv)
     import smk_core_client
 
-    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on")
+    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prefix_cache_gb=args.prefix_cache_gb, system_checkpoint=args.system_checkpoint == "on", prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on")
     from vllm.entrypoints.launchers.api_server.entry import run_server
 
     uvloop.run(run_server(args))

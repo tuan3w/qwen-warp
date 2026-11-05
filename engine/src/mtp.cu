@@ -498,6 +498,11 @@ cudaError_t smk_spec_read(smk_spec* s, int what, void* host, size_t bytes) {
 
 size_t smk_spec_bytes(smk_spec* s) { return s->bytes; }
 // MTP layer KV cache (bf16 [2][4][ctx_max][256]); used by the fast prefill (prefill.cu) to commit prompt pairs.
+// Host prefix cache: the MTP layer's KV (always bf16, one layer) in the same chunk format as the main cache (attn.h).
+size_t smk_spec_mtpkv_range_bytes(smk_spec* s, int m) { return swiftmk_attn_kv_range_bytes(0, m); }
+cudaError_t smk_spec_mtpkv_range_copy(smk_spec* s, void* host, int m, int dev_row0, int r0, int r1, int dir, cudaStream_t st) {
+  return swiftmk_attn_kv_range_copy(s->kvbuf, s->e->ctx_max, 0, host, m, dev_row0, r0, r1, dir, st);
+}
 void* smk_spec_kv_ptr(smk_spec* s) { return s->kvbuf; }
 
 // ---------------------------------------------------------------------------------------------- K7 sampling

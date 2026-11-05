@@ -15,6 +15,8 @@ Prefix reuse (DeltaNet state cannot be rewound, so the state is checkpointed ins
     divergence is right after "<|im_start|>assistant\\n") that is more than w4_max tokens after the previous end, and at len(prompt)-1 when the last row is not folded (a repeated prompt);
   * a new request with ids R: L = common prefix of R and the lineage; resume from the snapshot with the largest q <= L-1 (MTP pair q-1 needs token q to be common) that is a segment
     end of R's plan, restore it into the current DeltaNet ring slot, continue the prefill at position q (main KV / MTP KV positions >= q are simply overwritten).  No snapshot -> reset + full prefill.
+  * host tier (prefix_store.py): before the device lineage is overwritten by a request that does not continue it, its KV rows up to its last snapshot and its snapshots are SPILLED to a
+    pinned host store (budget `prefix_cache_gb`); a later request that continues a stored conversation RESTORES it (KV rows, then the snapshot) and prefills only the new tokens.  Same exactness.
 """
 import ctypes as C
 import random
@@ -30,6 +32,8 @@ ENGINE = Path(__file__).resolve().parent.parent / "engine"
 sys.path.insert(0, str(ENGINE))
 from spec import SpecEngine, make_pld, smk  # noqa: E402
 from prefill import FastPrefill  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prefix_store import Chunk, PrefixStore  # noqa: E402
 
 IM_START = 248045  # <|im_start|>
 MAX_TOP_K = 64  # the engine's sampler keeps at most the 64 highest logits (top_k > 64 is rejected by the server; top_k <= 0 = no top-k filter = these 64)
@@ -63,12 +67,13 @@ class GenParams:
                     bias=self.logit_bias, allowed=self.allowed_token_ids, stop=sorted(self.min_tokens_ids))
 
 
-@dataclass
+@dataclass(eq=False)  # identity comparison: the fields are tensors (== is not a bool), and list.remove / `in` must find THIS buffer
 class Snap:
     pos: int
     dn: torch.Tensor
     conv: torch.Tensor
     aux: object = None  # engine-specific extra cache state saved with the snapshot (e.g. an exact recent-token ring); None for engines that have none
+    sticky: bool = False  # the system-prompt checkpoint: kept when a conversation outgrows its snapshot budget (the lowest position would otherwise go first)
 
 
 @dataclass
@@ -80,10 +85,13 @@ class Stats:
     cycles: int = 0
     gen_s: float = 0.0
     snaps: list = field(default_factory=list)
+    source: str = "cold"  # where the resume point came from: cold | device | host
+    spill_s: float = 0.0  # time spent moving the previous device lineage to the host store
+    restore_s: float = 0.0  # time spent restoring a stored lineage (KV rows + snapshot)
 
 
 class Runner:
-    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False):
+    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
@@ -99,8 +107,13 @@ class Runner:
         self.load_s = time.time() - t0
         self.lineage = None  # np.int32 array: tokens whose main KV is valid in the device caches (see module docstring)
         self.snaps: list[Snap] = []
-        # all snapshot buffers are allocated up front (cudaHostAlloc of 151 MB costs ~20 ms): len(snaps) + len(pool) == max_snaps
-        self.pool: list[Snap] = [Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory(), self.e.kv_aux_new() if hasattr(self.e, "kv_aux_new") else None) for _ in range(max_snaps)]
+        self.pool: list[Snap] = []
+        self._made = 0  # snapshot buffers allocated so far (device snapshots + pool + stored entries'), at most max_snaps
+        for _ in range(min(max_snaps, 4)):  # the first ones up front (cudaHostAlloc of 151 MB costs ~20 ms); the rest are made on demand
+            self.pool.append(self._new_snap())
+        self.store = PrefixStore(int(prefix_cache_gb * (1 << 30))) if prefix_cache_gb > 0 and max_snaps > 0 else None  # host tier under the device lineage
+        self.system_checkpoint = system_checkpoint and max_snaps >= 3  # one more snapshot per long prompt: the first chat-turn boundary after SYSTEM_MIN tokens (see _system_end)
+        self.min_spill = min_spill  # lineages whose last snapshot is below this are not worth a spill (a cold prefill of them is shorter than a restore)
         self.last = Stats()
         self._procs_on = False
         if warmup:
@@ -129,15 +142,15 @@ class Runner:
         self.pool += [s for s in self.snaps if s not in keep]
         self.snaps = list(keep)
 
-    def _snapshot(self, i):
+    def _snapshot(self, i, sticky=False):
         """DeltaNet + conv state of the engine's current ring slot -> a host snapshot buffer for position i."""
         self._free_snaps([x for x in self.snaps if x.pos != i])  # same position: reuse the buffer
-        if not self.pool:  # evict the oldest (lowest position: conversation prompts grow, early boundaries are the least useful)
-            old = min(self.snaps, key=lambda x: x.pos)
-            self._free_snaps([x for x in self.snaps if x is not old])
+        if not self.pool:
+            self._grow_pool()
         s = self.pool.pop()
         cur = self._cur()
         s.pos = i
+        s.sticky = sticky
         s.dn.copy_(self.fp.dn_state[:, cur])
         s.conv.copy_(self.fp.dn_conv[:, cur])
         if s.aux is not None:
@@ -159,6 +172,85 @@ class Runner:
     def drop_cache(self):
         self.lineage = None
         self._free_snaps([])
+        if self.store is not None:
+            self.pool += self.store.clear()
+
+    def _new_snap(self):
+        self._made += 1
+        return Snap(0, torch.empty(48, 48, 128, 128, dtype=torch.float32).pin_memory(), torch.empty(48, 10240 * 3, dtype=torch.bfloat16).pin_memory(), self.e.kv_aux_new() if hasattr(self.e, "kv_aux_new") else None)
+
+    def _grow_pool(self):
+        """Get a snapshot buffer into the pool: allocate one while under max_snaps, else take the buffers of the least recently used stored entry, else evict the oldest device snapshot
+        (conversation prompts grow, so the lowest boundary is the least useful)."""
+        if self._made < self.max_snaps:
+            self.pool.append(self._new_snap())
+            return
+        while self.store is not None and not self.pool:
+            rel = self.store.evict_lru()
+            if rel is None:
+                break
+            self.pool += rel
+        if not self.pool:
+            old = min(self.snaps, key=lambda x: (x.sticky, x.pos))
+            self._free_snaps([x for x in self.snaps if x is not old])
+
+    def _spill_device(self, keep=None):
+        """Move the device lineage (KV rows up to its last snapshot + its snapshots) into the host store before the device caches are overwritten.  Without a store, or for a lineage
+        shorter than min_spill, the snapshots are just freed.  Returns the seconds spent."""
+        t0 = time.time()
+        snaps, lin, store = self.snaps, self.lineage, self.store
+        s_max = max((x.pos for x in snaps), default=0)
+        if store is None or lin is None or not snaps or s_max < self.min_spill or len(lin) <= s_max:
+            self._free_snaps([])
+            return 0.0
+        ids = lin[: s_max + 1]
+        ent = store.extendable(ids, s_max)
+        start = ent.n_kv if ent is not None else 0
+        m = s_max - start
+        e = self.e
+        chunk = None
+        if m > 0:
+            main, mtp = e.kv_chunk_new(m), e.mtp_chunk_new(m)
+            nb = main.numel() + mtp.numel()
+            if nb > store.budget:  # can never fit: do not keep a lineage the budget cannot hold
+                self._free_snaps([])
+                return time.time() - t0
+            self.pool += store.fit(nb, keep=(keep, ent))
+            e.kv_chunk_copy(main, m, start, 0, m, True)
+            e.mtp_chunk_copy(mtp, m, start, 0, m, True)
+            torch.cuda.synchronize()
+            chunk = Chunk(start, m, main, mtp, nb)
+        moved, self.snaps = self.snaps, []  # the snapshot buffers now belong to the entry
+        if ent is None:
+            _, rel = store.add(ids, s_max, chunk, moved)
+        else:
+            rel = store.extend(ent, ids, s_max, chunk, moved)
+        self.pool += rel
+        return time.time() - t0
+
+    def _load_entry(self, ent, snap, ids):
+        """Restore the stored lineage `ent` up to snap.pos into the device caches: the KV rows of the main cache and of the MTP layer, then the snapshot (DeltaNet + conv + int4 aux)."""
+        e, s = self.e, snap.pos
+        for ch in ent.chunks:
+            if ch.a >= s:
+                break
+            r1 = min(ch.m, s - ch.a)
+            e.kv_chunk_copy(ch.main, ch.m, ch.a, 0, r1, False)
+            e.mtp_chunk_copy(ch.mtp, ch.m, ch.a, 0, r1, False)
+        torch.cuda.synchronize()
+        self.store.touch(ent)
+        self.lineage = np.asarray(ids[:s], dtype=np.int32)  # the device KV now holds rows [0, s) of THIS prompt
+        e.reset_counters()
+        self._restore(snap)
+        self.pool += self.store.fit(0, keep=ent)  # the spill before the restore had to keep `ent` alive: trim back to the budget now (LRU, so the older conversation goes)
+
+    def _pick(self, ids, ends):
+        """Where to resume `ids`: ("device", snap), ("host", entry, snap) or None (cold).  The largest resume position wins, ties go to the device (no copy)."""
+        dev = self._choose(ids, ends)
+        host = self.store.best(ids, ends) if self.store is not None else None
+        if host is not None and (dev is None or host[1].pos > dev.pos):
+            return ("host", host[0], host[1])
+        return ("device", dev) if dev is not None else None
 
     def _choose(self, ids, ends):
         """Snapshot to resume from for prompt `ids` whose plan has the segment ends `ends` (None = cold start)."""
@@ -192,11 +284,26 @@ class Runner:
             i = j
         return ends, False
 
+    SYSTEM_MIN = 1024
+
+    def _system_end(self, ids, ends):
+        """The system-prompt checkpoint: the first segment end that is a chat-turn boundary (token ends[j] - 2 is <|im_start|>) at >= SYSTEM_MIN tokens, else None.  Parallel agents of one type
+        share a long system prompt and differ after it, so the state exactly at the end of that prompt is the resume point they have in common (SGLang's branching checkpoint)."""
+        if not self.system_checkpoint:
+            return None
+        for j in ends:
+            if j >= self.SYSTEM_MIN and ids[j - 2] == IM_START:
+                return j
+        return None
+
     def _prefill(self, ids, q, ends, folded, cancelled):
         """Process ids[q:] (state valid for [0, q), q = 0 or a segment end of the plan) following the plan; the last token as the head step.  Snapshots after the last (up to)
         two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix)."""
         e, fp = self.e, self.fp
         snap_at = set(ends[len(ends) - min(2, self.max_snaps) :]) if self.max_snaps else set()
+        sys_at = self._system_end(ids, ends)
+        if sys_at is not None and sys_at > q:
+            snap_at.add(sys_at)
         i = q
         for j in (x for x in ends if x > q):
             if cancelled():
@@ -217,7 +324,7 @@ class Runner:
                     smk.check(e.lib.smk_spec_prefill_chunk(e.sp, T, nt, a, e.st), "spec_prefill_chunk")
             i = j
             if i in snap_at:
-                self._snapshot(i)
+                self._snapshot(i, sticky=(i == sys_at))
             self.lineage = np.asarray(ids[:i], dtype=np.int32)
         if folded:
             if cancelled():
@@ -257,16 +364,26 @@ class Runner:
         if procs or self._procs_on:  # requests without processors touch nothing (a previous request's processors are switched off once)
             e.set_procs(**(procs or {}))
             self._procs_on = bool(procs)
-        snap = self._choose(ids, set(ends))
-        if snap is None:
-            self._free_snaps([])
+        pick = self._pick(ids, set(ends))
+        if pick is None:
+            st.spill_s = self._spill_device()
             e.reset()
             q = 0
-        else:
+        elif pick[0] == "device":
+            snap = pick[1]
             self._free_snaps([s for s in self.snaps if s.pos <= snap.pos])
             e.reset_counters()
             self._restore(snap)
             q = snap.pos
+            st.source = "device"
+        else:
+            _, ent, snap = pick
+            tr = time.time()
+            st.spill_s = self._spill_device(keep=ent)
+            self._load_entry(ent, snap, ids)
+            st.restore_s = time.time() - tr - st.spill_s
+            q = snap.pos
+            st.source = "host"
         st.cached = q
         if not self._prefill(ids, q, ends, folded, cancelled):
             return
