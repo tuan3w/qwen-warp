@@ -152,6 +152,28 @@ class Engine:
         self.pos += n
         return list(out)
 
+    # ---- external verify (feat/dflash2): T rows over host-chosen tokens, host-side greedy accept, commit a rows (include/engine.h smk_engine_verify)
+    def verify(self, toks):
+        """Run the T = len(toks) rows [anchor, drafts...] at positions pos.. through the target (graph, head 1, no advance); returns the greedy argmax of every row."""
+        T = len(toks)
+        arr = (C.c_int * T)(*toks)
+        smk.check(self.lib.smk_engine_set_tokens(self.h, arr, T, self.st), "set_tokens")
+        smk.check(self.lib.smk_engine_verify(self.h, T, self.st), "verify")
+        return [int(x) for x in self._read(0, 18, torch.int32)[10 : 10 + T]]
+
+    def commit(self, a, T):
+        """Keep the first `a` rows of the last verify of T rows (pos += a, DeltaNet ring slot += a); rows a..T-1 are rolled back."""
+        smk.check(self.lib.smk_engine_commit(self.h, a, T, self.st), "commit")
+        self.pos += a
+
+    def taps(self, layer_ids, T, out=None):
+        """bf16 cuda tensor [len(layer_ids)][T][5120]: hidden after target layer l (the residual stream = HF hidden_states[l + 1]) of rows 0..T-1 of the last step, stream ordered."""
+        slots = (C.c_int * len(layer_ids))(*[l + 1 for l in layer_ids])
+        if out is None:
+            out = torch.empty(len(layer_ids), T, 5120, dtype=torch.bfloat16, device="cuda")
+        smk.check(self.lib.smk_engine_tap_gather(self.h, slots, len(layer_ids), T, C.c_void_p(out.data_ptr()), self.st), "tap_gather")
+        return out
+
     def dbg_hidden(self, T=1):
         """bf16 -> fp32 [66][T][5120] debug taps of the last step: slot 0 embedding, l+1 = after layer l, 65 = final norm out."""
         x = self._read(1, 66 * 8 * 5120, torch.bfloat16).view(66, 8, 5120)

@@ -106,6 +106,11 @@ def setup_engine_api(lib):
     lib.smk_engine_decode.argtypes = [vp, ci, C.POINTER(ci), vp]
     lib.smk_engine_read.argtypes = [vp, ci, vp, C.c_size_t]
     lib.smk_engine_read.restype = ci
+    lib.smk_engine_verify.argtypes = [vp, ci, vp]
+    lib.smk_engine_commit.argtypes = [vp, ci, ci, vp]
+    lib.smk_engine_tap_gather.argtypes = [vp, C.POINTER(ci), ci, ci, vp, vp]
+    for n in ("smk_engine_verify", "smk_engine_commit", "smk_engine_tap_gather"):
+        getattr(lib, n).restype = ci
     lib.smk_engine_set_head.argtypes = [vp, ci]
     lib.smk_engine_set_head.restype = ci
     lib.smk_engine_head.argtypes = [vp]
