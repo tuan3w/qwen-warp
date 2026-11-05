@@ -4,7 +4,7 @@
   python tests/test_server_seed.py [--port 8013] [--reps 9] [--pld auto|0|1] [--k 3] [--extra FLAGS] [--tree DIR] [--dump FILE]
 
 Starts serve.py once.  A request with a seed must give the same tokens whatever the cache state (cold prefill, resumed from a snapshot of an earlier turn, repeated), so every
-scenario repeats ONE seeded request `reps` times, alternating the preceding requests:  cold = an unrelated request in between (the engine's cache is replaced),
+scenario repeats ONE seeded request `reps` times, alternating the preceding requests:  cold = an unrelated request in between, then POST /reset_prefix_cache (nothing is cached),
 turn = the earlier turns of the same chat first (the request resumes from their snapshot), repeat = the request again right after itself.
 All token ids (temperature 1, 48 tokens) must be equal, and both cached_tokens == 0 and > 0 must have occurred.  Scenarios: 2- and 3-turn chats over a ~1.5K-token document with
 thinking off and on, a raw 1000-token completion prompt (a repeat resumes right before its last token), n = 2 (choices differ, the pair is reproducible), greedy.
@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -57,7 +58,7 @@ def main():
     ap.add_argument("--tree", help="serve from this checkout instead of this one (run the test against an older revision)")
     ap.add_argument("--dump", help="write the token ids of fixed seeded probes to this json file")
     a = ap.parse_args()
-    env = dict(os.environ, HF_HUB_OFFLINE="1")
+    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_SERVER_DEV_MODE="1")  # dev mode: POST /reset_prefix_cache
     log = open("/tmp/swift_mk_seed_server.log", "w")
     srv = subprocess.Popen([sys.executable, str(Path(a.tree) / "server" / "serve.py" if a.tree else SERVE), "--port", str(a.port), "--max-model-len", str(a.max_model_len), "--prompt-lookup", a.pld, "--num-speculative-tokens", str(a.k)] + a.extra.split(),
                            env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -100,7 +101,11 @@ def main():
             return m
 
         def unrelated(i):
-            return chat([{"role": "user", "content": f"Unrelated question number {i}: what is {17 + i} times 23? Answer briefly."}], seed=1000 + i, max_tokens=6)
+            # an unrelated request, then a reset of the prefix cache: the next request is a truly COLD prefill (an unrelated request alone no longer makes it cold, the host prefix cache
+            # keeps the earlier conversation and resumes it)
+            out = chat([{"role": "user", "content": f"Unrelated question number {i}: what is {17 + i} times 23? Answer briefly."}], seed=1000 + i, max_tokens=6)
+            urllib.request.urlopen(urllib.request.Request(base + "/reset_prefix_cache", method="POST"), timeout=60).read()
+            return out
 
         def repeat_check(name, once, cold, turn, reps=a.reps, record=None, resumed_only=False):
             """once() -> (ids, cached); cold() / turn() run the requests that precede it."""

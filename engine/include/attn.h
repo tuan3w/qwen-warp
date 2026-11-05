@@ -35,6 +35,14 @@ extern "C" {
 size_t swiftmk_attn_ws_bytes(void);
 size_t swiftmk_attn_kv_bytes(int ctx_max, int kv_fp8);  // bytes of one layer's [2][4][ctx_max][256] cache
 
+// Prefix spill / restore (host prefix cache).  A "chunk" is the KV rows [a, a + m) of ONE layer packed as [plane][m][row bytes] (plane = K|V x kv head = 8 planes) and, for the
+// int4 cache (kv_dtype 2), followed by [plane][m] u32 meta words.  Row bytes: bf16 512, fp8 256, int4 128 (code bytes).  The int4 sink / ring buffers are not part of a chunk
+// (they are fixed-size state, see swiftmk_kv_aux_*).  kv_dtype: 0 bf16, 1 fp8, 2 int4.
+size_t swiftmk_attn_kv_range_bytes(int kv_dtype, int m);
+// dir 0: device -> host, 1: host -> device.  Copies rows [r0, r1) of the chunk (0 <= r0 <= r1 <= m) between the packed host chunk `host` (m rows) and the device layer cache
+// `layer_kv` rows a + r0 .. a + r1 - 1 (a = dev_row0).  Async on `stream`; `host` should be pinned.
+cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype, void* host, int m, int dev_row0, int r0, int r1, int dir, cudaStream_t stream);
+
 // Returns cudaSuccess or the first launch error.  T must be 1..8.
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
                               int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, void* out, void* ws,

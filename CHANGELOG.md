@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Host prefix cache: the GPU still holds one conversation, but a request that does not continue it no longer destroys it. The engine spills the conversation's KV rows and snapshots to pinned host memory (`--prefix-cache-gb`, default 6 GiB, LRU) and restores a stored conversation when a later request continues it. Agents interleave a long main conversation with helper calls and subagents; on a replayed agent trace (12k-token system prompt, 6 turns, helper requests, 2x2 parallel subagents) the trace takes 40 s instead of 121 s and the median first-token delay of the main turns drops from 8.6 s to 1.1 s. A resumed request is bit-identical to a cold one.
+- `--system-checkpoint on|off` (default on): one extra snapshot at the end of each long system prompt, so parallel agents sharing a system prompt resume there.
+- Engine API `swiftmk_kv_range_bytes/copy` and `smk_spec_mtpkv_range_bytes/copy` (copy a row range of the KV cache to and from pinned host memory for bf16, fp8 and int4).
+
+### Changed
+
+- Prefill of a prompt with many chat-turn boundaries is faster: consecutive prefill segments (the plan cuts one at every turn boundary) now run layer by layer, so each layer's int4 weights are dequantized once per group of segments instead of once per segment (the group's rows share the existing 4,096-row scratch, no extra GPU memory; a group ends at every snapshot position). 12,000 tokens with a turn marker every 900 tokens (15 segments): 7.99 s -> 7.21 s; every 300 tokens (41 segments): 11.79 s -> 8.91 s; a prompt with few turns is unchanged. Every segment runs the same kernels on the same row counts, so the result is bit-identical to the one-segment-at-a-time prefill (`tests/test_group_prefill.py`: all snapshots, main + MTP KV rows and tokens, bf16 / fp8 / int4).
+- `--snapshots` defaults to 16 (was 4): it now counts the buffers of the GPU conversation and of the host cache together; they are allocated on demand beyond the first four.
+
 ## 0.4.0 - 2026-11-05
 
 ### Changed

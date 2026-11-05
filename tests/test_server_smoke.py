@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -90,7 +91,7 @@ def main():
     a = ap.parse_args()
     if a.ref:
         return ref_main(a.ref, a.profile)
-    env = dict(os.environ, HF_HUB_OFFLINE="1")
+    env = dict(os.environ, HF_HUB_OFFLINE="1", VLLM_SERVER_DEV_MODE="1")  # dev mode: POST /reset_prefix_cache (drops the GPU conversation and the host prefix cache)
     py = sys.executable
     ref_path = tempfile.mktemp(suffix=".json")
     print("direct engine reference ...", flush=True)
@@ -244,9 +245,20 @@ def main():
             out_ids.append(o.choices[0].token_ids)
             cached.append((o.usage.prompt_tokens_details.cached_tokens if o.usage.prompt_tokens_details else 0, o.usage.prompt_tokens, ttft))
         t.check("multi-turn: turns 2 and 3 resume from a snapshot", cached[1][0] > 0 and cached[2][0] > 0, f"(cached, prompt, total s) per turn: {cached}")
-        chat("Unrelated question: what is 17*23?", max_tokens=8, extra_body=nothink)  # replaces the lineage -> cold
+        def reset_cache():
+            urllib.request.urlopen(urllib.request.Request(base + "/reset_prefix_cache", method="POST"), timeout=60).read()
+
+        def cached_of(o):
+            return o.usage.prompt_tokens_details.cached_tokens if o.usage.prompt_tokens_details else 0
+
+        # an unrelated request overwrites the GPU conversation, but the host prefix cache keeps it: the next turn resumes (from the host) and gives the warm answer
+        chat("Unrelated question: what is 17*23?", max_tokens=8, extra_body=nothink)
+        kept = chat(messages=convo, max_tokens=60, extra_body=nothink)
+        t.check("multi-turn: an unrelated request does not destroy the conversation (resumes from the host cache, same ids as the warm turn)",
+                cached_of(kept) > 0 and kept.choices[0].token_ids == out_ids[2], f"cached {cached_of(kept)} of {kept.usage.prompt_tokens}")
+        reset_cache()  # a truly cold prefill: GPU conversation and host cache dropped
         cold = chat(messages=convo, max_tokens=60, extra_body=nothink)
-        chat("Unrelated question: what is 19*23?", max_tokens=8, extra_body=nothink)
+        reset_cache()
         cold2 = chat(messages=convo, max_tokens=60, extra_body=nothink)
         t.check("multi-turn: cold re-prefill is deterministic (two cold runs, same ids)", cold.choices[0].token_ids == cold2.choices[0].token_ids)
         # The prefill is cut by a plan that depends on the prompt only (Runner._plan), so a resumed prefill is bit-identical to a cold one and the greedy answers are equal.
@@ -254,7 +266,7 @@ def main():
         first_diff = next((i for i in range(min(len(w), len(c))) if w[i] != c[i]), None)
         t.check("multi-turn: warm turn 3 == the cold re-prefill answer (same greedy ids)", w == c,
                 f"first difference at token {first_diff} of {len(w)}/{len(c)}" if first_diff is not None else f"identical, {len(w)} tokens")
-        t.check("cold re-prefill reports cached_tokens == 0", (cold.usage.prompt_tokens_details.cached_tokens if cold.usage.prompt_tokens_details else 0) == 0)
+        t.check("cold re-prefill reports cached_tokens == 0", cached_of(cold) == 0 and cached_of(cold2) == 0)
     finally:
         if not a.keep:
             srv.send_signal(signal.SIGINT)

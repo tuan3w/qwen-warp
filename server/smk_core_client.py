@@ -78,7 +78,7 @@ def to_gen_params(sp) -> GenParams:
                      allowed_token_ids=tuple(dict.fromkeys(sp.allowed_token_ids)) if sp.allowed_token_ids else None)
 
 
-OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=False, sort_tool_schema=True)
+OPTIONS = dict(stream_cycles=2, snapshots=16, prefix_cache_gb=6.0, system_checkpoint=True, prompt_lookup="auto", host_tables=False, sort_tool_schema=True)
 KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
 KV_NAMES = ("bf16", "fp8", "int4")
 
@@ -137,7 +137,7 @@ def engine_cfg(vllm_config, free_mib):
         raise RuntimeError(f"swift-mk: --max-model-len {L:,} with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{' and the prompt-lookup tail' if pld else ''} needs about {need:.0f} MiB of GPU memory "
                            f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
                            f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k)}")
-    return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], pld=pld)
+    return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld)
 
 
 class SwiftCoreClient(EngineCoreClient):
@@ -155,15 +155,15 @@ class SwiftCoreClient(EngineCoreClient):
         self.resources = SimpleNamespace(engine_dead=False)
         t0 = time.time()
         try:
-            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables)
+            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables, prefix_cache_gb=cfg.prefix_cache_gb, system_checkpoint=cfg.system_checkpoint)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "older than the sources" in str(e):
                 raise
             raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
                                f"{' and the prompt-lookup tail' if cfg.pld else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
                                f"Largest --max-model-len that fits that memory:\n{vram_limits_text(free_mib, cfg.k)}\n{e}") from e
-        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, prompt-lookup tail %s",
-                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, "on" if cfg.pld else "off")
+        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s",
+                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, cfg.prefix_cache_gb, "on" if cfg.pld else "off")
         self.thread = threading.Thread(target=self._worker, name="swift-mk-engine", daemon=True)
         self.thread.start()
 
@@ -210,8 +210,9 @@ class SwiftCoreClient(EngineCoreClient):
                 first = False
             self._emit([out])
         st = self.runner.last
-        logger.info("%s: prompt %d (resumed at %d) prefill %.3f s, %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s", rid, st.prompt, st.cached, st.prefill_s,
-                    st.tokens, st.gen_s, (st.tokens - 1) / st.gen_s if st.gen_s > 0 else 0.0, (st.tokens - 1) / st.cycles if st.cycles else 0.0, st.snaps)
+        logger.info("%s: prompt %d (resumed at %d from %s) prefill %.3f s (spill %.0f ms, restore %.0f ms), %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s, host cache %d lineages %.2f GiB", rid, st.prompt, st.cached, st.source, st.prefill_s,
+                    st.spill_s * 1e3, st.restore_s * 1e3, st.tokens, st.gen_s, (st.tokens - 1) / st.gen_s if st.gen_s > 0 else 0.0, (st.tokens - 1) / st.cycles if st.cycles else 0.0, st.snaps,
+                    len(self.runner.store.entries) if self.runner.store else 0, self.runner.store.bytes() / (1 << 30) if self.runner.store else 0.0)
 
     # ------------------------------------------------------------------------------------------------ EngineCoreClient
     async def add_request_async(self, request) -> None:

@@ -175,9 +175,10 @@ Follow-up turns of a chat do not re-prefill the whole history. The engine snapsh
 | Detail | Value |
 |---|---|
 | How you can see it | `usage.prompt_tokens_details.cached_tokens` in the response (0 on a cold prompt) |
-| Snapshots kept | 4 by default (`--snapshots N`, 151 MB of pinned host RAM each, 183 MB with the 4-bit cache, 0 = off) |
-| Where snapshots are taken | at the last two cut points of the prefill plan. Cuts fall every 4,096 tokens, at a chat-turn boundary more than 240 tokens after the previous cut, and just before the last token when more than 240 tokens follow the last cut. A long system prompt or document is therefore reused across different user questions |
+| Snapshots kept | 16 by default, in total over the GPU and the host cache below (`--snapshots N`, 151 MB of pinned host RAM each, 183 MB with the 4-bit cache, 0 = off) |
+| Where snapshots are taken | at the last two cut points of the prefill plan, plus (`--system-checkpoint on`, default) the first chat-turn boundary after 1,024 tokens, i.e. the end of the system prompt, so parallel agents that share a system prompt and differ after it resume there. Cuts fall every 4,096 tokens, at a chat-turn boundary more than 240 tokens after the previous cut, and just before the last token when more than 240 tokens follow the last cut. A long system prompt or document is therefore reused across different user questions |
 | Measured | 3-turn chat over a 1,529-token document, per request including 60 generated tokens: 1.28 s, 0.54 s, 0.41 s (turns 2 and 3 resumed at 1,524 cached tokens; the old cut points gave 1.31 s, 0.60 s, 0.39 s) |
+| Several conversations | the GPU holds ONE conversation. Before a request that does not continue it overwrites it, the engine copies its KV rows (up to its last snapshot) and its snapshots to pinned host memory; a later request that continues a stored conversation copies them back and prefills only the new tokens. Budget `--prefix-cache-gb` (default 6 GiB, least recently used conversation goes first, 0 = one conversation only); about 21 KB of host RAM per token with the 4-bit KV cache, 37 KB with fp8, 70 KB with bf16 (measured: 126, 221 and 418 MB for a 6,000-token conversation; the MTP layer's KV is included; the pinned allocator rounds buffers up, so plan for up to ~1.6x). Lineages whose last snapshot is below 1,024 tokens (helper and title requests) are not stored. Measured with the 4-bit cache: spill 31 ms and restore 46 ms at 15,000 tokens, 123 ms and 135 ms at 60,000; a request resumed from the host prefills 0.17 s longer than one that continues the GPU conversation at 15k tokens. A resumed request is bit-identical to a cold one (`tests/test_lineage_cache.py`, all three KV dtypes) |
 | Not reused | a repeated prompt with 240 tokens or fewer after its last cut: it is prefilled again (35 to 39 ms, the same time as its first run) |
 | To benefit | keep the earlier messages byte-identical and append only; changing an earlier message breaks the prefix |
 
@@ -196,7 +197,9 @@ Every stock `vllm serve` frontend flag works (`--host`, `--port`, `--api-key`, `
 | `--prompt-lookup {0,1,auto}` | `auto` | an n-gram draft tail that needs about 0.56 GiB more VRAM (0.67 GiB with `--host-tables`); `auto` turns it on only if the length leaves 256 MiB of the free memory next to it (bf16 KV up to about 23k, fp8 up to 42k, 4-bit up to 68k, any length on 4-bit with `--host-tables`), and the log says what it chose. `1` forces it (refused like any other length that does not fit) |
 | `--num-speculative-tokens {0..3}` | 3 | MTP drafts per step; 0 = plain decode (the prompt-lookup tail needs 3) |
 | `--sort-tool-schema {on,off}` | `on` | render the keys of every tool's `function.parameters` sorted, which gives well-formed tool calls more often ([tool calls](#tool-calls)) |
-| `--snapshots N` | 4 | multi-turn prefix snapshots |
+| `--snapshots N` | 16 | multi-turn prefix snapshots (GPU conversation + host cache) |
+| `--prefix-cache-gb G` | 6 | pinned host RAM for the KV rows of other conversations (0 = off) |
+| `--system-checkpoint on\|off` | on | one extra snapshot at the end of each long system prompt |
 | `--stream-cycles N` | 2 | speculative cycles per host sync, i.e. streaming granularity (one cycle is about 24 ms and emits 1 to 4 tokens) |
 
 Set `SWIFT_MODEL` (or pass `--model`) when the weights are not in `~/models/swift-1.5-int4`. With Docker these become `PROFILE`, `EXTRA_ARGS`, `MODEL_DIR` and `PORT` ([table](GETTING_STARTED.md#3a-docker)).

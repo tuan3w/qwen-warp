@@ -25,5 +25,8 @@ test:
 	uv run tests/test_sampling_params.py
 	uv run tests/test_sampling_params.py --profile long --port 8043
 	uv run tests/test_prefill_plan.py
+	uv run tests/test_group_prefill.py
+	uv run tests/test_prefix_store.py
+	uv run tests/test_lineage_cache.py
 	uv run tests/test_server_seed.py
 	uv run tests/test_startup_configs.py

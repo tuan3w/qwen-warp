@@ -105,6 +105,16 @@ class Engine:
         assert t.numel() == self.lib.swiftmk_kv_aux_bytes(self.h) and t.is_pinned()
         smk.check(self.lib.swiftmk_kv_aux_copy(self.h, C.c_void_p(t.data_ptr()), 1, self.st), "kv_aux_restore")
 
+    # ---- host prefix cache: KV rows [a, a + m) of all 16 attention layers as a packed pinned chunk (include/attn.h)
+    def kv_chunk_new(self, m):
+        """Pinned host uint8 tensor for a chunk of m KV rows."""
+        return torch.empty(int(self.lib.swiftmk_kv_range_bytes(self.h, m)), dtype=torch.uint8, pin_memory=True)
+
+    def kv_chunk_copy(self, t, m, dev_row0, r0, r1, to_host):
+        """Rows [r0, r1) of the m-row chunk t <-> device rows dev_row0 + r0 ..; stream ordered, the caller synchronises (torch.cuda.synchronize) before reading t."""
+        assert t.numel() == self.lib.swiftmk_kv_range_bytes(self.h, m) and t.is_pinned()
+        smk.check(self.lib.swiftmk_kv_range_copy(self.h, C.c_void_p(t.data_ptr()), m, dev_row0, r0, r1, 0 if to_host else 1, self.st), "kv_chunk_copy")
+
     def _step(self, toks, head, graph=True):
         T = len(toks)
         arr = (C.c_int * T)(*toks)

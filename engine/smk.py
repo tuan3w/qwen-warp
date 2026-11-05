@@ -116,3 +116,7 @@ def setup_engine_api(lib):
     lib.swiftmk_kv_aux_bytes.restype = C.c_size_t
     lib.swiftmk_kv_aux_copy.argtypes = [vp, vp, ci, vp]
     lib.swiftmk_kv_aux_copy.restype = ci
+    lib.swiftmk_kv_range_bytes.argtypes = [vp, ci]
+    lib.swiftmk_kv_range_bytes.restype = C.c_size_t
+    lib.swiftmk_kv_range_copy.argtypes = [vp, vp, ci, ci, ci, ci, ci, vp]
+    lib.swiftmk_kv_range_copy.restype = ci
