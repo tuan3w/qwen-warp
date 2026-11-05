@@ -91,7 +91,7 @@ A well-formed tool call is the fraction of requests whose answer carries a call 
 | int4, previous format (`--profile long`) | **39% (58/150)** [31, 47] | **87% (130/150)** [80, 91] |
 | int4, greedy (previous format) | 99% (149/150) | |
 | int4, previous format, through the server (n = 100) | 46% (46/100) [37, 56] | 94% (94/100) [88, 97] |
-| int4, rotated format (this version), through the server (n = 200 / 100) | **92% (183/200) [87, 95]** | 88% (88/100) [80, 93] |
+| int4, rotated format (this version), through the server (n = 200 first build / n = 100 final build) | **92% (183/200) [87, 95]** / **96% (96/100) [90, 98]** | 88% (88/100) [80, 93] |
 
 - The chat template prints each tool with `tojson` in the key order the client sent; `--sort-tool-schema on` (the default) sorts the top-level keys of every `function.parameters` before rendering (`server/tool_schema.py`). The change alters the prompt, not the client's JSON, the parser or the arguments.
 - Server level (`tests/test_tool_call_rate.py`, 40 requests): before the sorting, `--profile long` gave 18/40 (45%); with it, 37/40 on the default profile and 40/40 on `--profile long`.
@@ -106,16 +106,16 @@ A well-formed tool call is the fraction of requests whose answer carries a call 
 
 ## 3. Speed
 
-**4-bit cache format change (this version, 2026-11-05).** The rotated format with the exact sink and ring ([KV cache](KV_CACHE.md)) was measured against the previous format in one session, interleaved (old, new, new, old), through the server with the frozen prompts below; the GPU drifts about 5% inside a session, so only repeated pairs count. Decode tok/s:
+**4-bit cache format change (this version, 2026-11-05).** The rotated format with the exact sink and ring ([KV cache](KV_CACHE.md)) was measured against the previous format in one session through the server with the frozen prompts below, two runs per cell, runs interleaved (previous, port without the ring fix, this version); the GPU drifts about 5% inside a session and the previous format measured against itself at the start and end of the session differed by up to 6%, so differences under about 5% are not resolved. Decode tok/s, mean of two runs:
 
 | Arm | Format | 32k | 100k | 190k |
 |---|---|---|---|---|
-| `--profile long`, prompt-lookup tail on | previous | 124.0 | 109.0 | 96.4 |
-| | rotated | 121.2 | 112.4 | 100.5 |
-| tail off (`--prompt-lookup 0`) | previous | 126.3 | 109.3 | 96.0 |
-| | rotated | 117.7 | 114.6 | 96.4 |
+| `--profile long`, prompt-lookup tail on | previous | 130.5 | 115.0 | 98.6 |
+| | rotated (this version) | 126.7 | 123.3 | 102.3 |
+| tail off (`--prompt-lookup 0`) | previous | 129.0 | 111.6 | 97.2 |
+| | rotated (this version) | 128.5 | 124.6 | 96.9 |
 
-Short prompts (code / prose / math), median of 3: previous 172 / 106 / 176 (tail on) and 171 / 108 / 162 (tail off); rotated 167 / 102 / 167 and 167 / 108 / 164. Prefill is unchanged (about 1,780 tok/s at 32k, 1,090 at 190k). The tables below were measured on the previous format on 2026-11-04 and were not repeated; this session's old-format runs gave 96 tok/s at 190k against 102 in that table, which is the drift between sessions. The rotated format is level with the previous one at 100k and 190k and 2% to 7% slower at 32k and on short prompts.
+Short prompts (code / prose / math): tail on, previous 180 / 110 / 183, rotated 179 / 111 / 179; tail off, previous 176 / 112 / 167, rotated 178 / 114 / 172. Prefill is unchanged (1,785 to 1,860 tok/s at 32k, 1,085 to 1,128 at 190k). The needle at 100k was found in every rotated run and missed in every previous-format run. The tables below were measured on the previous format on 2026-11-04 and were not repeated; this session's previous-format runs gave 98.6 tok/s at 190k with the tail against 102 in that table, which is the drift between sessions. The rotated format is level with the previous one on short prompts and at 32k without the tail, ahead at 100k (+7% to +12%) and at 190k with the tail (+4%), and about 3% behind at 32k with the tail.
 
 Re-measured on 2026-11-04 on the released code (merged tree of this repository), with the frozen prompts and the streaming client of the HyperQwen comparison in [section 4](#4-hyperqwen-as-a-reference-point)
 (real code from several repositories with a planted passphrase at 40% of the prompt; greedy; 256 tokens after the prompt; decode tok/s = tokens after the first chunk over the time from the first to the last chunk). One run per cell, 350 W.

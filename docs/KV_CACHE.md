@@ -12,7 +12,7 @@ Per token and KV head, separately for K and V (256 elements):
 | 1. Rotate | Walsh-Hadamard transform over the 256-vector (`y = H x / 16`, orthonormal, its own inverse). The query is rotated the same way, so scores are unchanged; the attention output is un-rotated once per layer | makes the coordinates near-Gaussian: one outlier channel no longer sets the scale for everything |
 | 2. Quantise | 16 symmetric levels with a slightly stretched ("companded") grid, `L(n) = u (1 + 0.003 u^2)`, `u = 2n - 15`; 4 scales per vector (groups of 64 rotated coefficients), each an 8-bit logarithmic code | the grid fits a Gaussian within about 3% of the optimal 16-level quantiser's error, so there is no gain left in its shape |
 | 3. Keep the first 4 tokens exact | fp16 rows (rotated basis) in a small fixed buffer | the attention sinks carry a large share of the attention mass |
-| 4. Keep the last 256 tokens exact | fp16 rows in a ring buffer; the split kernels stop 256 keys before the end and the reduce kernel attends the ring exactly | the newest tokens are the ones attention uses most |
+| 4. Keep the last 256 tokens exact | fp16 rows in a ring buffer; the split kernel stops 256 keys before the end of the context and attends the ring as 16 extra fp16 tiles (no dequantisation); the reduce kernel only merges the splits and un-rotates | the newest tokens are the ones attention uses most |
 | 5. Decoder gain | the reader multiplies every decoded scale by 1.0075 (`1 / 0.9926`) | the writer's error-minimising scale makes each group about 0.74% too short, so quantised keys get logits slightly too small next to the exact ring keys; the constant comes from the quantiser's statistics on Gaussian groups, not from any text |
 
 Bytes per token are unchanged: 16,896 bytes (16.5 KiB, 4.125 bits per element), measured on the device for the old and the new format. The exact sink and ring are fixed
@@ -48,35 +48,35 @@ the gain should not be fitted per text. A logit offset for the Jensen bias of no
 
 | Measure | old | this version |
 |---|---|---|
-| Tool-call rate, minimal one-parameter schema in the usual key order (`--sort-tool-schema off`), n = 200 / 100 | 46% [37, 56] | **92% [87, 95]** |
+| Tool-call rate, minimal one-parameter schema in the usual key order (`--sort-tool-schema off`) | 46% [37, 56] (n = 100) | **92% [87, 95]** (n = 200, first build); **96% [90, 98]** (n = 100, final build) |
 | same, with the default sorted rendering, n = 100 | 94% [88, 97] | 88% [80, 93] (within noise of the old value) |
-| Needle in a haystack at 100k tokens, 4 runs per format, both speed arms | missed 4 of 4 | found 4 of 4 |
+| Needle in a haystack at 100k tokens, through the server | missed in every run (4 of 4 in the first session, and again in every old run of the final speed session) | found in every run |
 | Needle probe at 64k in chat format (8 depths, passphrase negative log-likelihood vs the fp8 cache) | 0.124 nats vs 0.086 for fp8 (+0.038, 1.6 standard errors) | 0.079 (-0.006, -0.6 s.e.): indistinguishable from fp8 |
 
 bf16 gave 91% on the type-first schema in the earlier measurement (0.3.0). Wilson 95% intervals. The server still sorts tool schemas by default; with this cache the rendering order no longer matters for that schema.
 
 ## What it costs
 
-Decode speed through the server (tokens/s, frozen prompts, same session, runs interleaved old/new; the GPU drifts about 5% inside a session, so only repeated pairs mean anything):
+Decode speed through the server on the final build (tokens/s, frozen prompts, mean of two runs per cell, runs interleaved old/previous-port/new; the card drifts about 5% inside a session, and the same old tree measured against itself at the start and end of the session differed by up to 6%, so differences under about 5% are not resolved at this number of runs):
 
-| Arm | 32k | 100k | 190k |
-|---|---|---|---|
-| prompt-lookup tail on: old | 124.0 | 109.0 | 96.4 |
-| prompt-lookup tail on: this version | 121.2 | 112.4 | 100.5 |
-| tail off: old | 126.3 | 109.3 | 96.0 |
-| tail off: this version | 117.7 | 114.6 | 96.4 |
+| Arm | Prompt | previous format | this version | difference |
+|---|---|---|---|---|
+| prompt-lookup tail on | 32k | 130.5 | 126.7 | -2.9% |
+| | 100k | 115.0 | 123.3 | +7.2% |
+| | 190k | 98.6 | 102.3 | +3.8% |
+| tail off | 32k | 129.0 | 128.5 | -0.4% |
+| | 100k | 111.6 | 124.6 | +11.6% |
+| | 190k | 97.2 | 96.9 | -0.3% |
 
-Short prompts (code / prose / math): 167 / 102 / 167 with the tail and 167 / 108 / 164 without, against 172 / 106 / 176 and 171 / 108 / 162 before. Prefill is unchanged (about 1,780 tok/s at 32k, 1,090 at 190k).
+Short prompts (code / prose / math), tail on: 179 / 111 / 179 against 180 / 110 / 183 before; tail off: 178 / 114 / 172 against 176 / 112 / 167. Prefill is unchanged (1,785 to 1,860 tok/s at 32k, 1,085 to 1,128 at 190k).
 
-In short: level with the old format at 100k and 190k, 2% to 7% slower at 32k and 2% to 4% on short prompts. A plain one-token step at 160k context is about 3% slower; the multi-token verify steps of speculative decoding
-were the problem at first (the attention kernel dequantised the same tile once per query tile; the first port was 15% to 20% slower at 190k) and are now level with, or below, the old reader for 2, 3, 4, 6, 7 and 8 rows (kernel `attn_split_i4_kernel`, one dequantisation per tile and group). A step of 5 rows (three drafts plus the verified token and one
-prompt-lookup tail token) is still about 12% slower at 160k.
+In short: level with the previous format on short prompts, at 32k (tail off) and at 190k (tail off); ahead at 100k, and at 190k with the tail on; about 3% behind at 32k with the tail on. This was not the case at first. The first port was 15% to 20% slower at 190k because the attention kernel dequantised the same tile once per query tile in the multi-row verify steps; a verify kernel that dequantises each tile once per group fixed that. A smaller cost remained at every context length, about 0.9 ms per speculative cycle (3.8% of kernel time at 32k): the exact-ring attention in the reduce kernel (33 us against 4.6 us per call) and the write kernel (15 us against 3.5 us). It was removed by attending the ring inside the split kernel and by an 8-warp write kernel (reduce 15 to 3.6 us and write 13.6 to 5.8 us per layer call at 32k); a plain one-row step is still about 1% to 2% over the previous reader. Speculative acceptance (tokens per cycle) of the new format tracks bf16 on four prompts (-3.8%, 0, +0.9%, 0), so the remaining differences are kernel time and text, not drafting.
 
 ## What is not known
 
-- **Sampled repetition.** On a 61-token loop prompt at temperature 0.7 (40 batches of 8), the share of distinct tokens is 0.240 with this cache against 0.330 with bf16 and 0.350 with the old int4 cache (0.318 against 0.433 with no speculation), i.e. the sampled text repeats more. Teacher-forced entropy and maximum probability match bf16 closely (top-64 entropy 0.539 / 1.959 / 1.184 against 0.537 / 1.958 / 1.185 over positions 0-60 / 60-260 / 260-1400), so it is not a per-position sharpening. The cause is not known. `tests/test_sampling_params.py` passed 4 of 4 runs.
+- **Sampled repetition on one prompt.** On a 61-token loop prompt at temperature 0.7 (320 samples), the share of distinct tokens is 0.24 with this cache against 0.29 to 0.33 with bf16, 0.33 to 0.35 with the previous int4 cache and 0.39 with fp8; on four other prompts it equals bf16 (a loop-prone list prompt 0.173 against 0.163, two ordinary chat prompts 0.624 against 0.624 and 0.745 against 0.742, a degenerate prompt identical). It comes from the exact 256-token ring: with a ring of 64 or 16 tokens the ratio returns to 0.39 and 0.37, and rounding the ring to bf16 changes nothing (0.242). Why a ring window that covers a whole 61-token prompt changes sampled loops is not known. Teacher-forced entropy and maximum probability match bf16 closely, so it is not a per-position sharpening. `tests/test_sampling_params.py` passed 48/48 on both runs of the final build; it failed one statistical repetition check in 2 of 4 runs on the first build.
 - **Not re-measured on this format:** coding pass@1 over 283 tasks and repo question-answering at 64k and 100k (the numbers in [PERFORMANCE.md](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache) are for the previous format). Perplexity at 98k was measured (above).
-- The 2% to 7% speed difference at 32k was not traced: the acceptance rate of speculative drafts under the two formats was not compared.
+- The speed result is for one model and one card, two runs per cell; the remaining 3% at 32k with the tail on may be real or the old tree's high draw.
 - One model, one card, one set of prompts; dKL was measured on two 32k texts. Needle tests: 4 runs and 8 depths.
 
 ## Where the ideas come from

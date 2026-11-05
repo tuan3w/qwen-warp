@@ -40,12 +40,12 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Context | 262,144 tokens fit in about 22.5 to 22.7 GiB in use, desktop included (`--host-tables` moves 4.8 GiB of tables to host memory; the 4-bit cache costs 16.5 KiB per token, bf16 64 KiB) |
 | Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
 | Ready after | 21 to 30 s |
-| Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), perplexity +0.056% over bf16 at 98k (previous: +0.26%), a minimal tool schema in the usual key order 92% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found 4 of 4 runs (previous: 0 of 4). Coding pass@1 was measured on the previous format only (241 against 244 of 283) and not repeated. Sampled text on one loop prompt repeats more than with bf16, cause unknown. [KV cache](docs/KV_CACHE.md) |
+| Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), perplexity +0.056% over bf16 at 98k (previous: +0.26%), a minimal tool schema in the usual key order 92% to 96% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found in every run (previous format: missed in every run). Coding pass@1 was measured on the previous format only (241 against 244 of 283) and not repeated. On one 61-token loop prompt, caused by the exact ring, sampled text repeats more than with bf16; four other prompts match. [KV cache](docs/KV_CACHE.md) |
 | Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and many concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine serves one request at a time) |
 
 HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
 
-The speed rows above were measured with the previous 4-bit format. With the rotated format of this version, repeated pairs in one session gave the same speed at 100k and 190k and 2% to 7% less at 32k and on short prompts ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
+The speed rows above were measured with the previous 4-bit format. With the rotated format of this version, two interleaved runs per cell in one session gave the same speed on short prompts, 7% to 12% more at 100k, level to +4% at 190k, and level to 3% less at 32k ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
 
 <details>
 <summary>Exact HyperQwen build and caveats</summary>

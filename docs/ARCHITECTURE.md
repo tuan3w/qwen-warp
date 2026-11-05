@@ -91,10 +91,10 @@ Format, measurements and costs: [KV cache](KV_CACHE.md). Definitions: `engine/sr
 
 | Part | How |
 |---|---|
-| Writers | the decode kernel's writer (`attn_prep_kernel`) and the prefill writer (`k_attn_prep`) rotate (a 256-point transform over one warp with shuffles), pick each group's scale by minimum squared error over a few candidates around the largest magnitude, and write the same bytes; the writers do not know the decoder gain |
+| Writers | the decode kernel's writer (`attn_prep_i4_kernel`, 8 warps, one scale candidate per warp) and the prefill writer (`k_attn_prep`) rotate (a 256-point transform over one warp with shuffles), pick each group's scale by minimum squared error over a few candidates around the largest magnitude, and write the same bytes; the writers do not know the decoder gain |
 | Scores and output | `q` is rotated the same way at prep, so scores equal the unrotated ones; the attention output is un-rotated once in the reduce kernel. The readers decode nibbles with `fp16x2` arithmetic (`L(n) = u (1 + 0.003 u^2)`) and multiply each decoded scale by 1.0075 |
-| Exact sinks and ring | positions 0-3 are read from the sink rows; the split kernels stop 256 keys before the end of the context and the reduce kernel attends the ring exactly and merges it as one more split |
-| Verify rows | `attn_split_i4_kernel` serves 2 to 8 rows (teams of d-split warps, query tiles in groups, so each K/V tile is dequantised once per group); one row uses the single-warp kernel |
+| Exact sinks and ring | positions 0-3 are read from the sink rows; the split kernel stops 256 keys before the end of the context and attends the ring as 16 extra fp16 tiles (no dequantisation), so it runs in parallel with the other splits; the reduce kernel only merges the splits and un-rotates |
+| Kernel rows | `attn_split_i4_kernel` serves every int4 launch, 1 to 8 rows (teams of d-split warps, query tiles in groups, so each K/V tile is dequantised once per group) |
 | Snapshots | the sink and ring rows are state outside the per-token cache, so every prefix snapshot saves and restores them (`kv_aux_*` in `server/smk_runner.py`, 32 MB of pinned host RAM per slot); without that, a resumed generation diverges |
 
 What it costs and gains: [KV cache](KV_CACHE.md) and [Performance](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache).
