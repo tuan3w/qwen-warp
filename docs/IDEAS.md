@@ -5,8 +5,8 @@ open an issue so others know. Back to the [README](../README.md).
 
 | Idea | Where it stands | Effort to settle it |
 |---|---|---|
-| [A rotated 4-bit KV cache](#a-rotated-4-bit-kv-cache) | measured as bf16 fake-quant: about 2x lower perplexity cost on this 27B; no kernel, no speed number | a decode kernel and a speed measurement |
-| [Why the 4-bit cache missed a needle at 100k](#why-the-4-bit-cache-missed-a-needle-at-100k) | one miss in two experiments, cause unknown | more needle runs, a per-layer look |
+| [What is left of the 4-bit cache gap](#what-is-left-of-the-4-bit-cache-gap) | the rotated cache is in; the remaining error is mostly key logits; two speed cases and one sampling difference are open | per-layer and K/V byte allocation, a 5-row verify kernel, a repeat-rate control run |
+| [Why the 4-bit cache missed a needle at 100k](#why-the-4-bit-cache-missed-a-needle-at-100k) | the previous format missed it; the rotated one found it 4 of 4, cause of the original miss unknown | more needle runs across positions, a per-layer look |
 | [Multi-turn agentic task success per KV dtype](#multi-turn-agentic-task-success-per-kv-dtype) | agent tasks not measured; the tool-call rate of one small schema was ([Usage](USAGE.md#tool-calls)) | an agent benchmark run three times |
 | [A non-uniform weight codebook](#a-non-uniform-weight-codebook) | helps accuracy on a 4B model; the extra bytes alone bound the 27B step at about +17% | a kernel; likely a dead end at this size |
 | [A better quantized model](#a-better-quantized-model-if-one-appears) | nothing to measure yet | kernel work if the format changes |
@@ -22,34 +22,20 @@ open an issue so others know. Back to the [README](../README.md).
 
 Out of scope: other models, other GPUs, batching. (If you try another GPU, the build takes `ARCH=-arch=sm_XX`, but nothing outside sm_86 has been tried.)
 
-## A rotated 4-bit KV cache
+## What is left of the 4-bit cache gap
 
-**Idea.** Rotate each K and V head vector with a 256-point Walsh-Hadamard transform (foldable into the query and the output, so it costs almost nothing at decode), use a log2 group
-scale per 64 coefficients and a fixed Gaussian 16-level codebook, at the same 4.125 bits per element.
+The rotated format ([KV cache](KV_CACHE.md)) cut the KL divergence from the bf16 cache from 0.51% to 0.069% at the same bytes. What was measured and not finished:
 
-| Setting | Current 4-bit cache | Rotated variant | fp8 |
-|---|---|---|---|
-| Qwen3.5-2B proxy, 262k fresh tokens (perplexity vs bf16) | +2.015% | +0.194% | not measured |
-| This 27B, 32k tokens | +0.27% | +0.10% (+-0.04) | 0.00% |
-| This 27B, 98k tokens | +0.26% | +0.13% (+-0.03) | +0.03% |
-
-**What we learned.**
-
-- The proxy's 10x did not carry over to the 27B: about 2x. The current cache's loss on the 27B is already small, and what remains looks like the cost of 16 levels per coefficient. [INFERENCE]
-- A per-channel mean table, which was most of the gain on the proxy, added nothing on the 27B (no mean gives the same perplexity).
-- A 5-bit variant (group 32, asymmetric, with the rotation) measured +0.05% at 32k in an earlier run, at one more bit per element.
-
-**Caveats.** Measured as quantise-then-dequantise in bf16 storage (the format's numbers, not a kernel's): no decode kernel, no speed measurement, code perplexity only, one run per arm.
-The CUDA fake-quant was checked against a torch reference on 65,536 real K/V rows (identical scale codes in 99.9996% of groups).
-
-**To settle it.** Write the decode kernel (lookup-table dequant, rotation folded into q and the output), measure speed against the current cache, then perplexity at 32k and 98k.
-
-**Tool calls.** How a rotated cache behaves on tool calls is not measured. The 4-bit cache's well-formed tool-call rate depends on the key order of the tool schema ([Usage](USAGE.md#tool-calls)); whether rotation changes that is open.
+- **Where the remaining error is.** With the ring and sinks exact, making K exact removes 76% of the removable loss and V 25%; making both exact leaves 0.0149% (fp16 numerics). Layer groups and distance bands were not attributed (switches were written, not run). A cheaper split of the 4.125 bits between K and V, or per layer, is untested; so is an 8-bit middle tier between the exact ring and the 4-bit body (about 1.4% of decode bandwidth per 4k bf16 tokens, an estimate).
+- **Speed cases.** A one-row step is still about 1% to 2% over the previous reader at every context length (the split kernel's own dequantisation, 5.25 against about 2 instructions per fp16 pair, and the write kernel at 5.8 against 3.7 us per call), and 32k with the prompt-lookup tail is about 3% below the previous format in two runs per cell (possibly the old tree's high draw). A 5-row verify step (3 drafts, the verified token and one tail token) needs all four query tiles in one group, which spills registers at 8 warps; its time was last measured before the ring change.
+- **Sampled repetition.** On a 61-token loop prompt at temperature 0.7 the rotated cache gives a distinct-token ratio of 0.24 against 0.29 to 0.33 for bf16, 0.33 to 0.35 for the previous format and 0.39 for fp8. It is caused by the 256-token exact ring (rings of 16 and 64 tokens give 0.37 and 0.39; rounding the ring to bf16 changes nothing) and does not appear on four other prompts. Why an exact window that covers the whole prompt changes sampled loops is not known; useful controls: more loop-prone prompts of different lengths, and the ring at 128 tokens.
+- **Not re-measured on this format:** coding pass@1 over 283 tasks, repository question-answering, agent-sized tool sets, more needle depths and lengths. (Perplexity at 98k was: +0.056% over bf16.)
+- **Other literature ideas not tried:** a learned or searched Hadamard sign vector (adaptive transforms gave at most 0.04 perplexity at 4 bits in the papers read), lattice quantisation (at most about 2.3x lower mean squared error in theory and no shown gain at 4 bits), extra exact slots for outlier tokens.
 
 ## Why the 4-bit cache missed a needle at 100k
 
-The 4-bit arm missed a planted needle at 100k tokens in the speed sweep of 2026-11-03 and found it at 32k, 64k, 130k and 190k; on 2026-11-04 both 4-bit arms (tail off and on) missed it at 100k again and found it at every other length (16k to 262k). In a separate test it got 7 of 8 needles at about 100k
-(fp8: 8 of 8, and fp8 found it at every length it served). That is now consistent enough to look like a failure mode of one position range, though it is one prompt per length. **To settle it:** many more needle prompts across positions, with fp8 as the control, and a look at which layers' keys carry the miss.
+The previous 4-bit format missed a planted needle at 100k tokens in the speed sweep of 2026-11-03 and found it at 32k, 64k, 130k and 190k; on 2026-11-04 both 4-bit arms (tail off and on) missed it at 100k again and found it at every other length (16k to 262k). In a separate test it got 7 of 8 needles at about 100k
+(fp8: 8 of 8, and fp8 found it at every length it served). On 2026-11-05 the rotated format found it in all 4 runs at 100k while the previous one missed all 4. In a chat-format probe at 64k (8 depths) all formats found the passphrase every time. So the miss belongs to the previous format; why one position range was affected is still unknown. **To settle it:** many more needle prompts across positions and lengths with the rotated format, with fp8 as the control.
 
 ## Multi-turn agentic task success per KV dtype
 

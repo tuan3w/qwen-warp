@@ -145,15 +145,17 @@ call = r.choices[0].message.tool_calls[0]          # name "get_weather", argumen
 ```
 
 What was measured: tool `get_weather(city: string)`, user "What is the weather in Hanoi?", thinking on, the model's default sampling, `max_tokens` 800; success = a well-formed call with a known name and
-the required parameter. In-process engine runs, n = 150 per cell (the 95% intervals reach 4 to 8 points to either side):
+the required parameter. Rows 1 to 4: in-process engine runs, n = 150 per cell (the 95% intervals reach 4 to 8 points to either side). The last two rows: through the server on `--profile long`, n = 200 and 100 (Wilson 95% intervals in brackets):
 
 | KV cache | schema as most clients send it (`type`, `properties`, `required`) | keys sorted (`properties`, `required`, `type`; what the server renders by default) |
 |---|---|---|
 | bf16 | 91% (137/150) | 93% (139/150) |
 | fp8 | 88% (132/150) | not measured |
-| 4-bit (`--profile long`) | **39% (58/150)** | **87% (130/150)** |
+| 4-bit, previous format (0.3.0, `--profile long`) | **39% (58/150)** | **87% (130/150)** |
+| 4-bit, previous format, through the server | 46% (46/100) [37, 56] | 94% (94/100) [88, 97] |
+| 4-bit, rotated format with exact sink and ring (this version), through the server | **92% (183/200) [87, 95]** | 88% (88/100) [80, 93] |
 
-- The chat template prints the tool schema in the key order the client sent, and the model's choice at the start of a tool call depends on that order, much more so on the 4-bit cache. `--sort-tool-schema on` (the default)
+- The chat template prints the tool schema in the key order the client sent, and the model's choice at the start of a tool call depended on that order, much more so on the previous 4-bit format. `--sort-tool-schema on` (the default)
   sorts the top-level keys of every tool's `function.parameters` before the template renders them; nothing else changes (not your JSON, not the parser, not the arguments, nested objects untouched).
   `--sort-tool-schema off` renders the schema exactly as sent.
 - Through the server, 40 identical requests: 18/40 before the sorting on `--profile long`; with it 37/40 on the default profile and 40/40 on `--profile long` (`tests/test_tool_call_rate.py`, which fails below 70%).
@@ -161,7 +163,7 @@ the required parameter. In-process engine runs, n = 150 per cell (the 95% interv
   schema is the fragile one.
 - The sampler is not the cause: on 219 real positions its draws match the exact bf16 reference distribution (`tests/test_sampler_dist.py`). Greedy decoding on the 4-bit cache gave 99% (149/150, schema as sent).
 - Even on bf16 the rate (93%) was below the 98% of a reference vLLM service we compared against (its prompt had the parameter keys sorted); the cause was not isolated ([Ideas](IDEAS.md#why-bf16-kv-is-below-a-reference-service-on-tool-calls)).
-- **Not measured:** coding-agent tool sets (six tools or more), second turns of a tool conversation, fp8 with the sorted order, the fp8 profile with host tables, a rotated 4-bit cache, top_p / min_p as a mitigation. How
+- **Not measured:** coding-agent tool sets (six tools or more), second turns of a tool conversation, fp8 with the sorted order, the fp8 profile with host tables, top_p / min_p as a mitigation. With the rotated cache the schema order no longer changes the rate beyond noise for this schema (92% against 88%, intervals overlap); sorting stays on by default. How
   well real agent loops succeed on any cache is unknown.
 
 Constrained decoding (`structured_outputs`) is not available; the parser reads the tool call from the model's text.
@@ -173,7 +175,7 @@ Follow-up turns of a chat do not re-prefill the whole history. The engine snapsh
 | Detail | Value |
 |---|---|
 | How you can see it | `usage.prompt_tokens_details.cached_tokens` in the response (0 on a cold prompt) |
-| Snapshots kept | 4 by default (`--snapshots N`, 151 MB of pinned host RAM each, 0 = off) |
+| Snapshots kept | 4 by default (`--snapshots N`, 151 MB of pinned host RAM each, 183 MB with the 4-bit cache, 0 = off) |
 | Where snapshots are taken | at the last two cut points of the prefill plan. Cuts fall every 4,096 tokens, at a chat-turn boundary more than 240 tokens after the previous cut, and just before the last token when more than 240 tokens follow the last cut. A long system prompt or document is therefore reused across different user questions |
 | Measured | 3-turn chat over a 1,529-token document, per request including 60 generated tokens: 1.28 s, 0.54 s, 0.41 s (turns 2 and 3 resumed at 1,524 cached tokens; the old cut points gave 1.31 s, 0.60 s, 0.39 s) |
 | Not reused | a repeated prompt with 240 tokens or fewer after its last cut: it is prefilled again (35 to 39 ms, the same time as its first run) |

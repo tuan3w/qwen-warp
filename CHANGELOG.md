@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The 4-bit KV cache (`--kv-cache-dtype int4_per_token_head`, `--profile long`) has a new format at the same bytes per token (16.5 KiB): the head vector is rotated with a Walsh-Hadamard transform, quantised with a symmetric companded 16-level grid and 4 logarithmic scales, the first 4 tokens and the last 256 tokens are kept exact (fp16), and the reader multiplies every decoded scale by 1.0075 to undo the shrink of the writer's error-minimising scale. KL divergence from the bf16 cache on a 32k code text: 0.069% against 0.51% for the previous format; perplexity at 98k +0.056% over bf16 (previous format +0.26%). Through the server on `--profile long`: a minimal one-parameter tool schema in the usual key order gave a well-formed call in 92% of 200 requests (first build) and 96% of 100 (final build), previous format 46% of 100 (bf16 91% earlier); a planted needle at 100k was found in every run, the previous format missed it in every run. Details, method, speed and what is not known: [docs/KV_CACHE.md](docs/KV_CACHE.md).
+- The exact sink and ring are fixed buffers: +34 MiB of device memory (in the start-up memory model, `VRAM_KV_FIXED_MIB`) and +32 MB of pinned host RAM per prefix snapshot (183 MB instead of 151 MB each, 4 by default). They are saved and restored with every snapshot, so a resumed generation equals a cold prefill (`kv_aux_*` in `server/smk_runner.py`; `tests/test_server_smoke.py`, `tests/test_server_seed.py`).
+- Speed through the server with the previous format as control, two interleaved runs per cell: short prompts level; 32k level without the prompt-lookup tail and about 3% lower with it; 100k +7% (tail) and +12% (no tail); 190k +4% (tail) and level (no tail); prefill unchanged. Kernels: `attn_split_i4_kernel` serves 1 to 8 verify rows and dequantises each K/V tile once per query-tile group (the first version of the format lost 15% to 20% at 190k without it); the exact ring is attended inside the split kernel as 16 fp16 tiles and an 8-warp write kernel (`attn_prep_i4_kernel`) writes the cache, which removed a fixed cost of about 0.9 ms per speculative cycle that showed on short prompts and at 32k. A 1-row step is about 1% to 2% over the previous reader. The ring change makes the attention output differ from the previous build at rounding level (the written cache bytes are identical).
+
+### Fixed
+
+- `kv_aux_new` returned an unpinned empty tensor for caches without aux state (bf16, fp8), which made the server die at the first snapshot; it now returns `None`.
+
+### Not measured on the new format
+
+Coding pass@1, repository question-answering, agent-sized tool sets. (Perplexity at 98k was measured: +0.056% over bf16, previous format +0.26%.) On one 61-token loop prompt at temperature 0.7 the sampled text repeats more than with bf16 (distinct-token ratio 0.24 against 0.29 to 0.33); it comes from the exact 256-token ring (a 16 or 64 token ring gives 0.37 to 0.39) and four other prompts match bf16; why is not known.
+
 ## 0.3.0 - 2026-11-04
 
 ### Fixed

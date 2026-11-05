@@ -112,3 +112,7 @@ def setup_engine_api(lib):
     lib.smk_engine_head.restype = ci
     lib.smk_engine_bytes.argtypes = [vp]
     lib.smk_engine_bytes.restype = C.c_size_t
+    lib.swiftmk_kv_aux_bytes.argtypes = [vp]
+    lib.swiftmk_kv_aux_bytes.restype = C.c_size_t
+    lib.swiftmk_kv_aux_copy.argtypes = [vp, vp, ci, vp]
+    lib.swiftmk_kv_aux_copy.restype = ci

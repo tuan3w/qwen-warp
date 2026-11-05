@@ -10,6 +10,7 @@
 #include <math.h>
 
 #include "engine_impl.h"
+#include "kvrot.cuh"
 #include "mtp.h"
 
 using namespace smk;
@@ -137,16 +138,6 @@ __global__ void __launch_bounds__(128) k_gnorm(const uint16_t* __restrict__ o, c
 // q_proj layout (ldq); k, v rows have strides ldk, ldv.  Row t is absolute position pos0 + t.
 //   qout [T][24][256] bf16 (normed + roped q);  k_all/v_all (nullable) bf16 token-major [pos][4][256] at index pos;
 //   kv = engine KV cache of this layer ([2][4][ctx_max][256], bf16 or fp8 e4m3 = x / scale) written at pos.
-__device__ __forceinline__ float warp_min32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fminf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-__device__ __forceinline__ float warp_max32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
 template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16_t* __restrict__ q, int ldq, const uint16_t* __restrict__ kk, int ldk,
                                                    const uint16_t* __restrict__ vv, int ldv, const uint16_t* __restrict__ q_norm, const uint16_t* __restrict__ k_norm,
@@ -205,26 +196,17 @@ __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16
 #pragma unroll
       for (int i = 0; i < 8; i++) dst[lane + 32 * i] = (uint8_t)__nv_cvt_float_to_fp8(x[i] * is, __NV_SATFINITE, __NV_E4M3);
     } else if constexpr (I4) {
-      // per token+head asymmetric 4-bit, identical to attn.cu's decode-time writer: x ~ code*s + lo (fp16 s, lo), 2 codes/byte (low nibble = even d), codes
-      // [2][NKV][ctx][128] then u32 meta (s | lo << 16) [2][NKV][ctx].
-      float lo = x[0], hi = x[0];
+      // rotated 4-bit format, identical to attn.cu's decode-time writer (kvrot.cuh): the cache rows are Walsh-Hadamard rotated; k_all / v_all above stay unrotated bf16.
+      float y[8];
 #pragma unroll
-      for (int i = 1; i < 8; i++) { lo = fminf(lo, x[i]); hi = fmaxf(hi, x[i]); }
-      lo = warp_min32(lo); hi = warp_max32(hi);
-      const __half sh = __float2half_rn(fmaxf(hi - lo, 1e-3f) * (1.f / 15.f)), lh = __float2half_rn(lo);
-      const float sf = __half2float(sh), lf = __half2float(lh), inv = 1.f / sf;
-      uint8_t* dst = reinterpret_cast<uint8_t*>(kv) + (row >> 1);
-#pragma unroll
-      for (int i = 0; i < 8; i++) {
-        int code = (int)rintf((x[i] - lf) * inv);
-        code = code < 0 ? 0 : (code > 15 ? 15 : code);
-        const int hi_c = __shfl_xor_sync(0xffffffffu, code, 1);
-        if (!(lane & 1)) dst[16 * i + (lane >> 1)] = (uint8_t)((hi_c << 4) | code);
-      }
-      if (lane == 0) {
-        uint32_t* meta = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2));
-        meta[(size_t)(isv * NKV + kvh) * ctx_max + pos] = (uint32_t)__half_as_ushort(sh) | ((uint32_t)__half_as_ushort(lh) << 16);
-      }
+      for (int i = 0; i < 8; i++) y[i] = x[i];
+      kvrot::wht256(y, lane);
+      uint32_t* meta = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2));
+      kvrot::quant_store(y, lane, reinterpret_cast<uint8_t*>(kv) + (row >> 1), meta + (size_t)(isv * NKV + kvh) * ctx_max + pos);
+      if (pos + kvrot::RING_R >= pos0 + T)  // exact ring: only the last RING_R rows of this launch (equal slots would race)
+        kvrot::sink_store(y, lane, reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(kv) + kvrot::ring_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::RING_R + (pos & (kvrot::RING_R - 1))) * HD);
+      if (pos < kvrot::NSINK)
+        kvrot::sink_store(y, lane, reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(kv) + kvrot::sink_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::NSINK + pos) * HD);
     } else {
       uint16_t* dst = reinterpret_cast<uint16_t*>(kv) + row;
 #pragma unroll
@@ -234,7 +216,7 @@ __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16
 }
 
 // history gather: cache [2][4][ctx_max][256] (bf16 / fp8*scale) positions [0, npos) -> k_all / v_all bf16 [pos][4][256].  One thread = 8 elements.
-template <bool FP8, bool I4>
+template <bool FP8>
 __global__ void k_gather_kv(const void* __restrict__ kv, int ctx_max, int npos, float k_scale, float v_scale, uint16_t* __restrict__ k_all, uint16_t* __restrict__ v_all) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const long long n = (long long)npos * NKV * (HD / 8);
@@ -258,18 +240,36 @@ __global__ void k_gather_kv(const void* __restrict__ kv, int ctx_max, int npos, 
         f[b] = __half2float(__half(__nv_cvt_fp8_to_halfraw(s8, __NV_E4M3))) * sc;
       }
       *reinterpret_cast<uint4*>(dst) = make_uint4(pack_bf16x2(f[0], f[1]), pack_bf16x2(f[2], f[3]), pack_bf16x2(f[4], f[5]), pack_bf16x2(f[6], f[7]));
-    } else if constexpr (I4) {
-      const size_t rowi = (size_t)(isv * NKV + kvh) * ctx_max + pos;
-      const uint32_t cw = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(kv) + rowi * (HD / 2) + d8 * 4);  // 8 codes
-      const uint32_t m = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2) + rowi * 4);
-      const float s = __half2float(__ushort_as_half((unsigned short)(m & 0xffffu))), l = __half2float(__ushort_as_half((unsigned short)(m >> 16)));
-      float f[8];
-#pragma unroll
-      for (int b = 0; b < 8; b++) f[b] = (float)((cw >> (4 * b)) & 0xfu) * s + l;
-      *reinterpret_cast<uint4*>(dst) = make_uint4(pack_bf16x2(f[0], f[1]), pack_bf16x2(f[2], f[3]), pack_bf16x2(f[4], f[5]), pack_bf16x2(f[6], f[7]));
     } else {
       *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(kv) + src);
     }
+  }
+}
+
+// int4 history gather (rotated format, kvrot.cuh): one warp = one (pos, kvh) row pair; dequantise the rotated K and V rows and un-rotate them (H/16 is its own inverse).
+__global__ void __launch_bounds__(128) k_gather_kv_i4(const void* __restrict__ kv, int ctx_max, int npos, uint16_t* __restrict__ k_all, uint16_t* __restrict__ v_all) {
+  const int lane = threadIdx.x & 31;
+  const long long pk = (long long)blockIdx.x * 4 + (threadIdx.x >> 5);  // pos * 4 + kvh
+  if (pk >= (long long)npos * NKV) return;
+  const int kvh = (int)(pk & 3);
+  const int pos = (int)(pk >> 2);
+#pragma unroll
+  for (int isv = 0; isv < 2; isv++) {
+    const size_t rowi = (size_t)(isv * NKV + kvh) * ctx_max + pos;
+    const uint8_t* codes = reinterpret_cast<const uint8_t*>(kv) + rowi * (HD / 2);
+    const uint32_t m = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(kv) + (size_t)2 * NKV * ctx_max * (HD / 2) + rowi * 4);
+    float y[8];
+    if (pos < kvrot::NSINK) {  // exact fp16 sink row (rotated basis)
+      const uint16_t* sr = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(kv) + kvrot::sink_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::NSINK + pos) * HD;
+#pragma unroll
+      for (int i = 0; i < 8; i++) y[i] = __half2float(__ushort_as_half(sr[lane + 32 * i]));
+    } else {
+      kvrot::dequant_row(codes, m, lane, isv ? kvrot::LOG2_VGAIN : kvrot::LOG2_KGAIN, y);
+    }
+    kvrot::wht256(y, lane);
+    uint16_t* dst = (isv ? v_all : k_all) + (size_t)pk * HD;
+#pragma unroll
+    for (int i = 0; i < 8; i++) dst[lane + 32 * i] = f2bf(y[i]);
   }
 }
 
@@ -351,6 +351,25 @@ extern "C" {
 
 // ---- accessors into the opaque engine (what: 0 device state ints, 1 DeltaNet state fp32 [48 layers][tmax+1][48][128][128], 2 conv state bf16 [48][tmax+1][10240][3],
 //      3 KV cache base (16 layers of kv_layer_bytes), 4 = kv_layer_bytes (returned as a pointer-sized integer))
+// Exact sink + ring buffers of the int4 cache (kvrot.cuh) live behind the code/meta region of every layer; they are state that a DeltaNet snapshot must carry along (prefix reuse).
+// Bytes of all 16 layers' buffers (0 unless the cache is int4).
+size_t swiftmk_kv_aux_bytes(smk_engine* e) {
+  if (e->kv_dtype != 2) return 0;
+  return (size_t)16 * (e->kv_layer_bytes - kvrot::sink_off(e->ctx_max));
+}
+// dir 0: device -> host (synchronises the stream before returning), dir 1: host (pinned) -> device, stream ordered.
+cudaError_t swiftmk_kv_aux_copy(smk_engine* e, void* host, int dir, cudaStream_t st) {
+  if (e->kv_dtype != 2) return cudaSuccess;
+  const size_t per = e->kv_layer_bytes - kvrot::sink_off(e->ctx_max);
+  for (int l = 0; l < 16; l++) {
+    char* dev = e->kv + (size_t)l * e->kv_layer_bytes + kvrot::sink_off(e->ctx_max);
+    char* h = (char*)host + (size_t)l * per;
+    cudaError_t r = dir == 0 ? cudaMemcpyAsync(h, dev, per, cudaMemcpyDeviceToHost, st) : cudaMemcpyAsync(dev, h, per, cudaMemcpyHostToDevice, st);
+    if (r != cudaSuccess) return r;
+  }
+  return dir == 0 ? cudaStreamSynchronize(st) : cudaSuccess;
+}
+
 void* smkp_engine_ptr(smk_engine* e, int what) {
   switch (what) {
     case 0: return e->ds;
@@ -437,9 +456,12 @@ cudaError_t smkp_attn_prep(int T, int pos0, const void* q, int ldq, const void* 
 cudaError_t smkp_gather_kv(const void* kv, int ctx_max, int kv_dtype, int npos, float k_scale, float v_scale, void* k_all, void* v_all, cudaStream_t st) {
   if (npos < 1) return cudaSuccess;
   const unsigned grid = cdiv((long long)npos * NKV * 32, 256);
-  if (kv_dtype == 1) k_gather_kv<true, false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
-  else if (kv_dtype == 2) k_gather_kv<false, true><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
-  else k_gather_kv<false, false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
+  if (kv_dtype == 2) {
+    k_gather_kv_i4<<<cdiv((long long)npos * NKV, 4), 128, 0, st>>>(kv, ctx_max, npos, (uint16_t*)k_all, (uint16_t*)v_all);
+    return cudaGetLastError();
+  }
+  if (kv_dtype == 1) k_gather_kv<true><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
+  else k_gather_kv<false><<<grid, 256, 0, st>>>(kv, ctx_max, npos, k_scale, v_scale, (uint16_t*)k_all, (uint16_t*)v_all);
   return cudaGetLastError();
 }
 

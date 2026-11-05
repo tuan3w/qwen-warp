@@ -82,21 +82,22 @@ OPTIONS = dict(stream_cycles=2, snapshots=4, prompt_lookup="auto", host_tables=F
 KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
 KV_NAMES = ("bf16", "fp8", "int4")
 
-# GPU memory the engine needs after a request at --max-model-len (peak, MiB): VRAM_FIXED_MIB[host tables, prompt-lookup tail] + VRAM_KIB_PER_TOKEN[kv dtype] * --max-model-len.
-# per token = the KV cache (64 / 32 / 16.5 KiB for bf16 / fp8 / int4) + 8 KiB that also grow with the length (the MTP layer's bf16 KV, the fast-prefill K/V scratch).
+# GPU memory the engine needs after a request at --max-model-len (peak, MiB): VRAM_FIXED_MIB[host tables, prompt-lookup tail] + VRAM_KV_FIXED_MIB[kv dtype] + VRAM_KIB_PER_TOKEN[kv dtype] * --max-model-len.
+# per token = the KV cache (64 / 32 / 16.5 KiB for bf16 / fp8 / int4; the int4 layout's fixed sink + ring buffers are VRAM_KV_FIXED_MIB) + 8 KiB that also grow with the length (the MTP layer's bf16 KV, the fast-prefill K/V scratch).
 # Fitted to the 21 real server starts that bracket, for every cache layout, the largest length which starts AND serves a prompt of that length (RTX 3090, a desktop holding 0.6 GiB,
 # 23228 MiB free at start): within +-40 MiB (about 1 K tokens at bf16) of each of them.  The fixed part is the weights, the activations, the 4-slot DeltaNet ring and the engine
 # buffers; --host-tables moves the 4.7 GiB bf16 embedding + lm_head to pinned host memory; the tail adds the 9-slot ring and its cycle graphs.
 # The server compares it with the memory that is free at start instead of trusting lengths measured next to some other desktop.
 VRAM_FIXED_MIB = {(False, False): 20740, (False, True): 21312, (True, False): 15800, (True, True): 16488}
 VRAM_KIB_PER_TOKEN = (72.0, 40.0, 24.5)
+VRAM_KV_FIXED_MIB = (0, 0, 34)  # per kv dtype: the int4 cache's exact fp16 sink rows and recent-token ring (engine/src/kvrot.cuh) are a fixed device allocation, not per token (torch.cuda.mem_get_info: +34 MiB at 8 K and 64 K tokens)
 MIN_HEADROOM_MIB = 64  # refuse to start with less than this predicted to be left after a request at --max-model-len (the prediction is good to +-40 MiB)
 AUTO_TAIL_HEADROOM_MIB = 256  # `--prompt-lookup auto` only turns the tail on if at least this much stays free
 MODEL_MAX_LEN = 262144
 
 
 def vram_need_mib(ctx, dt, ht, pld):
-    return VRAM_FIXED_MIB[ht, bool(pld)] + ctx * VRAM_KIB_PER_TOKEN[dt] / 1024
+    return VRAM_FIXED_MIB[ht, bool(pld)] + VRAM_KV_FIXED_MIB[dt] + ctx * VRAM_KIB_PER_TOKEN[dt] / 1024
 
 
 def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB):
