@@ -316,6 +316,127 @@ class FastPrefill:
             e.pos = pos0 + T
         return a
 
+    # ------------------------------------------------------------------------------------------------ layer-major group of segments
+    def _group(self, segs, cur):
+        """Run several consecutive segments LAYER BY LAYER: every layer's weights are dequantized once for the whole group instead of once per segment (a segment of <= w4_max rows
+        needs no dequant, the W4 kernel reads the int4 weights).  segs: list of (ids_seg, pos0, nxt) with pos0 of segment k + len = pos0 of segment k + 1; no head / fold segment.
+        Bit-identical to calling _segment on each segment in turn: every segment runs the same kernels on the same row counts, and within a layer the segments run in order (a
+        segment's DeltaNet state and KV rows of this layer are written before the next segment reads them).  The group's rows share the scratch of one segment (sum of rows <= self.seg
+        or the largest segment); the per-layer scratch (qkvz, tmpA, W1, W2, ...) is reused segment after segment, only h / xn / dn / mix / y6 are per-segment slices."""
+        e, st = self.e, self.e.st
+        Ts = [len(x[0]) for x in segs]
+        total = sum(Ts)
+        a = self._scratch(max(self.seg, total))
+        views, r0 = [], 0
+        for (ids_seg, pos0, nxt), T in zip(segs, Ts):
+            av = dict(a)
+            for name in ("h", "xn", "dn", "mix", "y6", "tok"):
+                av[name] = a[name][r0 : r0 + T]
+            av["tok"].copy_(torch.tensor(ids_seg, dtype=torch.int32), non_blocking=False)
+            av["cuq"] = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+            av["cuk"] = torch.tensor([0, pos0 + T], dtype=torch.int32, device="cuda")
+            views.append(av)
+            r0 += T
+        poss = [x[1] for x in segs]
+        big = any(T > self.w4_max for T in Ts)
+        self._fold = False
+        for av, T in zip(views, Ts):
+            with self._t("embed"):
+                smk.check(self.lib.smk_embed(e.G.embed.data_ptr(), av["tok"].data_ptr(), av["h"].data_ptr(), T, H, st), "embed")
+        for li, L in enumerate(e.Ls):
+            for av, T in zip(views, Ts):
+                self._norm(av["h"], None if li == 0 else av["dn"], L.ln1, av["xn"], T)
+            W = self._deq(L.qkvz, a["W2"]) if big else None  # one dequant of the qkv(z) weights for every segment of the group
+            for av, T, pos0 in zip(views, Ts, poss):
+                if L.kind == "linear":
+                    self._dn_front(li, L, av, T, cur, W)
+                else:
+                    self._attn_front(li, L, av, T, pos0, W)
+            W = self._deq(L.o, a["W2"]) if big else None
+            for av, T in zip(views, Ts):
+                self._proj(av["y6"][:T], L.o, W, av["mix"][:T])
+            for av, T in zip(views, Ts):
+                self._norm(av["h"], av["mix"], L.ln2, av["xn"], T)
+            Wg = self._deq(L.gu, a["W1"]) if big else None
+            Wd = self._deq(L.down, a["W2"]) if big else None
+            for av, T in zip(views, Ts):
+                self._mlp_seg(L, av, T, Wg, Wd)
+        for av, (ids_seg, pos0, nxt), T in zip(views, segs, Ts):
+            self._norm(av["h"], av["dn"], e.G.final_norm, av["xn"], T)
+            if nxt is not None and len(nxt):
+                self._small = T <= self.w4_max
+                self._mtp(av, len(nxt), pos0, nxt)
+        return a
+
+    def _proj(self, x, w4, W, out):
+        """out = x @ W4^T for one segment of a group: the W4 kernel for a segment of <= w4_max rows, else cuBLAS on the group's dequantized weights W."""
+        if x.shape[0] <= self.w4_max:
+            self._w4g(x, w4, out)
+        else:
+            self._mm(x, W, out)
+
+    def _dn_front(self, li, L, a, T, cur, W):
+        """_deltanet up to (excluding) the o projection, for one segment of a group; a = the segment's scratch view; W = dequantized qkvz weights (None for a small segment)."""
+        lib, st = self.lib, self.e.st
+        di = self.dn_idx[li]
+        xn = a["xn"][:T]
+        qkvz = a["qkvz"][: T * 16384].view(T, 16384)
+        self._proj(xn, L.qkvz, W, qkvz)
+        self._mm(xn, L.ab, a["ab"][:T])
+        with self._t("deltanet"):
+            smk.check(lib.smkp_gates(a["ab"].data_ptr(), L.A_log.data_ptr(), L.dt_bias.data_ptr(), a["g"].data_ptr(), a["beta"].data_ptr(), T, st), "gates")
+            cs = self.dn_conv[di, cur]
+            a["conv_prev"].copy_(cs)
+            tmp = a["tmpA"]
+            qc, kc, vc = tmp[: T * 2048], tmp[T * 2048 : T * 4096], tmp[T * 4096 : T * 10240]
+            smk.check(lib.smkp_conv(qkvz.data_ptr(), 16384, a["conv_prev"].data_ptr(), L.conv_w.data_ptr(), qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), cs.data_ptr(), T, st), "conv")
+            S0 = self.dn_state[di, cur]
+            o, sf = chunk_gated_delta_rule(
+                qc.view(1, T, 16, 128), kc.view(1, T, 16, 128), vc.view(1, T, 48, 128), a["g"][:T].view(1, T, 48), a["beta"][:T].view(1, T, 48),
+                scale=128**-0.5, initial_state=S0.view(1, 48, 128, 128), output_final_state=True, use_qk_l2norm_in_kernel=True, state_v_first=True)
+            S0.copy_(sf.view(48, 128, 128))
+            smk.check(lib.smkp_gnorm(o.data_ptr(), qkvz.data_ptr() + 10240 * 2, 16384, L.norm_w.data_ptr(), a["y6"].data_ptr(), T, st), "gnorm")
+
+    def _attn_front(self, li, L, a, T, pos0, W):
+        """_attention up to (excluding) the o projection, for one segment of a group."""
+        lib, st = self.lib, self.e.st
+        ai = self.at_idx[li]
+        kvp = self.kv_base + ai * self.kv_layer_bytes
+        xn = a["xn"][:T]
+        qkv = a["qkvz"][: T * 14336].view(T, 14336)
+        self._proj(xn, L.qkvz, W, qkv)
+        Ltot = pos0 + T
+        kall, vall = a["kall"], a["vall"]
+        with self._t("attn"):
+            if pos0:
+                smk.check(lib.smkp_gather_kv(kvp, self.ctx_max, self.fp8, pos0, L.k_scale, L.v_scale, kall.data_ptr(), vall.data_ptr(), st), "gather")
+            q0 = qkv.data_ptr()
+            qatt = a["tmpA"][: T * 6144]
+            ao = a["tmpA"][T * 6144 : T * 12288]
+            smk.check(lib.smkp_attn_prep(T, pos0, q0, 14336, q0 + 12288 * 2, 14336, q0 + 13312 * 2, 14336, L.q_norm.data_ptr(), L.k_norm.data_ptr(), kvp, self.ctx_max,
+                                         self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), st), "attn_prep")
+            flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
+                                   causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
+            smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
+
+    def _mlp_seg(self, L, a, T, Wg, Wd):
+        """_mlp for one segment of a group: Wg / Wd = the group's dequantized gate|up / down weights (None when the segment is small: the W4 kernel path)."""
+        lib, st = self.lib, self.e.st
+        xn, dn, gu, act = a["xn"], a["dn"], a["gu"], a["act"]
+        if T <= self.w4_max:
+            for r0 in range(0, T, self.rows):
+                r1 = min(T, r0 + self.rows)
+                self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
+            return
+        for r0 in range(0, T, self.rows):
+            r1 = min(T, r0 + self.rows)
+            n = r1 - r0
+            self._mm(xn[r0:r1], Wg, gu[:n])
+            with self._t("silu"):
+                smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
+            self._mm(act[:n], Wd, dn[r0:r1])
+
     def _mtp(self, a, T, pos0, nxt):
         """MTP KV for pairs (final-norm hidden of position p (a['xn'][t]), token p+1): cat -> fc -> ln1 -> K,V (k_norm + rope) -> MTP KV cache."""
         e, lib, st = self.e, self.lib, self.e.st

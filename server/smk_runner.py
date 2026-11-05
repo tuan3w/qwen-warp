@@ -91,7 +91,7 @@ class Stats:
 
 
 class Runner:
-    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True):
+    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
@@ -113,6 +113,7 @@ class Runner:
             self.pool.append(self._new_snap())
         self.store = PrefixStore(int(prefix_cache_gb * (1 << 30))) if prefix_cache_gb > 0 and max_snaps > 0 else None  # host tier under the device lineage
         self.system_checkpoint = system_checkpoint and max_snaps >= 3  # one more snapshot per long prompt: the first chat-turn boundary after SYSTEM_MIN tokens (see _system_end)
+        self.group_prefill = group_prefill  # run consecutive prefill segments layer by layer (one weight dequant per layer for the group); False = one segment at a time
         self.min_spill = min_spill  # lineages whose last snapshot is below this are not worth a spill (a cold prefill of them is shorter than a restore)
         self.last = Stats()
         self._procs_on = False
@@ -296,6 +297,28 @@ class Runner:
                 return j
         return None
 
+    @staticmethod
+    def plan_groups(ends, q, seg, min_fast, snap_at, enabled=True):
+        """Group the plan segments [prev end, end) after position q into runs executed layer by layer (FastPrefill._group): consecutive segments while their total rows stay <= seg (the
+        scratch of one segment), a group ends at every snapshot position (the DeltaNet state must be exact there) and a segment of fewer than min_fast rows (the decode-step path) is
+        alone.  enabled=False: one segment per group (the previous behaviour).  Returns a list of lists of (start, end)."""
+        groups, cur, rows, i = [], [], 0, q
+        for j in (x for x in ends if x > q):
+            n = j - i
+            fast = n >= min_fast
+            if cur and (not enabled or not fast or rows + n > seg):
+                groups.append(cur)
+                cur, rows = [], 0
+            cur.append((i, j))
+            rows += n
+            i = j
+            if not enabled or not fast or j in snap_at:
+                groups.append(cur)
+                cur, rows = [], 0
+        if cur:
+            groups.append(cur)
+        return groups
+
     def _prefill(self, ids, q, ends, folded, cancelled):
         """Process ids[q:] (state valid for [0, q), q = 0 or a segment end of the plan) following the plan; the last token as the head step.  Snapshots after the last (up to)
         two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix)."""
@@ -305,14 +328,18 @@ class Runner:
         if sys_at is not None and sys_at > q:
             snap_at.add(sys_at)
         i = q
-        for j in (x for x in ends if x > q):
+        for g in self.plan_groups(ends, q, fp.seg, fp.min_fast, snap_at, self.group_prefill):
             if cancelled():
                 self.lineage = np.asarray(ids[:i], dtype=np.int32)
                 return False
-            if j - i >= fp.min_fast:
+            j = g[-1][1]
+            if g[0][1] - g[0][0] >= fp.min_fast:
                 cur = self._cur()
                 fp._ev = []
-                fp._segment(ids[i:j], i, cur, ids[i + 1 : j + 1])
+                if len(g) == 1:
+                    fp._segment(ids[i:j], i, cur, ids[i + 1 : j + 1])
+                else:  # several segments layer by layer: one dequant of each layer's weights for all of them, bit-identical to running them one after the other
+                    fp._group([(ids[x:y], x, ids[x + 1 : y + 1]) for x, y in g], cur)
                 fp.ds[0] = j
                 e.pos = j
                 torch.cuda.synchronize()

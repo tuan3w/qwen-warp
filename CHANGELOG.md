@@ -10,6 +10,7 @@
 
 ### Changed
 
+- Prefill of a prompt with many chat-turn boundaries is faster: consecutive prefill segments (the plan cuts one at every turn boundary) now run layer by layer, so each layer's int4 weights are dequantized once per group of segments instead of once per segment (the group's rows share the existing 4,096-row scratch, no extra GPU memory; a group ends at every snapshot position). 12,000 tokens with a turn marker every 900 tokens (15 segments): 7.99 s -> 7.21 s; every 300 tokens (41 segments): 11.79 s -> 8.91 s; a prompt with few turns is unchanged. Every segment runs the same kernels on the same row counts, so the result is bit-identical to the one-segment-at-a-time prefill (`tests/test_group_prefill.py`: all snapshots, main + MTP KV rows and tokens, bf16 / fp8 / int4).
 - `--snapshots` defaults to 16 (was 4): it now counts the buffers of the GPU conversation and of the host cache together; they are allocated on demand beyond the first four.
 
 ## 0.4.0 - 2026-11-05
