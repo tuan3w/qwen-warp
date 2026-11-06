@@ -1,7 +1,7 @@
 # Performance and quality: what was measured, and how far to trust it
 
 Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) |
-[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. Reproducing](#5-reproducing) | [Back to README](../README.md)
+[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Reproducing](#6-reproducing) | [Back to README](../README.md)
 
 Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
 the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
@@ -17,6 +17,7 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | How fast is decode? | 94 to 133 tok/s from 32k to 262k tokens (4-bit cache); 105 to 181 tok/s on short prompts | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | long context: decode is 1.2x to 1.3x faster than its `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than its `mtp-huge` at 32k to 190k; short prompts: 1.2x to 1.3x faster than its MTP presets but slower than its DFlash2 preset (about 1.5x on code, earlier session); DFlash2 was not measured at long context; prefill within about 10% | same day, same card, prompts and client for the MTP presets; one pinned build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
+| How fast is the experimental DFlash2 drafter? | engine-direct, short prompts: 276 / 112 / 261 tok/s on code / prose / math (MTP k=3 in the same engine 185 / 119 / 184); level with HyperQwen's DFlash2 in the same session (254 / 103 / 226) after a server-overhead correction of the engine-direct numbers; greedy only, not in the server | interleaved rounds, same session | [5](#5-dflash2-block-drafter-experimental) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
 ## 1. Memory: how much context fits
@@ -221,11 +222,46 @@ Caveats, all of which matter:
 - HyperQwen is a different design; this engine is hard-wired to one model on sm_86. The comparison is for this one
   workload, a single stream on a 3090. It says nothing about batching or other GPUs.
 
-## 5. Reproducing
+## 5. DFlash2 block drafter (experimental)
+
+`engine/dflash.py` runs the 7-token block drafter of `incoai/Qwen3.8-27B-DFlash2` (W4A16, 1.19 GiB) inside the engine ([Architecture](ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)). Greedy, `Engine(tmax=8)`, bf16 KV, not wired into the server. Everything below was measured on 2026-11-06 on this card at 350 W with no desktop load beyond the usual 0.6 GiB, 385 new tokens per prompt (256 for the sets of 8 and 48), decode tokens/s after the first token. The server and HyperQwen arms are HTTP; the engine arms call the engine directly (a host sync every 8 cycles), so they carry no HTTP, tokenisation or scheduling cost.
+
+**Same-session comparison** (the tree before the kernel work below; arms round-robin on an idle card; mean of rounds, round-to-round spread at most 1.3%; HyperQwen image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1`, revision `bd6c5e2f`, 2026-10-04, default `GPU_UTIL`; the n of rounds is 4 for HyperQwen and the engine arms, 3 for the server):
+
+| Arm | code | prose | math | 8 chat prompts (median) | 48 English tasks (median) |
+|---|---|---|---|---|---|
+| HyperQwen DFlash2 (HTTP) | 254.0 | 103.0 | 225.7 | 175.1 | 167.5 |
+| qwen-warp server, MTP k=3 + prompt-lookup tail (HTTP) | 180.9 | 112.3 | 180.9 | 157.6 | 150.1 |
+| engine-direct MTP k=3 + prompt-lookup tail | 185.3 | 119.0 | 184.2 | 157.5 | 153.6 |
+| **engine-direct DFlash2** | **276.4** | **112.0** | **260.9** | 175.3 | 174.2 |
+| engine-direct DFlash2, scaled by (server / engine-direct MTP) | about 270 | about 106 | about 256 | 175.4 | about 170 |
+
+The scaled row assumes the server overhead is the same fraction for DFlash2 as for MTP (measured only on MTP: 0.98 / 0.94 / 0.98). On that basis it is level with HyperQwen's DFlash2 on code and prose (+6%, +3%) and 13% ahead on math, and level on both pooled sets. Both engines run the same drafter file and get the same tokens per step on code (5.98 for HyperQwen from its vLLM counters, 5.8 to 6.0 here); the difference is the step: 21.1 ms here, 23.5 ms for HyperQwen (which also ran about 5% higher SM clocks at the same 323 W). On the README prose prompt DFlash2 accepts only 2.4 tokens per cycle and is no faster than MTP (112 against 116 tok/s in the same engine). The engine-direct MTP rows use `engine/spec.py` with the prompt-lookup tail, not the server loop.
+
+**Tokens per cycle** (eager torch drafter, greedy, 11 prompts of 256 tokens, same INT4 target): 4.68 against 3.01 for MTP k=3 (code 5.87 against 3.49, math 5.50 against 3.33, prose 3.81 against 2.66); the in-engine W4 drafter reaches 4.48 against 2.98. Per draft position the acceptance falls from 0.87 to 0.26 over the 7 drafts.
+
+**Cycle** (nsys, code prompt): 21.0 ms = verify T=8 and accept 18.6 ms + drafter 2.50 ms (context append 0.12, noise block 1.40, head, rescoring and selector 0.99); launch idle 0.04 ms. The W4 GEMVs run at 820 to 855 GB/s, 92% to 96% of the 891 GB/s read peak of this card.
+
+**Kernel work in this release** (autonomous campaign, 3 agent lineages, a gate that compares each candidate with a pristine control run back to back, held-out prompts and a 31k-token document the agents never saw; output tokens identical to the previous tree on every prompt; stock tree against release tree, interleaved, same session, 2 rounds, decoding stops at the end token):
+
+| Set | previous tree | this release | ratio |
+|---|---|---|---|
+| benchmark set: score = sqrt(short geomean x 31k tok/s) | 173.5 | 176.8 | 1.019x |
+| short prompts (geomean of 11) | 209.3 | 211.6 | 1.011x |
+| 31k-token prompt | 143.9 | 147.7 | 1.026x |
+| held-out set: score | 162.3 | 165.2 | 1.018x |
+| held-out short prompts (geomean of 8) / 31k-token document | 223.3 / 118.0 | 225.9 / 120.7 | 1.012x / 1.023x |
+
+Read this as +1% to +2.5%, not more. A first version of the benchmark kept decoding to 256 tokens after the end token and reported 1.049x on the benchmark set: one prompt (`translate`, which ends at token 55) degenerated into a repeating loop that an n-gram lookup copied for 2.0x on that prompt. With the loop excluded the lookup gains nothing, so it is off by default (`SMK_DF_LOOKUP=1`); the lookup rows of the campaign are not evidence of speed. What did not work: a draft-vocabulary head (68,864 rows: prose loses 5% to 12% of its tokens per cycle), L2 prefetch of the next GEMV across the cycle (1.4% slower), fusing the residual add and norm into the GEMV tail (11% slower), and a persistent kernel (1.5% to 4%, [earlier measurement](IDEAS.md)).
+
+**Not measured**: sampling (greedy only), the server path, DFlash2 beyond 31k tokens of context (the drafter KV cache is indexed by absolute position, 20 KiB per token, and the device lm_head table needs 2.5 GiB: at 31k context on bf16 KV 0.15 GiB stay free), the long-context presets of HyperQwen, and any prompt that quotes its input at length (where HyperQwen's lookup drafter reports 381 tok/s).
+
+## 6. Reproducing
 
 | What | How | Takes |
 |---|---|---|
 | Every test in the Makefile list: KV-cache perplexity guard, host tables, logit processors, tool-call and sampler checks, the server end to end, start-up configurations | `make test` (needs the checkpoint and the GPU) | long: it starts the server several times; no total is given here |
+| DFlash2 acceptance and exactness | `python tests/test_dflash.py` (needs the W4A16 drafter, `$DFLASH_W4`) | minutes |
 | The part that needs no GPU | `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py`, `uv run tests/test_prefill_plan.py` | seconds |
 | The tables in sections 2 to 4 | not regenerated by anything here: the long-context sweeps were done with throwaway harnesses against this engine and the HyperQwen container, which are not part of this repository | n/a |
 

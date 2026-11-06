@@ -21,7 +21,7 @@ from weights import Checkpoint  # noqa: E402
 
 
 class Engine:
-    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None):
+    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None, lm_head_host=None):
         assert layers == pack.NL
         self.lib = smk.load(lib)
         smk.setup_engine_api(self.lib)
@@ -47,10 +47,23 @@ class Engine:
             assert G.hq is not None, "host tables need the quantised head (Engine(head='int4'|'int8'))"
             emb = torch.empty(G.embed.shape, dtype=G.embed.dtype, pin_memory=True)
             emb.copy_(G.embed)
-            lmh = torch.empty(G.lm_head.shape, dtype=G.lm_head.dtype, pin_memory=True)
-            lmh.copy_(G.lm_head)
-            G.embed, G.lm_head = emb, lmh  # the C engine holds raw pointers into these: they live as long as G
-            self.tables_on_host = True
+            lmh = None
+            # The embedding rows are gathered a few per step (cheap over PCIe); the lm_head rows are re-read for the exact rescoring of every head step (R candidates x T rows, ~0.2 ms
+            # per cycle over PCIe).  When the device has room for the rest of the engine (KV cache for ctx_max, ring, drafters: ~96 KiB per context token + 5.25 GiB) the lm_head
+            # table stays resident when lm_head_host=False is passed and it fits; the default keeps it in pinned host memory (the server's memory model, vram_need_mib, assumes that).
+            torch.cuda.empty_cache()
+            free0 = torch.cuda.mem_get_info()[0] + G.embed.numel() * G.embed.element_size()
+            need = int(ctx_max * (0.5 if kv_fp8 else 1) * 96 * 1024) + int(5.35 * 2**30)  # measured: ctx_max 31488, bf16 KV, DflashEngine -> 8.11 GiB allocated after this point
+            if lm_head_host is None or lm_head_host or free0 - need < 0:  # default (None) and True: host table; DflashEngine passes False (device table if it fits; True again on its retry after an out-of-memory)
+                lmh = torch.empty(G.lm_head.shape, dtype=G.lm_head.dtype, pin_memory=True)
+                lmh.copy_(G.lm_head)
+            if verbose:
+                print(f"[engine] lm_head table on {'host' if lmh is not None else 'device'} (free {free0 / 2**30:.2f} GiB, need {need / 2**30:.2f} GiB)", flush=True)
+            G.embed = emb  # the C engine holds raw pointers into these: they live as long as G
+            if lmh is not None:
+                G.lm_head = lmh
+                self.tables_on_host = True
+            self.lm_head_on_host = lmh is not None
         torch.cuda.empty_cache()  # weight packing leaves ~1.5 GiB of idle blocks in torch's pool (and the GPU tables just freed): hand them to the driver before the engine's cudaMallocs
         self.load_s = time.time() - t0
         m = smk.ModelW()
@@ -151,6 +164,28 @@ class Engine:
         smk.check(self.lib.smk_engine_decode(self.h, n, out, self.st), "decode")
         self.pos += n
         return list(out)
+
+    # ---- external verify (feat/dflash2): T rows over host-chosen tokens, host-side greedy accept, commit a rows (include/engine.h smk_engine_verify)
+    def verify(self, toks):
+        """Run the T = len(toks) rows [anchor, drafts...] at positions pos.. through the target (graph, head 1, no advance); returns the greedy argmax of every row."""
+        T = len(toks)
+        arr = (C.c_int * T)(*toks)
+        smk.check(self.lib.smk_engine_set_tokens(self.h, arr, T, self.st), "set_tokens")
+        smk.check(self.lib.smk_engine_verify(self.h, T, self.st), "verify")
+        return [int(x) for x in self._read(0, 18, torch.int32)[10 : 10 + T]]
+
+    def commit(self, a, T):
+        """Keep the first `a` rows of the last verify of T rows (pos += a, DeltaNet ring slot += a); rows a..T-1 are rolled back."""
+        smk.check(self.lib.smk_engine_commit(self.h, a, T, self.st), "commit")
+        self.pos += a
+
+    def taps(self, layer_ids, T, out=None):
+        """bf16 cuda tensor [len(layer_ids)][T][5120]: hidden after target layer l (the residual stream = HF hidden_states[l + 1]) of rows 0..T-1 of the last step, stream ordered."""
+        slots = (C.c_int * len(layer_ids))(*[l + 1 for l in layer_ids])
+        if out is None:
+            out = torch.empty(len(layer_ids), T, 5120, dtype=torch.bfloat16, device="cuda")
+        smk.check(self.lib.smk_engine_tap_gather(self.h, slots, len(layer_ids), T, C.c_void_p(out.data_ptr()), self.st), "tap_gather")
+        return out
 
     def dbg_hidden(self, T=1):
         """bf16 -> fp32 [66][T][5120] debug taps of the last step: slot 0 embedding, l+1 = after layer l, 65 = final norm out."""

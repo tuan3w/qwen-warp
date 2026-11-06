@@ -146,6 +146,15 @@ cudaError_t smk_engine_set_procs(smk_engine* e, const smk_procs* p, cudaStream_t
 // (-1 unused) / exact float [T][64] -> out [T][64].  gen[n_gen] = tokens already generated (noted through the device path), drafts[T-1] = the draft tokens of rows 1..T-1.
 cudaError_t smk_test_proc_logits(const smk_procs* p, int T, const int* gen, int n_gen, const int* drafts, const float* logits, float* out);
 cudaError_t smk_test_proc_cand(const smk_procs* p, int T, const int* gen, int n_gen, const int* drafts, const int* cand, const float* exact, float* out);
+// Verify T rows (the tokens staged by smk_engine_set_tokens) WITHOUT advancing the sequence: the engine step with head = 1 (greedy argmax of every row -> device ds[10 + t], read with
+// smk_engine_read what = 0, ints 10..10+T-1) as a graph per T; the speculative cycle's verify (include/mtp.h) with the host choosing the draft tokens.  The host accepts the longest prefix
+// m with tok[t + 1] == argmax[t], then calls smk_engine_commit(a = m + 1, T): pos += a, DeltaNet ring slot += a (rows a..T-1 are rolled back by the ring), next input = argmax[a - 1];
+// KV rows beyond are overwritten by the next step.  Needs a greedy engine (smk_engine_set_head state is respected).
+cudaError_t smk_engine_verify(smk_engine* e, int T, cudaStream_t st);
+cudaError_t smk_engine_commit(smk_engine* e, int a, int T, cudaStream_t st);
+// Async copy of rows 0..T-1 of n debug tap slots (slot l + 1 = hidden after layer l, see smk_engine_read what = 1) to dst = [n][T][5120] bf16 (a device or host pointer), on st.
+// The taps are written by every step (no flag: the writes are already in the default graphs), so the default path is unchanged.
+cudaError_t smk_engine_tap_gather(smk_engine* e, const int* slots, int n, int T, void* dst, cudaStream_t st);
 // Same work launched as individual kernels (no graph): for profiling / debugging.
 cudaError_t smk_engine_step_nograph(smk_engine* e, int T, int head, cudaStream_t st);
 // Greedy decode: n replays of the T=1 head graph, host out_tok[0..n-1] filled (synchronises).

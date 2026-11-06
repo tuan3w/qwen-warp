@@ -51,6 +51,7 @@ struct smk_engine {
   cudaStream_t cap = nullptr, side = nullptr;
   cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
   cudaGraphExec_t gexec[smk::TM + 1][smk::NHEAD_MODES][smk::NHEAD_VARIANTS] = {};
+  cudaGraphExec_t gverify[smk::TM + 1][2] = {};  // smk_engine_verify graphs [T][BF16 head | quantised head] (greedy, spec = 1)
   // K9 quantised head: hq_on = use it (else the BF16 head); hsamp = sampling configured (rescoring set R = 64 so the device top-k <= 64 sees exact logits)
   int hq_on = 0, hsamp = 0;
   unsigned head_epoch = 0;  // bumped by smk_engine_set_head: graphs of the speculative driver are recaptured

@@ -4,6 +4,14 @@
 using namespace smk;
 
 // ---------------------------------------------------------------------------------------------- tiny kernels
+// Commit a of the T rows of a smk_engine_verify step: the bookkeeping of the speculative accept kernel (spec_finish, mtp_sample.h) without the MTP state.
+__global__ void k_commit(int* ds, int a, int T) {
+  ds[DS_TOK] = ds[DS_OUT + a - 1];
+  ds[DS_POS] += a;
+  dn_pend_after(ds, a, T);
+  ds[DS_CUR] = (ds[DS_CUR] + a) % ds[DS_SLOTS];
+}
+
 __global__ void k_advance(int* ds, int acc, int feedback) {
   ds[DS_POS] += acc;
   dn_pend_after(ds, acc, acc);
@@ -94,6 +102,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
 
 static void smk_engine_drop_graphs(smk_engine* e) {
   for (auto& r : e->gexec) for (auto& v : r) for (auto& g : v) if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+  for (auto& r : e->gverify) for (auto& g : r) if (g) { cudaGraphExecDestroy(g); g = nullptr; }
 }
 
 extern "C" {
@@ -219,6 +228,28 @@ cudaError_t smk_engine_step(smk_engine* e, int T, int head, cudaStream_t st) {
     if (err != cudaSuccess) return err;
   }
   return cudaGraphLaunch(gx, st);
+}
+
+cudaError_t smk_engine_verify(smk_engine* e, int T, cudaStream_t st) {
+  if (T < 1 || T > e->tmax) return cudaErrorInvalidValue;
+  cudaGraphExec_t& gx = e->gverify[T][e->hq_on ? 1 : 0];
+  return smk_graph_launch(e, &gx, [&](cudaStream_t c) { return smk_run_step(e, T, 1, 1, c, 0); }, st);
+}
+
+cudaError_t smk_engine_commit(smk_engine* e, int a, int T, cudaStream_t st) {
+  if (T < 1 || T > e->tmax || a < 1 || a > T) return cudaErrorInvalidValue;
+  k_commit<<<1, 1, 0, st>>>(e->ds, a, T);
+  return cudaGetLastError();
+}
+
+cudaError_t smk_engine_tap_gather(smk_engine* e, const int* slots, int n, int T, void* dst, cudaStream_t st) {
+  if (T < 1 || T > TM || n < 1) return cudaErrorInvalidValue;
+  for (int i = 0; i < n; i++) {
+    if (slots[i] < 0 || slots[i] >= DBG_SLOTS) return cudaErrorInvalidValue;
+    cudaError_t err = cudaMemcpyAsync((char*)dst + (size_t)i * T * H * 2, e->dbg + (size_t)slots[i] * TM * H, (size_t)T * H * 2, cudaMemcpyDefault, st);
+    if (err != cudaSuccess) return err;
+  }
+  return cudaSuccess;
 }
 
 cudaError_t smk_engine_decode(smk_engine* e, int n, int* host_tokens, cudaStream_t st) {
