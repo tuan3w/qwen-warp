@@ -88,18 +88,36 @@ class Stats:
     source: str = "cold"  # where the resume point came from: cold | device | host
     spill_s: float = 0.0  # time spent moving the previous device lineage to the host store
     restore_s: float = 0.0  # time spent restoring a stored lineage (KV rows + snapshot)
+    route: str = "mtp"  # the draft path that decoded the request: mtp (MTP chain + prompt-lookup tail) | dflash2 (block drafter)
+    hist: list = field(default_factory=list)  # dflash2: cycles by number of accepted drafts (0..7)
 
 
 class Runner:
-    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True):
-        """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object."""
+    def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True,
+                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False):
+        """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object.
+        drafter: "mtp" (default) or "dflash2": greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter (engine/dflash.py: 7 drafts per cycle, verify T = 8) when
+        its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
+        assert drafter in ("mtp", "dflash2"), drafter
         self.k, self.group, self.max_snaps, self.log = k, group, max_snaps, log
         self.pld = (make_pld() if pld is True else pld) or None
+        self.drafter = drafter
+        self.df = drafter == "dflash2"
+        self.df_lo = self.df_hi = 0  # drafter K/V rows [df_lo, df_hi) of the device lineage's prompt are valid (see _df_note); empty when equal
+        self.tap = None
+        self.df_mib = 0.0  # device memory of the drafter (weights, caches, ring, graphs of the first request not included), measured at construction
         t0 = time.time()
         try:
-            self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)
+            if self.df:
+                from dflash import DF_PATH, DflashEngine, TapCapture
+
+                self.e = DflashEngine(dflash_path=dflash_path or DF_PATH, codebooks_host=dflash_codebooks_host, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables, lm_head_host=True)
+                self.tap = TapCapture(self.e, self.DF_WINDOW)
+                self.df_mib = self.e.df_mib + self.tap.nbytes / 2**20  # drafter weights + K/V cache + scratch + the tap staging buffers
+            else:
+                self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)
         except AttributeError as ex:  # ctypes: symbol missing in an old libswiftmk.so
             raise RuntimeError(f"libswiftmk.so is older than the sources ({ex}): run `make -C engine` (or point SMK_BUILD at a current build dir)") from ex
         self.fp = FastPrefill(self.e, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))
@@ -173,8 +191,39 @@ class Runner:
     def drop_cache(self):
         self.lineage = None
         self._free_snaps([])
+        self.df_lo = self.df_hi = 0
         if self.store is not None:
             self.pool += self.store.clear()
+
+    # ------------------------------------------------------------------------------------------------ DFlash2 drafter context
+    # The drafter attends the last 2047 committed rows of its own K/V cache (positions [n - 2047, n) at the first cycle of a prompt of n tokens); row p is a function of the target's residual taps at
+    # row p alone (engine/dflash.py), so the rows of the window are rebuilt from the taps of the fast prefill (TapCapture) instead of re-running the target.  The Runner tracks which rows of the
+    # device lineage's prompt are valid: [df_lo, df_hi).  Every prefill of a dflash2 Runner captures its window whatever route decodes the request, so the lineage stays resumable by a
+    # later greedy turn.  A missing row never makes the output wrong (greedy accept = argmax equality of the T = 8 verify), it only lowers the tokens per cycle: the router sends a request to
+    # the MTP path when its window is not on the device.
+    DF_WINDOW = 2047
+
+    def _df_window(self, n_prompt, q):
+        """Prompt rows [c0, c1) the prefill of a prompt of n_prompt tokens resumed at q must capture: the window [n_prompt - W, n_prompt - 1) minus what a resume skips; row n_prompt - 1 comes from the head step."""
+        return max(q, n_prompt - self.DF_WINDOW), n_prompt - 1
+
+    def _df_note(self, a, b):
+        """Rows [a, b) were just (re)written: extend the valid interval when they continue it, else they start a new one."""
+        if self.df_hi > self.df_lo and a == self.df_hi:
+            self.df_hi = b
+        else:
+            self.df_lo, self.df_hi = a, b
+
+    def _df_cut(self, q):
+        """A resume at q keeps the drafter rows below q (same tokens) and drops the rest."""
+        self.df_hi = min(self.df_hi, q)
+        if self.df_hi <= self.df_lo:
+            self.df_lo = self.df_hi = 0
+
+    def _df_covered(self, n_prompt, q):
+        """Is every row of the window of a prompt of n_prompt tokens resumed at q on the device after the prefill (captured by it, or valid from the lineage below q)?"""
+        lo_need = max(0, n_prompt - self.DF_WINDOW)
+        return lo_need >= q or (self.df_hi > self.df_lo and self.df_lo <= lo_need and self.df_hi >= q)
 
     def _new_snap(self):
         self._made += 1
@@ -319,9 +368,27 @@ class Runner:
             groups.append(cur)
         return groups
 
-    def _prefill(self, ids, q, ends, folded, cancelled):
+    def _prefill(self, ids, q, ends, folded, cancelled, use_df=False):
         """Process ids[q:] (state valid for [0, q), q = 0 or a segment end of the plan) following the plan; the last token as the head step.  Snapshots after the last (up to)
-        two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix)."""
+        two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix).  dflash2 Runner: also builds the drafter's context window (TapCapture); use_df: the
+        request is decoded by the block drafter, so the prefill ends with smk_dflash_start instead of the MTP draft (smk_spec_start)."""
+        tap = self.tap
+        if tap is not None:
+            tap.begin(*self._df_window(len(ids), q))
+            self.fp.tap = tap
+        try:
+            return self._prefill_rows(ids, q, ends, folded, cancelled, use_df, tap)
+        finally:
+            self.fp.tap = None
+
+    def _df_flush(self, tap, a, b):
+        """Append the staged rows of [a, b) that are inside the capture window to the drafter's context."""
+        a, b = max(a, tap.lo), min(b, tap.hi)
+        if a < b:
+            tap.flush(a, b)
+            self._df_note(a, b)
+
+    def _prefill_rows(self, ids, q, ends, folded, cancelled, use_df, tap):
         e, fp = self.e, self.fp
         snap_at = set(ends[len(ends) - min(2, self.max_snaps) :]) if self.max_snaps else set()
         sys_at = self._system_end(ids, ends)
@@ -343,12 +410,17 @@ class Runner:
                 fp.ds[0] = j
                 e.pos = j
                 torch.cuda.synchronize()
+                if tap is not None:
+                    self._df_flush(tap, i, j)
             else:
                 for a in range(i, j, 4):
                     T = min(4, j - a)
                     e._step(ids[a : a + T], 2)
                     nt = (C.c_int * T)(*ids[a + 1 : a + 1 + T])
                     smk.check(e.lib.smk_spec_prefill_chunk(e.sp, T, nt, a, e.st), "spec_prefill_chunk")
+                    if tap is not None and a + T > tap.lo:  # the step left the taps of these rows in dbg rows 0..T-1
+                        e.df_append(T, a)
+                        self._df_note(a, a + T)
             i = j
             if i in snap_at:
                 self._snapshot(i, sticky=(i == sys_at))
@@ -360,22 +432,34 @@ class Runner:
             cur = self._cur()
             fp._ev = []
             fp._segment(ids[i:], i, cur, ids[i + 1 :], head=True)
+            if tap is not None:
+                torch.cuda.synchronize()
+                self._df_flush(tap, i, len(ids) - 1)
+                tap.put_last()  # the folded head has no step that fills dbg row 0 with the last row's taps
         else:
             e._step(ids[-1:], 1)
+        n = len(ids) - 1  # position of the last prompt row (its taps are in dbg row 0 now)
+        if tap is not None and not use_df:  # the lineage stays resumable by a later greedy turn: its last row joins the window (smk_dflash_start does it for the dflash2 route)
+            e.df_append(1, n)
+            self._df_note(n, n + 1)
         if e.sampling:
             smk.check(e.lib.smk_spec_sample_first(e.sp, e.st), "spec_sample_first")
-        if self.k:
+        if use_df:
+            e.df_start()
+            self._df_note(n, n + 1)
+        elif self.k:
             smk.check(e.lib.smk_spec_start(e.sp, self.k, e.st), "spec_start")
         self.lineage = np.asarray(ids, dtype=np.int32)
         return True
 
     # ------------------------------------------------------------------------------------------------ generation
-    def run(self, ids, p: GenParams, cancelled=lambda: False):
-        """Generator of (new_tokens, finish_reason | None, stop_reason); tokens are cut exactly at the stop / length.  Nothing is yielded after a cancel."""
+    def run(self, ids, p: GenParams, cancelled=lambda: False, route=None):
+        """Generator of (new_tokens, finish_reason | None, stop_reason); tokens are cut exactly at the stop / length.  Nothing is yielded after a cancel.
+        route: None = the router's choice; "mtp" forces the MTP path (a dflash2 Runner otherwise decodes greedy requests without logit processors with the block drafter when its window is covered)."""
         e, k = self.e, self.k
         ids = [int(t) for t in ids]
         st = self.last = Stats(prompt=len(ids))
-        n_new = min(p.max_tokens, self.ctx_max - self.slack(self.group, k, bool(self.pld)) - len(ids))
+        n_new = min(p.max_tokens, self.ctx_max - self.slack(self.group, k, bool(self.pld) or self.df) - len(ids))
         if n_new < 1 or len(ids) < 1:
             raise ValueError(f"prompt of {len(ids)} tokens does not fit the engine context {self.ctx_max}")
         t0 = time.time()
@@ -394,13 +478,15 @@ class Runner:
         pick = self._pick(ids, set(ends))
         if pick is None:
             st.spill_s = self._spill_device()
-            e.reset()
+            e.reset()  # (a dflash2 engine also zeroes the drafter's K/V cache)
+            self.df_lo = self.df_hi = 0
             q = 0
         elif pick[0] == "device":
             snap = pick[1]
             self._free_snaps([s for s in self.snaps if s.pos <= snap.pos])
             e.reset_counters()
             self._restore(snap)
+            self._df_cut(snap.pos)  # the drafter rows below the resume position are the same tokens' rows
             q = snap.pos
             st.source = "device"
         else:
@@ -409,14 +495,21 @@ class Runner:
             st.spill_s = self._spill_device(keep=ent)
             self._load_entry(ent, snap, ids)
             st.restore_s = time.time() - tr - st.spill_s
+            self.df_lo = self.df_hi = 0  # the drafter cache holds another lineage's rows
             q = snap.pos
             st.source = "host"
         st.cached = q
-        if not self._prefill(ids, q, ends, folded, cancelled):
+        use_df = self.df and route != "mtp" and p.temperature <= 0 and not procs and self._df_covered(len(ids), q)
+        st.route = "dflash2" if use_df else "mtp"
+        if not self._prefill(ids, q, ends, folded, cancelled, use_df):
             return
-        e._emitted = self._ss()[12]
+        if use_df:
+            ss0 = e.df_state()  # the counters run on across requests that resume a cached lineage: this request's share is the difference
+            e._demitted = ss0[12]
+        else:
+            e._emitted = self._ss()[12]
         first = e.read_out_tok()
-        use_pld = bool(self.pld) and k == 3
+        use_pld = bool(self.pld) and k == 3 and not use_df
         if use_pld:
             e.enable_pld(self.pld)
             e.pld_begin(ids + [first])
@@ -437,7 +530,11 @@ class Runner:
             if cancelled():
                 st.gen_s = time.time() - t1
                 return
-            if use_pld:
+            if use_df:
+                new, ss = e.df_cycles(self.group)
+                st.cycles = ss[13] - ss0[13]
+                st.hist = [a - b for a, b in zip(ss[16:24], ss0[16:24])]
+            elif use_pld:
                 new, ss = e.cycles_pld(self.group)
                 st.cycles = ss[13]
             elif k:
@@ -466,9 +563,10 @@ class Runner:
         """Compile / autotune the prefill paths and size the scratch (a segment-sized prompt) so the first request is not slow and the VRAM peak is paid up front."""
         e = self.e
         rng = np.random.default_rng(0)
-        for n in (40, min(self.fp.seg + 64, self.ctx_max - 64), 130):
+        routes = (None, "mtp") if self.df else (None,)  # a dflash2 Runner warms both draft paths: the graphs of the MTP route (T = 4..8 cycles) are captured now, not under memory pressure at the first sampled request
+        for n, route in [(40, r) for r in routes] + [(min(self.fp.seg + 64, self.ctx_max - 64), None), (130, None)]:
             ids = rng.integers(1000, 100000, size=n).tolist()
-            for _ in self.run(ids, GenParams(max_tokens=2 * (self.group * (8 if self.pld else self.k + 1)) + 2, temperature=0.0)):
+            for _ in self.run(ids, GenParams(max_tokens=2 * (self.group * (8 if self.pld or self.df else self.k + 1)) + 2, temperature=0.0), route=route):
                 pass
         self.drop_cache()
         torch.cuda.empty_cache()

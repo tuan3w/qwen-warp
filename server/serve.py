@@ -41,6 +41,12 @@ def parse_args(argv=None):
     g.add_argument("--sort-tool-schema", default="on", choices=["on", "off"], help="render the keys of every tool's function.parameters in sorted order (properties, required, type): the model returns a well-formed tool call "
                    "more often than with the type-first order most clients send (server/tool_schema.py); off = render the schemas exactly as sent")
     g.add_argument("--profile", default="default", choices=["default", "long"], help="long = --kv-cache-dtype int4_per_token_head --host-tables and a default --max-model-len of 196608 (explicit flags win)")
+    g.add_argument("--drafter", default="mtp", choices=["mtp", "dflash2"], help="mtp (default): MTP chain + prompt-lookup tail.  dflash2 (experimental): greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter "
+                   "(7 drafts per cycle, W4A16, ~+30..45% decode tok/s on code and math, about equal on prose); sampled requests, requests with logit processors and requests whose drafter window is not on the GPU "
+                   "(resumed from the host prefix cache) use the MTP path.  Needs the drafter checkpoint (--dflash-path), ~1.6 GiB + 20 KiB per context token of GPU memory (practically needs --host-tables; "
+                   "the --profile long length does not fit)")
+    g.add_argument("--dflash-path", default=None, help="directory of the DFlash2 W4A16 checkpoint (compressed-tensors; model.safetensors) for --drafter dflash2; default $DFLASH_W4 or ~/llm-lab/models/dflash2-w4a16")
+    g.add_argument("--dflash-codebooks", default="device", choices=["device", "host"], help="where the drafter's two 242 MiB candidate-selector codebooks live (host = pinned memory, gathered by row over PCIe: 484 MiB less VRAM)")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
                         language_model_only=True, disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
     args = parser.parse_args(argv)
@@ -66,7 +72,8 @@ def main(argv=None):
     args = parse_args(argv)
     import smk_core_client
 
-    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prefix_cache_gb=args.prefix_cache_gb, system_checkpoint=args.system_checkpoint == "on", prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on")
+    smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prefix_cache_gb=args.prefix_cache_gb, system_checkpoint=args.system_checkpoint == "on", prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on",
+                            drafter=args.drafter, dflash_path=args.dflash_path, dflash_codebooks=args.dflash_codebooks)
     from vllm.entrypoints.launchers.api_server.entry import run_server
 
     uvloop.run(run_server(args))

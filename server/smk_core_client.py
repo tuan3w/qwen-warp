@@ -78,7 +78,7 @@ def to_gen_params(sp) -> GenParams:
                      allowed_token_ids=tuple(dict.fromkeys(sp.allowed_token_ids)) if sp.allowed_token_ids else None)
 
 
-OPTIONS = dict(stream_cycles=2, snapshots=16, prefix_cache_gb=6.0, system_checkpoint=True, prompt_lookup="auto", host_tables=False, sort_tool_schema=True)
+OPTIONS = dict(stream_cycles=2, snapshots=16, prefix_cache_gb=6.0, system_checkpoint=True, prompt_lookup="auto", host_tables=False, sort_tool_schema=True, drafter="mtp", dflash_path=None, dflash_codebooks="device")
 KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
 KV_NAMES = ("bf16", "fp8", "int4")
 
@@ -95,21 +95,35 @@ MIN_HEADROOM_MIB = 64  # refuse to start with less than this predicted to be lef
 AUTO_TAIL_HEADROOM_MIB = 256  # `--prompt-lookup auto` only turns the tail on if at least this much stays free
 MODEL_MAX_LEN = 262144
 
+# --drafter dflash2 (engine/dflash.py): the engine always has the 9-slot ring (tmax = 8: the (host tables, tail) fixed term), plus the drafter: VRAM_DF_FIXED_MIB[codebooks on the host] = the W4A16 weights
+# (1.0 GiB), the two 121 MiB candidate-selector codebooks (device only), the output ring + log, the tap staging buffers of the fast prefill (5 x 2047 rows x 10 KiB), the captured cycle graphs of both draft routes;
+# VRAM_DF_KIB_PER_TOKEN = the drafter's own K/V cache over the whole context (absolute positions: 5 layers x 8 kv heads x 128 x (K, V) x bf16 = 20 KiB) + its token history (4 B).  MEASURED as the difference to
+# the --drafter mtp Runner with the tail at the same length after warmup + a request at that length (RTX 3090, experiments/2026-11-06-dflash2-server/memfit.py): +1872 / +2352 MiB at 24,576 / 49,152 tokens
+# (20.0 KiB per token), +3310 MiB at 98,304 with int4 KV, +2670 MiB at 65,536 with fp8 KV, +1628 MiB at 24,576 with the codebooks on the host.
+VRAM_DF_FIXED_MIB = {False: 1400, True: 1150}
+VRAM_DF_KIB_PER_TOKEN = 20.004
 
-def vram_need_mib(ctx, dt, ht, pld):
+
+def vram_need_mib(ctx, dt, ht, pld, df=False, cb_host=False):
+    if df:  # the drafter's cycle verifies 8 rows: the ring of the tail is paid whether or not the MTP route uses the tail
+        return VRAM_FIXED_MIB[ht, True] + VRAM_DF_FIXED_MIB[bool(cb_host)] + VRAM_KV_FIXED_MIB[dt] + ctx * (VRAM_KIB_PER_TOKEN[dt] + VRAM_DF_KIB_PER_TOKEN) / 1024
     return VRAM_FIXED_MIB[ht, bool(pld)] + VRAM_KV_FIXED_MIB[dt] + ctx * VRAM_KIB_PER_TOKEN[dt] / 1024
 
 
-def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB):
+def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB, df=False, cb_host=False):
     """Largest --max-model-len (a multiple of 1024) whose predicted need leaves `headroom` MiB of `free_mib`; 0 if not even a short context fits."""
-    n = (free_mib - headroom - vram_need_mib(0, dt, ht, pld)) * 1024 / VRAM_KIB_PER_TOKEN[dt]
+    per_token = VRAM_KIB_PER_TOKEN[dt] + (VRAM_DF_KIB_PER_TOKEN if df else 0.0)
+    n = (free_mib - headroom - vram_need_mib(0, dt, ht, pld, df, cb_host)) * 1024 / per_token
     return min(MODEL_MAX_LEN, max(0, int(n) // 1024 * 1024))
 
 
-def vram_limits_text(free_mib, k):
-    """One line per cache layout: the largest --max-model-len for the memory that is free now (with the tail, without it)."""
+def vram_limits_text(free_mib, k, df=False, cb_host=False):
+    """One line per cache layout: the largest --max-model-len for the memory that is free now (with the tail, without it; --drafter dflash2: with the block drafter)."""
     rows = []
     for dt, ht, flags in ((0, False, "(default)"), (1, False, "--kv-cache-dtype fp8"), (2, False, "--kv-cache-dtype int4_per_token_head"), (2, True, "--profile long")):
+        if df:
+            rows.append(f"  {KV_NAMES[dt]} KV{' + host tables' if ht else ''} {flags}: {vram_max_len(free_mib, dt, ht, True, df=True, cb_host=cb_host):,} with --drafter dflash2")
+            continue
         with_tail = f"{vram_max_len(free_mib, dt, ht, True):,} with the prompt-lookup tail, " if k == 3 else ""
         rows.append(f"  {KV_NAMES[dt]} KV{' + host tables' if ht else ''} {flags}: {with_tail}{vram_max_len(free_mib, dt, ht, False):,} without (--prompt-lookup 0)")
     return "\n".join(rows)
@@ -127,17 +141,27 @@ def engine_cfg(vllm_config, free_mib):
     g = OPTIONS["stream_cycles"]
     pl = OPTIONS["prompt_lookup"]  # K11 hybrid draft (MTP chain + prompt-lookup tail, 9-slot ring): True / False / "auto" = on iff k == 3 and --max-model-len fits next to the ring
     dt, ht = KV_DTYPES[kv], bool(OPTIONS["host_tables"])
+    df, cbh = OPTIONS["drafter"] == "dflash2", OPTIONS["dflash_codebooks"] == "host"
     L = mc.max_model_len
-    pld = k == 3 and (vram_need_mib(L, dt, ht, True) <= free_mib - AUTO_TAIL_HEADROOM_MIB if pl == "auto" else bool(pl))
-    if pl == "auto" and k == 3 and not pld:
-        logger.info("swift-mk: prompt-lookup tail off: at --max-model-len %d with %s KV%s it needs %.0f MiB of the %d MiB free (it keeps %d MiB free at most); pass --prompt-lookup 1 to force it",
-                    L, KV_NAMES[dt], " + host tables" if ht else "", vram_need_mib(L, dt, ht, True), free_mib, AUTO_TAIL_HEADROOM_MIB)
-    need = vram_need_mib(L, dt, ht, pld)
-    if need > free_mib - MIN_HEADROOM_MIB:
-        raise RuntimeError(f"swift-mk: --max-model-len {L:,} with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{' and the prompt-lookup tail' if pld else ''} needs about {need:.0f} MiB of GPU memory "
-                           f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
-                           f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k)}")
-    return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld)
+    if df:  # the 9-slot ring is paid by the drafter's verify anyway: the MTP route's tail is free
+        pld = k == 3 and pl is not False
+        need = vram_need_mib(L, dt, ht, True, True, cbh)
+        if need > free_mib - MIN_HEADROOM_MIB:
+            raise RuntimeError(f"swift-mk: --drafter dflash2 with --max-model-len {L:,} and {KV_NAMES[dt]} KV{' + host tables' if ht else ''} needs about {need:.0f} MiB of GPU memory "
+                               f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest; the drafter takes {VRAM_DF_FIXED_MIB[cbh]} MiB + {VRAM_DF_KIB_PER_TOKEN:.0f} KiB per context token).  "
+                               f"Largest --max-model-len with --drafter dflash2 that fits the free memory ({'--host-tables is required for any useful length' if not ht else 'this layout'}):\n{vram_limits_text(free_mib, k, True, cbh)}")
+    else:
+        pld = k == 3 and (vram_need_mib(L, dt, ht, True) <= free_mib - AUTO_TAIL_HEADROOM_MIB if pl == "auto" else bool(pl))
+        if pl == "auto" and k == 3 and not pld:
+            logger.info("swift-mk: prompt-lookup tail off: at --max-model-len %d with %s KV%s it needs %.0f MiB of the %d MiB free (it keeps %d MiB free at most); pass --prompt-lookup 1 to force it",
+                        L, KV_NAMES[dt], " + host tables" if ht else "", vram_need_mib(L, dt, ht, True), free_mib, AUTO_TAIL_HEADROOM_MIB)
+        need = vram_need_mib(L, dt, ht, pld)
+        if need > free_mib - MIN_HEADROOM_MIB:
+            raise RuntimeError(f"swift-mk: --max-model-len {L:,} with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{' and the prompt-lookup tail' if pld else ''} needs about {need:.0f} MiB of GPU memory "
+                               f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
+                               f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k)}")
+    return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld or df), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld,
+                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh)
 
 
 class SwiftCoreClient(EngineCoreClient):
@@ -155,15 +179,17 @@ class SwiftCoreClient(EngineCoreClient):
         self.resources = SimpleNamespace(engine_dead=False)
         t0 = time.time()
         try:
-            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables, prefix_cache_gb=cfg.prefix_cache_gb, system_checkpoint=cfg.system_checkpoint)
+            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables, prefix_cache_gb=cfg.prefix_cache_gb, system_checkpoint=cfg.system_checkpoint,
+                                 drafter=cfg.drafter, dflash_path=cfg.dflash_path, dflash_codebooks_host=cfg.dflash_codebooks_host)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "older than the sources" in str(e):
                 raise
             raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
-                               f"{' and the prompt-lookup tail' if cfg.pld else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
-                               f"Largest --max-model-len that fits that memory:\n{vram_limits_text(free_mib, cfg.k)}\n{e}") from e
-        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s",
-                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, cfg.prefix_cache_gb, "on" if cfg.pld else "off")
+                               f"{' and the prompt-lookup tail' if cfg.pld else ''}{' and --drafter dflash2' if cfg.drafter == 'dflash2' else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
+                               f"Largest --max-model-len that fits that memory:\n{vram_limits_text(free_mib, cfg.k, cfg.drafter == 'dflash2', cfg.dflash_codebooks_host)}\n{e}") from e
+        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s%s",
+                    time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, cfg.prefix_cache_gb, "on" if cfg.pld else "off",
+                    f", drafter dflash2 (greedy requests without logit processors; {self.runner.df_mib:.0f} MiB device, codebooks on the {'host' if cfg.dflash_codebooks_host else 'device'})" if cfg.drafter == "dflash2" else "")
         self.thread = threading.Thread(target=self._worker, name="swift-mk-engine", daemon=True)
         self.thread.start()
 
@@ -210,9 +236,10 @@ class SwiftCoreClient(EngineCoreClient):
                 first = False
             self._emit([out])
         st = self.runner.last
-        logger.info("%s: prompt %d (resumed at %d from %s) prefill %.3f s (spill %.0f ms, restore %.0f ms), %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s, host cache %d lineages %.2f GiB", rid, st.prompt, st.cached, st.source, st.prefill_s,
+        logger.info("%s: prompt %d (resumed at %d from %s) prefill %.3f s (spill %.0f ms, restore %.0f ms), %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s, host cache %d lineages %.2f GiB%s", rid, st.prompt, st.cached, st.source, st.prefill_s,
                     st.spill_s * 1e3, st.restore_s * 1e3, st.tokens, st.gen_s, (st.tokens - 1) / st.gen_s if st.gen_s > 0 else 0.0, (st.tokens - 1) / st.cycles if st.cycles else 0.0, st.snaps,
-                    len(self.runner.store.entries) if self.runner.store else 0, self.runner.store.bytes() / (1 << 30) if self.runner.store else 0.0)
+                    len(self.runner.store.entries) if self.runner.store else 0, self.runner.store.bytes() / (1 << 30) if self.runner.store else 0.0,
+                    f", route {st.route}" + (f" (accepted drafts per cycle {st.hist})" if st.route == "dflash2" else "") if self.runner.df else "")
 
     # ------------------------------------------------------------------------------------------------ EngineCoreClient
     async def add_request_async(self, request) -> None:
