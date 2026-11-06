@@ -1,5 +1,6 @@
 // swift-mk K3: the 64-layer decode step wired from the K1 (DeltaNet) / K2 (attention) / K3 (GEMV, norm, lm_head) kernels + CUDA-graph capture.
 #include "engine_impl.h"
+#include "sp_params.h"
 
 using namespace smk;
 
@@ -17,6 +18,31 @@ __global__ void k_advance(int* ds, int acc, int feedback) {
   dn_pend_after(ds, acc, acc);
   ds[DS_CUR] = (ds[DS_CUR] + acc) % ds[DS_SLOTS];
   if (feedback) ds[DS_TOK] = ds[DS_OUT + acc - 1];
+}
+
+// Lab control knobs (positive / negative controls of the sparsity lab; all off by default and then the captured graph is unchanged).  sp_zero zeroes the channels c of the T rows of x
+// [T][N] with hash(c, salt) < frac (a fixed pseudo-random subset: the same channels in every step); frac = 0 launches the kernel and zeroes nothing (SMK_SP_CTRL_NOOP=1: a no-op knob).
+__global__ void k_sp_zero(uint16_t* x, int T, int N, unsigned thr, int salt) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= N) return;
+  unsigned h = (unsigned)c * 2654435761u ^ ((unsigned)salt * 40503u + 12345u);
+  h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  if (h < thr) for (int t = 0; t < T; t++) x[(size_t)t * N + c] = 0;
+}
+static cudaError_t sp_zero(uint16_t* x, int T, int N, double frac, int salt, cudaStream_t st) {
+  const unsigned thr = frac >= 1.0 ? 0xffffffffu : (unsigned)(frac * 4294967296.0);
+  k_sp_zero<<<(N + 255) / 256, 256, 0, st>>>(x, T, N, thr, salt);
+  return cudaGetLastError();
+}
+// Failure controls for the lab's crash isolation (SMK_SP_CTRL_FAIL=1: illegal memory access, 2: kernel that never returns, 3: scribbles over the first bytes of layer 0's gate|up weights).
+__global__ void k_sp_fail(int mode, int* bad, uint32_t* weights) {
+  if (mode == 1) { *bad = 1; }
+  else if (mode == 2) { volatile int spin = 1; while (spin) {} }
+  else if (mode == 3) { for (int i = threadIdx.x; i < 4096; i += blockDim.x) weights[i] = 0u; }
+}
+static cudaError_t sp_fail(int mode, const void* gu_w, cudaStream_t st) {
+  k_sp_fail<<<1, 128, 0, st>>>(mode, nullptr, (uint32_t*)gu_w);
+  return cudaGetLastError();
 }
 
 // ---------------------------------------------------------------------------------------------- the step
@@ -50,9 +76,12 @@ static cudaError_t head_tail(smk_engine* e, int T, int head, int rsamp, cudaStre
 
 cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t st, int rsamp) {
   int l = -1;
+  const double sp_mz = smk_sp_f("SMK_SP_CTRL_MLP_ZERO", 0.0), sp_az = smk_sp_f("SMK_SP_CTRL_ATTN_ZERO", e->sp_az_create);
+  const bool sp_noop = smk_sp_i("SMK_SP_CTRL_NOOP", 0) != 0;
   if (T < 1 || T > e->tmax) return cudaErrorInvalidValue;
   const int* ds = e->ds;
   auto dbgp = [&](int slot) { return (void*)(e->dbg + (size_t)slot * TM * H); };
+  if (const int fm = (int)smk_sp_i("SMK_SP_CTRL_FAIL", 0)) CK(sp_fail(fm, e->w.layers[0].gu_w, st));
   CK(smk_embed(e->w.embed, ds + DS_TOK, e->h, T, H, st));
   for (l = 0; l < NLAYER; l++) {
     const smk_layer_w& L = e->w.layers[l];
@@ -77,6 +106,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
       CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_dtype,
                            L.k_scale, L.v_scale, ds + DS_POS, e->y6, e->ws_attn, st));
+      if (sp_az > 0.0) CK(sp_zero(e->y6, T, 6144, sp_az, 1000 + l, st));  // control knob (SMK_SP_CTRL_ATTN_ZERO)
     }
     {
       smk_epi ep = {};
@@ -88,6 +118,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       smk_epi ep = {};
       ep.kind = SMK_EPI_SILU; ep.out[0] = e->act;
       CK(smk_w4r_gemv(L.gu_w, L.gu_s, e->xn, 2 * I, H, T, &ep, st));
+      if (sp_mz > 0.0 || sp_noop) CK(sp_zero(e->act, T, I, sp_mz, l, st));  // control knob (SMK_SP_CTRL_MLP_ZERO / SMK_SP_CTRL_NOOP)
       smk_epi ed = {};
       ed.kind = SMK_EPI_SEGS; ed.end[0] = ed.end[1] = ed.end[2] = H; ed.out[0] = e->dn;
       CK(smk_w4r_gemv(L.dn_w, L.dn_s, e->act, H, I, T, &ed, st));
@@ -118,6 +149,7 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   if (tmax < 4 || tmax > TM) { fprintf(stderr, "smk_engine: tmax %d outside 4..%d\n", tmax, TM); return nullptr; }
   smk_engine* e = new smk_engine();
   e->tmax = tmax;
+  e->sp_az_create = smk_sp_f("SMK_SP_CTRL_ATTN_ZERO_CREATE", 0.0);
   e->slots = tmax + 1;
   e->w = *w;
   e->ctx_max = ctx_max;

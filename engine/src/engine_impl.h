@@ -36,6 +36,7 @@ struct smk_engine {
   smk_model_w w;
   int ctx_max = 0, kv_dtype = 0;  // 0=bf16 1=fp8 2=int4
   int tmax = 4, slots = 5;  // K11: largest step (rows) and DeltaNet ring slots = tmax + 1
+  double sp_az_create = 0.0;  // lab control read at engine creation (SMK_SP_CTRL_ATTN_ZERO_CREATE): only a fresh engine (lab --recreate) sees a new value
   size_t bytes = 0;
   bool failed = false;
   std::vector<void*> allocs;
