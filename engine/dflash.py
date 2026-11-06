@@ -38,6 +38,8 @@ def setup_df_api(lib):
     for n in ("reset", "start"):
         getattr(lib, f"smk_dflash_{n}").argtypes = [vp, vp]
         getattr(lib, f"smk_dflash_{n}").restype = ci
+    lib.smk_dflash_set_hist.argtypes = [vp, C.POINTER(ci), ci, vp]
+    lib.smk_dflash_set_hist.restype = ci
     lib.smk_dflash_prefill_chunk.argtypes = [vp, ci, ci, vp]
     lib.smk_dflash_prefill_chunk.restype = ci
     lib.smk_dflash_run.argtypes = [vp, ci, vp, C.POINTER(ci), C.POINTER(ci)]
@@ -136,7 +138,30 @@ class DflashEngine(SpecEngine):
     """SpecEngine (MTP k=3 path intact) + the DFlash2 drafter.  tmax must be 8."""
 
     def __init__(self, dflash_path=DF_PATH, rescore_r=32, codebooks_host=False, mask_id=248070, **kw):
+        retry = False
+        try:
+            self._build(dflash_path, rescore_r, codebooks_host, mask_id, **kw)
+        except RuntimeError:
+            # Engine keeps the bf16 lm_head table on the device when the free VRAM covers the engine's estimated needs; if the estimate was short (out of memory somewhere in the
+            # construction), rebuild with the table in pinned host memory.
+            if getattr(self, "lm_head_on_host", True) or not kw.get("host_tables", True):
+                raise
+            retry = True
+        if retry:  # outside the handler: the traceback of the failed attempt would keep its tensors alive
+            lib = getattr(self, "lib", None)
+            for attr, fn in (("df", "smk_dflash_destroy"), ("sp", "smk_spec_destroy"), ("h", "smk_engine_destroy")):  # the C objects of the failed attempt (device memory)
+                if lib is not None and getattr(self, attr, None):
+                    getattr(lib, fn)(getattr(self, attr))
+            for name in list(vars(self)):
+                delattr(self, name)
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._build(dflash_path, rescore_r, codebooks_host, mask_id, lm_head_host=True, **kw)
+
+    def _build(self, dflash_path, rescore_r, codebooks_host, mask_id, **kw):
         kw.setdefault("tmax", 8)
+        kw.setdefault("lm_head_host", False)  # keep the bf16 lm_head table on the device when it fits (rescoring over PCIe costs ~0.2 ms per cycle)
         super().__init__(**kw)
         assert self.tmax == 8, "DFlash2 verifies 8 rows per cycle (Engine(tmax=8))"
         setup_df_api(self.lib)
@@ -164,6 +189,8 @@ class DflashEngine(SpecEngine):
         ids = list(ids)
         assert len(ids) + 64 < self.ctx_max
         self.reset()
+        hbuf = (C.c_int * len(ids))(*ids)
+        smk.check(self.lib.smk_dflash_set_hist(self.df, hbuf, len(ids), self.st), "dflash_set_hist")
         n, i = len(ids) - 1, 0
         while i < n:
             T = min(8, n - i)

@@ -98,6 +98,7 @@ cudaError_t launch_i8(const void* w, const float* sc, const void* x, float* out,
 constexpr int CHUNK = 2048;      // logits per chunk (256 threads x 8)
 constexpr int NCH_MAX = 128;     // chunk-maximum slots per row (N <= 262144)
 constexpr int CAP = NCH_MAX * 64;  // survivor list capacity per row: every chunk contributes at most R <= 64 elements (see k_extract), so it never overflows (N <= NCH_MAX * CHUNK)
+constexpr int FLAT_MAX = 512;  // k_extract: largest survivor set of a chunk ranked by counting
 constexpr int RMAX = SMK_HEADQ_RMAX;
 static_assert(RMAX <= 64, "CAP assumes R <= 64");
 constexpr int ROWS = 8;  // K11: T <= 8 rows (int4 head; the int8 CUDA-core kernel keeps T <= 4: its smem holds T x 20 KB of activations)
@@ -156,10 +157,10 @@ __device__ __forceinline__ uint64_t wmax64(uint64_t v) {
 __global__ void __launch_bounds__(256) k_extract(const float* __restrict__ lg, int N, int R, const uint32_t* __restrict__ cm_all, int* __restrict__ cnt, uint64_t* __restrict__ list) {
   const int r = blockIdx.y, c = blockIdx.x, tid = threadIdx.x, nch = gridDim.x, lane = tid & 31, w = tid >> 5;
   __shared__ uint32_t cm[NCH_MAX], thr_s;
-  __shared__ int ns;
-  __shared__ uint64_t red[2][8];
+  __shared__ int ns, np;
+  __shared__ uint64_t red[2][8], sk[FLAT_MAX];
   for (int i = tid; i < nch; i += 256) cm[i] = cm_all[r * NCH_MAX + i];
-  if (tid == 0) { thr_s = nch <= R ? 0u : 0xFFFFFFFFu; ns = 0; }
+  if (tid == 0) { thr_s = nch <= R ? 0u : 0xFFFFFFFFu; ns = 0; np = 0; }
   __syncthreads();
   if (nch > R && tid < nch) {
     int g = 0;
@@ -190,7 +191,20 @@ __global__ void __launch_bounds__(256) k_extract(const float* __restrict__ lg, i
       if (key[i]) list[(size_t)r * CAP + atomicAdd(&cnt[r], 1)] = key[i];
     return;
   }
-  for (int it = 0; it < R; it++) {  // flat chunk: its R largest keys by iterated block-argmax
+  if (ns <= FLAT_MAX) {  // moderately flat chunk: compact the survivors in smem, a key is among the R largest iff fewer than R survivors are larger (keys are unique)
+#pragma unroll
+    for (int i = 0; i < CHUNK / 256; i++)
+      if (key[i]) sk[atomicAdd(&np, 1)] = key[i];
+    __syncthreads();
+    for (int e = tid; e < ns; e += 256) {
+      const uint64_t k = sk[e];
+      int rank = 0;
+      for (int j = 0; j < ns; j++) rank += sk[j] > k;
+      if (rank < R) list[(size_t)r * CAP + atomicAdd(&cnt[r], 1)] = k;
+    }
+    return;
+  }
+  for (int it = 0; it < R; it++) {  // very flat chunk: its R largest keys by iterated block-argmax
     uint64_t best = key[0];
 #pragma unroll
     for (int i = 1; i < CHUNK / 256; i++) best = key[i] > best ? key[i] : best;

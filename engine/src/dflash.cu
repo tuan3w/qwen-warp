@@ -36,9 +36,12 @@ struct smk_dflash {
   uint16_t *fcin, *th_raw, *th, *kvraw, *h, *xn, *xc, *kfin, *qb, *kb, *vb, *qn, *att, *oo, *act, *mlp, *hid, *kc, *vc;
   float *dyn, *hp, *sel_un;
   int *tmp_tok, *sel_id;
+  int* hist;                     // token history by position (prompt + emitted), for the device-side n-gram lookup
+  unsigned long long* lk;        // best n-gram match key (match length << 32 | end position), 0 = none
   int *pinned_ss, *pinned_ring;
   cudaGraphExec_t g_cycle = nullptr, g_verify = nullptr, g_stage = nullptr, g_ctx = nullptr, g_noise = nullptr, g_head = nullptr, g_start = nullptr;
   int kp_cfg = 1;                // smk_bf16_gemv_f32_cfg configuration of the conv projections (env SMK_DF_KP_CFG)
+  int lookup = 0;                // device n-gram lookup over the token history overrides the drafts on a long exact match (env SMK_DF_LOOKUP=1; off by default: no measured gain outside degenerate repetition)
   unsigned epoch = 0;
   size_t bytes = 0;
 };
@@ -96,17 +99,43 @@ __global__ void __launch_bounds__(256) k_conv_prep(const uint16_t* __restrict__ 
   if (c < 2 * NG) kfin[t * 2 * NG + c] = f2bf(dyn[t * KP_N + 2 * NG + c]);
 }
 
-// finish half + residual: h[t][c] = bf16(h[t][c] + conv(y)[t][c]) with the finish base kernel (base + 2 * H) and dynamic kernel kfin.  grid (20, 8).
-__global__ void __launch_bounds__(256) k_conv_fin(const uint16_t* __restrict__ y, const uint16_t* __restrict__ kfin, const uint16_t* __restrict__ base, uint16_t* __restrict__ h) {
-  const int t = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x, g = c >> 4;
-  const float v0 = bf2f(y[t * H + c]), v1 = t > 0 ? bf2f(y[(t - 1) * H + c]) : 0.f;
+__device__ __forceinline__ void unpack8(const uint4& u, float (&v)[8]) {
+  v[0] = bflo(u.x); v[1] = bfhi(u.x); v[2] = bflo(u.y); v[3] = bfhi(u.y); v[4] = bflo(u.z); v[5] = bfhi(u.z); v[6] = bflo(u.w); v[7] = bfhi(u.w);
+}
+
+// k_conv_fin + the RMSNorm that follows it: h[t] = bf16(h[t] + conv(y)[t]) (finish base kernel base + 2 * H), out[t] = rms(h[t]) * w.  One block per row, 8 channels per thread.  grid R8, NH threads.
+__global__ void __launch_bounds__(NH) k_conv_fin_rms(const uint16_t* __restrict__ y, const uint16_t* __restrict__ kfin, const uint16_t* __restrict__ base, uint16_t* __restrict__ h,
+                                                     const uint4* __restrict__ w, uint4* __restrict__ out) {
+  __shared__ float wsum[32];
+  const int t = blockIdx.x, c = threadIdx.x, g = c >> 1;  // channels 8c..8c+7 share the conv group (16 channels)
+  const uint4 yu = ((const uint4*)y)[(size_t)t * NH + c];
+  const uint4 pu = t > 0 ? ((const uint4*)y)[(size_t)(t - 1) * NH + c] : make_uint4(0u, 0u, 0u, 0u);
+  const uint4 k0u = ((const uint4*)(base + 2 * H))[c], k1u = ((const uint4*)(base + 3 * H))[c];
+  const uint4 hu = ((const uint4*)h)[(size_t)t * NH + c];
   const float d0 = bf2f(kfin[t * 2 * NG + g]), d1 = bf2f(kfin[t * 2 * NG + NG + g]);
-  const float k0 = bf2f(base[2 * H + c]), k1 = bf2f(base[3 * H + c]);
-  float o = bf16r(k0 * v0);
-  o = bf16r(fmaf(d0, v0, o));
-  o = bf16r(o + bf16r(k1 * v1));
-  o = bf16r(fmaf(d1, v1, o));
-  h[t * H + c] = f2bf(bf2f(h[t * H + c]) + o);
+  float yv[8], pv[8], k0[8], k1[8], hv[8];
+  unpack8(yu, yv); unpack8(pu, pv); unpack8(k0u, k0); unpack8(k1u, k1); unpack8(hu, hv);
+  float ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    float o = bf16r(k0[i] * yv[i]);
+    o = bf16r(fmaf(d0, yv[i], o));
+    o = bf16r(o + bf16r(k1[i] * pv[i]));
+    o = bf16r(fmaf(d1, pv[i], o));
+    hv[i] = bf16r(hv[i] + o);
+    ss = fmaf(hv[i], hv[i], ss);
+  }
+  ((uint4*)h)[(size_t)t * NH + c] = make_uint4(pack_bf16x2(hv[0], hv[1]), pack_bf16x2(hv[2], hv[3]), pack_bf16x2(hv[4], hv[5]), pack_bf16x2(hv[6], hv[7]));
+  ss = warp_sum(ss);
+  if ((c & 31) == 0) wsum[c >> 5] = ss;
+  __syncthreads();
+  float tot = 0.f;
+  for (int i = 0; i < NH / 32; i++) tot += wsum[i];
+  const float r = rsqrtf(tot / (float)H + 1e-6f);
+  float wv[8];
+  unpack8(w[c], wv);
+  out[(size_t)t * NH + c] = make_uint4(pack_bf16x2(wv[0] * bf16r(hv[0] * r), wv[1] * bf16r(hv[1] * r)), pack_bf16x2(wv[2] * bf16r(hv[2] * r), wv[3] * bf16r(hv[3] * r)),
+                                       pack_bf16x2(wv[4] * bf16r(hv[4] * r), wv[5] * bf16r(hv[5] * r)), pack_bf16x2(wv[6] * bf16r(hv[6] * r), wv[7] * bf16r(hv[7] * r)));
 }
 
 // per-head RMSNorm (plain weight, eps 1e-6) + RoPE (rotate-half, bf16-rounded cos / sin table) of one 128-element head by 128 threads (thread = dim d).
@@ -352,7 +381,7 @@ __global__ void __launch_bounds__(256) k_select(const int* __restrict__ cand, co
 }
 
 // greedy accept of a T = 8 verify (7 drafts) + bookkeeping + the drafter's next ctx rows (a rows at positions P ..) + the per-cycle log
-__global__ void k_df_accept(int* ds, int* ss, int* ring, int* dd, int* log) {
+__global__ void k_df_accept(int* ds, int* ss, int* ring, int* dd, int* log, int* hist) {
   int m = 0;
   while (m < SMK_DF_DRAFTS && ds[DS_TOK + m + 1] == ds[DS_OUT + m]) m++;
   const int P = ds[DS_POS], ci = ss[SS_NCYC];
@@ -360,13 +389,50 @@ __global__ void k_df_accept(int* ds, int* ss, int* ring, int* dd, int* log) {
   lg[0] = m + 1;
   for (int t = 0; t < 8; t++) { lg[1 + t] = ds[DS_TOK + t]; lg[9 + t] = ds[DS_OUT + t]; }
   lg[17] = P;
+  for (int j = 0; j <= m; j++) hist[P + 1 + j] = ds[DS_OUT + j];
   spec_finish(ds, ss, ring, m, 8);
   dd[DD_NNEW] = m + 1;
   dd[DD_BASE] = P;
 }
-__global__ void k_df_start(const int* ds, int* dd) {
+__global__ void k_df_start(const int* ds, int* dd, int* hist) {
   dd[DD_NNEW] = 1;
   dd[DD_BASE] = ds[DS_POS] - 1;
+  hist[ds[DS_POS]] = ds[DS_TOK];
+}
+// n-gram lookup over the token history: the longest earlier occurrence (ties: the most recent) of the suffix ending at the anchor (position A = ds[DS_POS]).
+// Scan: every thread takes end positions e < A with hist[e] == hist[A], extends the match backwards (<= LK_NMAX) and the block max goes to lk with one atomicMax.
+constexpr int LK_NMAX = 64, LK_MINLEN = 16, LK_MINPER = 6, LK_BLK = 256, LK_GRID = 64;
+__global__ void __launch_bounds__(LK_BLK) k_lookup_scan(const int* __restrict__ ds, const int* __restrict__ hist, unsigned long long* lk) {
+  __shared__ unsigned long long red[LK_BLK / 32];
+  const int A = ds[DS_POS], q = hist[A];
+  unsigned long long best = 0;
+  for (int e = blockIdx.x * LK_BLK + threadIdx.x; e < A; e += gridDim.x * LK_BLK) {
+    if (hist[e] != q) continue;
+    int l = 1;
+    while (l < LK_NMAX && e - l >= 0 && hist[e - l] == hist[A - l]) l++;
+    const unsigned long long key = ((unsigned long long)l << 32) | (unsigned)e;
+    if (key > best) best = key;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const unsigned long long v = __shfl_xor_sync(0xffffffffu, best, o);
+    if (v > best) best = v;
+  }
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = best;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < LK_BLK / 32; i++) if (red[i] > best) best = red[i];
+    if (best) atomicMax(lk, best);
+  }
+}
+// Override the selector's drafts d1.. with the tokens that followed the best match when it is long enough.  A match whose source ends before the
+// 7 drafts are covered (period p = A - e < 7: the last l + p tokens are p-periodic) continues periodically (token A + j = token A + j - p, as an overlapping LZ copy)
+// and needs only LK_MINPER tokens: a repeating run of < 8 tokens is repeated >= 2 more times.  1 thread.
+__global__ void k_lookup_apply(int* ds, const int* __restrict__ hist, unsigned long long* lk) {
+  const unsigned long long key = *lk;
+  *lk = 0;
+  const int l = (int)(key >> 32), e = (int)(key & 0xffffffffu), A = ds[DS_POS], p = A - e;
+  if (key == 0 || l < (p < SMK_DF_DRAFTS ? LK_MINPER : LK_MINLEN)) return;
+  for (int j = 1; j <= SMK_DF_DRAFTS; j++) ds[DS_TOK + j] = hist[e + 1 + (j - 1) % p];
 }
 __global__ void k_df_set(int* dd, int n, int base) {
   dd[DD_NNEW] = n;
@@ -410,7 +476,7 @@ static cudaError_t df_noise(smk_dflash* s, cudaStream_t st) {
   for (int l = 0; l < NL; l++) {
     const smk_df_layer_w& L = W.layers[l];
     const size_t lay = (size_t)l * NKV * s->ctxd * HD;
-    k_rms<<<R8, NH, 0, st>>>((const uint4*)s->h, (const uint4*)L.in_ln, (uint4*)s->xn);
+    if (l == 0) k_rms<<<R8, NH, 0, st>>>((const uint4*)s->h, (const uint4*)L.in_ln, (uint4*)s->xn);  // later layers: the previous layer's k_conv_fin_rms made it
     DCK(smk_bf16_gemv_f32_cfg(L.aconv_kp, s->xn, KP_N, H, R8, s->dyn, s->kp_cfg, st));
     k_conv_prep<<<dim3(H / 256, R8), 256, 0, st>>>(s->xn, s->dyn, (const uint16_t*)L.aconv_base, s->xc, s->kfin);
     smk_epi eq = {};
@@ -419,17 +485,15 @@ static cudaError_t df_noise(smk_dflash* s, cudaStream_t st) {
     k_qk_prep<<<dim3(R8, NQ + 2 * NKV), 128, 0, st>>>(s->qb, s->kb, s->vb, (const uint16_t*)L.q_norm, (const uint16_t*)L.k_norm, W.inv_freq, s->dd, s->qn, s->kc + lay, s->vc + lay, s->ctxd);
     k_attn<<<NQ, ATT_T, (R8 * HD + R8 * ATT_SMAX) * sizeof(float), st>>>(s->qn, s->kc + lay, s->vc + lay, s->dd, s->ctxd, s->att);
     DCK(gw4(L.o_w, L.o_s, s->att, H, QD, s->oo, st));
-    k_conv_fin<<<dim3(H / 256, R8), 256, 0, st>>>(s->oo, s->kfin, (const uint16_t*)L.aconv_base, s->h);
-    k_rms<<<R8, NH, 0, st>>>((const uint4*)s->h, (const uint4*)L.post_ln, (uint4*)s->xn);
+    k_conv_fin_rms<<<R8, NH, 0, st>>>(s->oo, s->kfin, (const uint16_t*)L.aconv_base, s->h, (const uint4*)L.post_ln, (uint4*)s->xn);
     DCK(smk_bf16_gemv_f32_cfg(L.mconv_kp, s->xn, KP_N, H, R8, s->dyn, s->kp_cfg, st));
     k_conv_prep<<<dim3(H / 256, R8), 256, 0, st>>>(s->xn, s->dyn, (const uint16_t*)L.mconv_base, s->xc, s->kfin);
     smk_epi eg = {};
     eg.kind = SMK_EPI_SILU; eg.out[0] = s->act;
     DCK(smk_w4r_gemv(L.gu_w, L.gu_s, s->xc, 2 * I, H, R8, &eg, st));
     DCK(gw4(L.dn_w, L.dn_s, s->act, H, I, s->mlp, st));
-    k_conv_fin<<<dim3(H / 256, R8), 256, 0, st>>>(s->mlp, s->kfin, (const uint16_t*)L.mconv_base, s->h);
+    k_conv_fin_rms<<<R8, NH, 0, st>>>(s->mlp, s->kfin, (const uint16_t*)L.mconv_base, s->h, l + 1 < NL ? (const uint4*)W.layers[l + 1].in_ln : (const uint4*)W.norm, l + 1 < NL ? (uint4*)s->xn : (uint4*)s->hid);
   }
-  k_rms<<<R8, NH, 0, st>>>((const uint4*)s->h, (const uint4*)W.norm, (uint4*)s->hid);
   return cudaGetLastError();
 }
 
@@ -440,9 +504,17 @@ static cudaError_t df_head(smk_dflash* s, cudaStream_t st) {
   const uint16_t* x = s->hid + H;
   const int T = SMK_DF_DRAFTS;
   DCK(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, x, VOC, H, T, e->logits, st));
+  DCK(cudaEventRecord(e->ev_fork, st));
+  DCK(cudaStreamWaitEvent(e->side, e->ev_fork, 0));
+  DCK(smk_bf16_gemv_f32(W.sel_hp, x, SEL_D, H, T, s->hp, e->side));  // selector projection: parallel branch, overlaps the select / rescore chain (latency bound, idle SMs)
+  DCK(cudaEventRecord(e->ev_join, e->side));
   DCK(smk_headq_select_rescore(e->logits, e->w.lm_head, x, VOC, H, T, W.rescore_r, s->tmp_tok, nullptr, e->ws_hq, st));
-  DCK(smk_bf16_gemv_f32(W.sel_hp, x, SEL_D, H, T, s->hp, st));
+  DCK(cudaStreamWaitEvent(st, e->ev_join, 0));
   k_select<<<1, 256, 0, st>>>(smk_headq_ws_cand(e->ws_hq), smk_headq_ws_exact(e->ws_hq), s->hp, (const uint16_t*)W.pred_cb, (const uint16_t*)W.succ_cb, e->ds, s->sel_id, s->sel_un, W.rescore_r, T);
+  if (s->lookup) {
+    k_lookup_scan<<<LK_GRID, LK_BLK, 0, st>>>(e->ds, s->hist, s->lk);
+    k_lookup_apply<<<1, 1, 0, st>>>(e->ds, s->hist, s->lk);
+  }
   return cudaGetLastError();
 }
 
@@ -455,7 +527,7 @@ static cudaError_t df_stage(smk_dflash* s, cudaStream_t st) {
 static cudaError_t df_verify_accept(smk_dflash* s, cudaStream_t st) {
   smk_engine* e = s->e;
   DCK(smk_run_step(e, R8, 1, 1, st, 0));
-  k_df_accept<<<1, 1, 0, st>>>(e->ds, s->ss, s->ring, s->dd, s->log);
+  k_df_accept<<<1, 1, 0, st>>>(e->ds, s->ss, s->ring, s->dd, s->log, s->hist);
   return cudaGetLastError();
 }
 
@@ -475,6 +547,7 @@ smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) {
   s->w = *w;
   s->ctxd = e->ctx_max + R8;
   if (const char* kc_env = getenv("SMK_DF_KP_CFG")) s->kp_cfg = atoi(kc_env);
+  if (const char* lk_env = getenv("SMK_DF_LOOKUP")) s->lookup = atoi(lk_env);
   const size_t b0 = e->bytes;
   auto B = [&](size_t n, bool z = false) { return dalloc(e, n, z); };
   s->dd = (int*)B(DD_N * sizeof(int), true);
@@ -505,6 +578,8 @@ smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) {
   s->sel_un = (float*)B((size_t)R8 * SEL_K * 4, true);
   s->sel_id = (int*)B((size_t)R8 * SEL_K * 4, true);
   s->tmp_tok = (int*)B(R8 * sizeof(int), true);
+  s->hist = (int*)B((size_t)(e->ctx_max + 2 * R8) * sizeof(int), true);
+  s->lk = (unsigned long long*)B(sizeof(unsigned long long), true);
   cudaMallocHost((void**)&s->pinned_ss, SS_N * sizeof(int));
   cudaMallocHost((void**)&s->pinned_ring, RING * sizeof(int));
   if (cudaFuncSetAttribute(k_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)((R8 * HD + R8 * ATT_SMAX) * sizeof(float))) != cudaSuccess) e->failed = true;
@@ -528,6 +603,8 @@ cudaError_t smk_dflash_reset(smk_dflash* s, cudaStream_t st) {
   cudaMemsetAsync(s->ss, 0, SS_N * sizeof(int), st);
   cudaMemsetAsync(s->ring, 0, RING * sizeof(int), st);
   cudaMemsetAsync(s->log, 0, (size_t)SMK_DF_LOG * SMK_DF_LOGW * sizeof(int), st);
+  cudaMemsetAsync(s->hist, 0, (size_t)(s->e->ctx_max + 2 * R8) * sizeof(int), st);
+  cudaMemsetAsync(s->lk, 0, sizeof(unsigned long long), st);
   cudaMemsetAsync(s->kc, 0, kvb, st);
   cudaMemsetAsync(s->vc, 0, kvb, st);
   return cudaGetLastError();
@@ -540,10 +617,15 @@ cudaError_t smk_dflash_prefill_chunk(smk_dflash* s, int T, int pos0, cudaStream_
   return df_ctx(s, st);
 }
 
+cudaError_t smk_dflash_set_hist(smk_dflash* s, const int* ids, int n, cudaStream_t st) {
+  if (n < 1 || n + 1 > s->e->ctx_max) return cudaErrorInvalidValue;
+  return cudaMemcpyAsync(s->hist, ids, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, st);
+}
+
 cudaError_t smk_dflash_start(smk_dflash* s, cudaStream_t st) {
   sync_epoch(s);
   return smk_graph_launch(s->e, &s->g_start, [&](cudaStream_t c) {
-    k_df_start<<<1, 1, 0, c>>>(s->e->ds, s->dd);
+    k_df_start<<<1, 1, 0, c>>>(s->e->ds, s->dd, s->hist);
     DCK(cudaGetLastError());
     return df_stage(s, c);
   }, st);

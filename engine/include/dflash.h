@@ -54,6 +54,8 @@ cudaError_t smk_dflash_reset(smk_dflash* s, cudaStream_t st);
 // Prefill: after smk_engine_step(T <= 8 rows, head 0) of prompt rows at positions pos0 .. pos0 + T - 1: append their taps as drafter context.
 cudaError_t smk_dflash_prefill_chunk(smk_dflash* s, int T, int pos0, cudaStream_t st);
 // After the final prompt row ran as smk_engine_step(1, head = 1): append its tap and draft d1..d7 (-> ds[DS_TOK + 1 ..]).
+// Prompt tokens by position for the device n-gram lookup (pageable host memory is staged by the driver; call after reset, before start).
+cudaError_t smk_dflash_set_hist(smk_dflash* s, const int* ids, int n, cudaStream_t st);
 cudaError_t smk_dflash_start(smk_dflash* s, cudaStream_t st);
 // n full cycles (graph replays), then synchronise and copy the state ints (SMK_DF_SS_N) and the output ring: ss[12] = tokens emitted, ss[13] = cycles, ss[16 + m] = cycles with m accepted drafts.
 #define SMK_DF_SS_N 64

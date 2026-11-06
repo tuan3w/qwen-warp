@@ -39,6 +39,7 @@ constexpr int S_MAX = SWIFTMK_ATTN_MAX_SPLITS;
 #ifndef ATTN_KS3
 #define ATTN_KS3 2
 #endif
+
 // K11, T = 5..8 (NT = ceil(6T/8) = 4 / 5 / 6 / 6 n-tiles): key-parallel warps per n-tile
 #ifndef ATTN_KS5
 #define ATTN_KS5 2
@@ -360,7 +361,7 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     typename std::conditional<I4, uint2, uint4>::type v[4][NVC];  // V key slots {2j, 2j+1, 2j+8, 2j+9}, chunk r
     uint32_t km[2], vm[2];                                        // int4 only: meta words (4 x 8-bit group scale code) of keys r and r+8, K and V
   };
-  auto issue = [&](Tile& t, int it) {
+  auto issueK = [&](Tile& t, int it) {
     const int base = kstart + it * 16;
     const int klast = kend - 1;
     const char* k0 = kbase + (size_t)min(base + r, klast) * ROWB + j * ECHB;
@@ -375,6 +376,16 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
         t.k[1][b] = ld_kv<NT>(k1 + b * 4 * ECHB);
       }
     }
+  };
+  auto issueKc = [&](Tile& t, int it, int b) {  // bf16 only: K chunk b of tile it
+    const int base = kstart + it * 16;
+    const int klast = kend - 1;
+    t.k[0][b] = ld_kv<NT>(kbase + (size_t)min(base + r, klast) * ROWB + j * ECHB + b * 4 * ECHB);
+    t.k[1][b] = ld_kv<NT>(kbase + (size_t)min(base + r + 8, klast) * ROWB + j * ECHB + b * 4 * ECHB);
+  };
+  auto issueV = [&](Tile& t, int it) {
+    const int base = kstart + it * 16;
+    const int klast = kend - 1;
     if constexpr (I4) {
       t.km[0] = __ldg(kmeta + min(base + r, klast)); t.km[1] = __ldg(kmeta + min(base + r + 8, klast));
       t.vm[0] = __ldg(vmeta + min(base + r, klast)); t.vm[1] = __ldg(vmeta + min(base + r + 8, klast));
@@ -387,6 +398,19 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
         if constexpr (I4) t.v[sl][c] = ld_kv8<NT>(vp + c * 8 * ECHB);
         else t.v[sl][c] = ld_kv<NT>(vp + c * 8 * ECHB);
       }
+    }
+  };
+  auto issue = [&](Tile& t, int it) {
+    issueK(t, it);
+    issueV(t, it);
+  };
+  auto issueVc = [&](Tile& t, int it, int c) {  // bf16 only: V chunk c of tile it
+    const int base = kstart + it * 16;
+    const int klast = kend - 1;
+#pragma unroll
+    for (int sl = 0; sl < 4; sl++) {
+      const int kk_ = base + 2 * j + (sl & 1) + (sl >> 1) * 8;
+      t.v[sl][c] = ld_kv<NT>(vbase + (size_t)min(kk_, klast) * ROWB + r * ECHB + c * 8 * ECHB);
     }
   };
 
@@ -427,7 +451,7 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
   for (int i = 0; i < NINST; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
   float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
 
-  auto compute = [&](const Tile& t, int it) {
+  auto compute = [&](const Tile& t, int it, auto&& kdone, auto&& vdone) {
     const int base = kstart + it * 16;
     float ksc[2][4], vsc[2][4];  // int4: per-key group scales (G = 0..3) of keys r (index 0) and r+8 (index 1), K and V
     if constexpr (I4) {
@@ -467,6 +491,7 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
       const uint2 q = qs[sidx * 32];
       if constexpr (I4) mma_t<FP8, I4>(sg[2 * (b >> 1) + (u >> 1)], a0, a1, a2, a3, q.x, q.y);
       else mma_t<FP8, I4>((sidx & 1) ? sb : sa, a0, a1, a2, a3, q.x, q.y);
+      if (u == E / 4 - 1) kdone(b);  // K chunk b is dead after its QK mma: bf16 re-issues the next tile's chunk b here (it flies during the rest of the tile)
     }
     // ---- scores, mask, online softmax (columns e = 0/1 of this lane; rows = keys r, r+8)
     float sc[4];
@@ -602,6 +627,7 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
         if constexpr (I4) mma_t<FP8, I4>(acc[c * (E / 2) + g], a0, a1, a2, a3, pbg[2 * c + (g >> 2)][0], pbg[2 * c + (g >> 2)][1]);
         else mma_t<FP8, I4>(acc[c * (E / 2) + g], a0, a1, a2, a3, pb0, pb1);
       }
+      vdone(c);  // V chunk c registers are dead: bf16 issues the next tile's chunk c here
     }
 
     if constexpr (I4) {
@@ -634,17 +660,19 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
     while (it < ntiles) {
       const int it1 = it + KS;
       if (it1 < ntiles) issue(tb, it1);
-      compute(ta, it);
+      compute(ta, it, [](int) {}, [](int) {});
       if (it1 >= ntiles) break;
       const int it2 = it1 + KS;
       if (it2 < ntiles) issue(ta, it2);
-      compute(tb, it1);
+      compute(tb, it1, [](int) {}, [](int) {});
       it = it2;
     }
   } else {
+    // bf16 has no room for a second register tile, so the next tile is requested chunk by chunk as the current tile's K / V registers die
+    // (K chunk b after its QK mma, V chunk c after its PV mma): the loads fly during the rest of this tile's compute.
     for (int it = ks; it < ntiles; it += KS) {
-      compute(ta, it);
-      if (it + KS < ntiles) issue(ta, it + KS);
+      const bool more = it + KS < ntiles;
+      compute(ta, it, [&](int b) { if (more) issueKc(ta, it + KS, b); }, [&](int c) { if (more) issueVc(ta, it + KS, c); });
     }
   }
 

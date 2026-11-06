@@ -21,7 +21,7 @@ from weights import Checkpoint  # noqa: E402
 
 
 class Engine:
-    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None):
+    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None, lm_head_host=None):
         assert layers == pack.NL
         self.lib = smk.load(lib)
         smk.setup_engine_api(self.lib)
@@ -47,10 +47,23 @@ class Engine:
             assert G.hq is not None, "host tables need the quantised head (Engine(head='int4'|'int8'))"
             emb = torch.empty(G.embed.shape, dtype=G.embed.dtype, pin_memory=True)
             emb.copy_(G.embed)
-            lmh = torch.empty(G.lm_head.shape, dtype=G.lm_head.dtype, pin_memory=True)
-            lmh.copy_(G.lm_head)
-            G.embed, G.lm_head = emb, lmh  # the C engine holds raw pointers into these: they live as long as G
-            self.tables_on_host = True
+            lmh = None
+            # The embedding rows are gathered a few per step (cheap over PCIe); the lm_head rows are re-read for the exact rescoring of every head step (R candidates x T rows, ~0.2 ms
+            # per cycle over PCIe).  When the device has room for the rest of the engine (KV cache for ctx_max, ring, drafters: ~96 KiB per context token + 5.25 GiB) the lm_head
+            # table stays resident when lm_head_host=False is passed and it fits; the default keeps it in pinned host memory (the server's memory model, vram_need_mib, assumes that).
+            torch.cuda.empty_cache()
+            free0 = torch.cuda.mem_get_info()[0] + G.embed.numel() * G.embed.element_size()
+            need = int(ctx_max * (0.5 if kv_fp8 else 1) * 96 * 1024) + int(5.35 * 2**30)  # measured: ctx_max 31488, bf16 KV, DflashEngine -> 8.11 GiB allocated after this point
+            if lm_head_host is None or lm_head_host or free0 - need < 0:  # default (None) and True: host table; DflashEngine passes False (device table if it fits; True again on its retry after an out-of-memory)
+                lmh = torch.empty(G.lm_head.shape, dtype=G.lm_head.dtype, pin_memory=True)
+                lmh.copy_(G.lm_head)
+            if verbose:
+                print(f"[engine] lm_head table on {'host' if lmh is not None else 'device'} (free {free0 / 2**30:.2f} GiB, need {need / 2**30:.2f} GiB)", flush=True)
+            G.embed = emb  # the C engine holds raw pointers into these: they live as long as G
+            if lmh is not None:
+                G.lm_head = lmh
+                self.tables_on_host = True
+            self.lm_head_on_host = lmh is not None
         torch.cuda.empty_cache()  # weight packing leaves ~1.5 GiB of idle blocks in torch's pool (and the GPU tables just freed): hand them to the driver before the engine's cudaMallocs
         self.load_s = time.time() - t0
         m = smk.ModelW()
