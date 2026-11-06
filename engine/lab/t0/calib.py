@@ -19,7 +19,7 @@ BUDGETS = (0.0005, 0.0015, 0.005)
 
 def load_b1():
     E = collections.defaultdict(list)  # (doc, kind, mode, rule, b, f) -> [(bytes, err)] over layers
-    with open(R / "b1/b1_raw.csv") as fh:
+    with open(R.parent / "runs/b1_raw.csv") as fh:
         for r in csv.DictReader(fh):
             if r["doc"] in KLDOCS:
                 E[(r["kind"], r["mode"], r["rule"], int(r["b"]), float(r["f"]))].append((float(r["bytes"]), float(r["err"])))

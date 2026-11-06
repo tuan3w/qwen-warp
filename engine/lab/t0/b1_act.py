@@ -16,6 +16,7 @@ import torch
 import sp
 
 RES = Path("/media/fatman/data/workspace/research/experiments/2026-11-06-sparsity-probes/results/b1")
+RUNS = Path("/media/fatman/data/workspace/research/experiments/2026-11-06-sparsity-probes/runs")  # raw rows (5 MB, gitignored)
 FS = [0.98, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
 THR = (0.01, 0.02, 0.05, 0.10)
 DOCS = ["tr32_code_cuda", "tr32_notes", "tr32_vendor_py", "tr32_vendor_cu", "tr32_gitlog", "tr32_papers"]
@@ -64,7 +65,8 @@ def run(docs, layers, kinds, quick, dev):
                             for mode in ("union", "max"):
                                 ev(sp.union_mask(x, rule, f, b, Wd.cn, 8, mode), b, "U8_" + mode, rule, f)
         print(f"layer {li} done  {time.time() - t0:.1f}s  rows={len(rows)}", flush=True)
-    with open(RES / ("b1_raw_quick.csv" if quick else "b1_raw.csv"), "w", newline="") as fh:
+    RUNS.mkdir(exist_ok=True)
+    with open(RUNS / ("b1_raw_quick.csv" if quick else "b1_raw.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["doc", "layer", "kind", "mode", "rule", "b", "f", "bytes", "err"])
         w.writerows(rows)
@@ -75,7 +77,7 @@ def summary():
     import collections
 
     R = collections.defaultdict(list)
-    with open(RES / "b1_raw.csv") as fh:
+    with open(RUNS / "b1_raw.csv") as fh:
         for r in csv.DictReader(fh):
             R[(r["doc"], int(r["layer"]), r["kind"], r["mode"], r["rule"], int(r["b"]))].append((float(r["bytes"]), float(r["err"])))
     # byte fraction at err <= thr per (layer, kind, mode, rule, b), mean over docs

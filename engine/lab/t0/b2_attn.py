@@ -231,8 +231,8 @@ def run_layer(doc, li, T, blocks, budgets, rows, scorers, cur_orc, xl, gen, bg_s
                         M = select(sc, bv, pool[:-2] if (name == "oracle" and pool.endswith("_p")) else pool, nsel)
                         out.setdefault((li, name + "+bg", pool, b, bud), []).append(evaluate_bg(Ly, g, lg, P, Od, M, b, vg, kb, vb))
             # reuse of earlier selections: oracle scores of the row j-lag (same layer) / previous layer
-            osc = cur_orc[(b, g)]
-            for lag in (1, 8):
+            osc = cur_orc.get((b, g))
+            for lag in (1, 8) if osc is not None else ():
                 sc = torch.cat([osc[:lag].clone(), osc[:-lag]])  # row j uses row (j-lag)'s oracle scores (first rows: own)
                 for bud in budgets:
                     nsel = max(1, (bud - SINK - RING) // b)

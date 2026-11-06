@@ -17,7 +17,7 @@ KINDS = ("qkv", "o", "gu", "down")
 
 def b1():
     E = collections.defaultdict(list)
-    for r in csv.DictReader(open(R / "b1/b1_raw.csv")):
+    for r in csv.DictReader(open(R.parent / "runs/b1_raw.csv")):
         if r["mode"] == "T1" and r["rule"] in ("abs_topk",):
             E[(r["kind"], int(r["b"]), float(r["f"]))].append((float(r["bytes"]), float(r["err"])))
         if r["mode"] == "U8_union" and r["rule"] == "abs_topk" and int(r["b"]) == 1:
