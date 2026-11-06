@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Image input ([Usage](docs/USAGE.md#images), [Architecture](docs/ARCHITECTURE.md#image-input)): the checkpoint's bf16 vision tower runs on the GPU (`engine/vision.py`: patch embed as one GEMM, bilinear position table, 2-D rotary, per-image FlashAttention-2, fp32 residual stream, 2x2 merger; encode 16 / 65 / 220 ms at 448x448 / 1024x768 / 1920x1080), placeholder rows take the ViT rows in the fast prefill (and as the MTP layer's input embedding), the prefill ropes every row at its 3-D MRoPE position (== vLLM's `get_mrope_input_positions`), decode ropes at KV position + a per-sequence offset (`ds[DS_RDELTA]`, read by the target's and the MTP layer's attention prep). Images go through vLLM's chat API (`image_url`, base64 or URL); video is refused with a 400.
+- `--vision auto|device|host|off` (default auto: the ViT weights on the GPU when 256 MiB stay free at `--max-model-len`, else streamed per image from pinned host memory (153 MiB on the GPU), else image input off: auto never changes the tail decision or the length a text request gets), `--max-image-pixels` (default 2,097,152 = 2,048 placeholder tokens), at most 4 images per prompt by default (`--limit-mm-per-prompt`).
+- Prefix cache keyed by image content: placeholder rows carry the image's mm hash (`vision.cache_key`), so two prompts that differ only in the image share nothing past it, and a follow-up turn about the same image resumes past it (`cached_tokens` > 0). The ViT runs only for images after the resume point.
+- Tests by tier (`tests/run_tier.sh 0|1|2`, "Tier:" lines in the docstrings): `test_vision_logic.py` (tier 0: cache key, request parsing / rejections, memory decisions), `test_vision.py` (tier 0 MRoPE vs vLLM; tier 1 ViT vs cached transformers references), `test_vision_engine.py` (tier 1: text ids == 0.7.0 from `tests/data/text_ids_v070.json`, image determinism cold vs resumed), `test_vision_server.py` (tier 2: one server, colours / shapes / text at several sizes, no false cache hit, multi-turn, video 400). `tests/_engine.py` builds tier-1 engines (resident weights with `SMK_RESIDENT=1`).
+
+### Changed
+
+- Text requests are bit-identical to 0.7.0 (greedy, seeded sampling, resumed turns; engine and server level) and decode at the same speed (README prompts, median of 3: 184.3 / 118.2 / 184.1 against 184.9 / 118.4 / 184.5 tok/s). `swiftmk_attn_step` and `smkp_attn_prep` take the rope offset / per-row MRoPE table (NULL = 0.7.0's rope); `DS_N` is 21; `smkp_ds_n` lets the Python side refuse a stale library.
+
 ## 0.7.0 - 2026-11-06
 
 ### Added

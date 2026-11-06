@@ -4,7 +4,7 @@
 
 I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
 At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than the MTP engine (about 1.5x on code); the experimental in-engine DFlash2 drafter is level with it in a same-session comparison, and the server can use it for greedy requests with `--drafter dflash2` (through the server: code 277 against 184 tok/s, math 254 against 184, prose 113 against 118, and 31% slower on copy-heavy agent turns; [Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)); neither was measured at long context.
-I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
+I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text and images (no video).
 
 ## Numbers
 
@@ -109,6 +109,7 @@ The server measures the free GPU memory at start and refuses a context that does
 | Sampling | `temperature`, `top_p`, `top_k` (up to 64), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` ([table](docs/USAGE.md#sampling-parameters)) |
 | Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
 | Tool calls | They work, with one caveat: the previous 4-bit format gave a well-formed call in 39% to 46% of requests for a minimal one-parameter schema in the usual key order (bf16: 91%); with the rotated 4-bit cache of this version it is 92% (n = 200, through the server). The default `--sort-tool-schema` stays on ([details](docs/USAGE.md#tool-calls)) |
+| Images | `image_url` parts in chat messages (base64 or URL), up to 4 per prompt and 2 megapixels each by default; the checkpoint's vision tower runs on the GPU (time to first token 0.22 s at 448x448, 1.5 s at 1920x1080), text requests are unchanged; video returns 400 ([details](docs/USAGE.md#images)) |
 | Concurrency | One request decodes at a time; the rest queue |
 
 ## Documentation

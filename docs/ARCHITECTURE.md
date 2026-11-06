@@ -115,6 +115,19 @@ as before (`--drafter mtp` is byte-identical to the previous release). The Runne
 conversation's rows, and nothing carries the window of a spilled lineage). A request whose window is not covered after the prefill is decoded by the MTP path; the output is never wrong either way (the greedy accept is an argmax equality of the T = 8
 verify, the drafter only changes how many tokens a cycle commits). MTP-layer KV is still computed by the fast prefill for every request, so a later sampled turn on the same lineage reads it.
 
+## Image input
+
+| Piece | How |
+|---|---|
+| ViT (`engine/vision.py`) | the checkpoint's bf16 Qwen3.5 vision tower (27 blocks, hidden 1152, 16 heads of 72, 2x2 merger to 5120), batched over all patches of an image: the Conv3d patch embed as one GEMM, the 48x48 position table resampled bilinearly, axial 2-D rotary, per-image non-causal FlashAttention-2 (vLLM's binding), the residual stream and LayerNorms in fp32 (transformers keeps them in bf16; against an fp32 forward its bf16 model has tokens at a cosine of 0.96, ours 0.98). Weights on the GPU, or (`weights="host"`) the blocks' GEMM weights in pinned memory copied block by block on a side stream into two buffers, bit-identical. One call per image |
+| Placeholder rows | `FastPrefill.mm` (`MMRows`): after the token embedding, the rows of an image's placeholder tokens are overwritten with the ViT rows; the MTP pairs whose next token is a placeholder take the ViT row as their input embedding (vLLM's MTP proposer feeds the merged embeddings) |
+| MRoPE | `vision.mrope_positions` == vLLM's `_get_mrope_input_positions`. The prefill writer `k_attn_prep` takes an optional `[T][3]` table: rotary frequency l uses axis T, H or W (`mrope_axis`: section [11, 11, 10], interleaved); the cache row stays the KV position. After the last image every axis is KV position + delta, so decode (target attention prep and the MTP layer's) ropes at `*pos + ds[DS_RDELTA]`; the Runner sets `DS_RDELTA` per request (0 for text, so text is bit-identical to 0.7.0) |
+| Prefix cache | lineages and the host store match on `vision.cache_key`: placeholder rows carry a hash of the image's mm hash (negative ids), so a different image diverges at its first row and the same image resumes past it; the ViT runs only for images with rows after the resume point |
+| Server | `serve.py` keeps vLLM's multimodal frontend on (processor, chat template, `--limit-mm-per-prompt`, video limit 0); `SwiftCoreClient` fills the frontend's processor-cache holes with vLLM's receiver cache, turns each image feature into `ImageInput(offset, grid, mm hash, pixels)` and refuses video, oversize images and mismatched placeholders with a 400 |
+| DFlash2 | image requests take the MTP route: the block drafter's rope has no MRoPE offset and it was trained on text |
+
+Memory (measured, `smk_core_client.VRAM_VISION_*`): +888 MiB with the weights on the GPU, +154 MiB streamed, at 8,100 patches; the ViT's activation peak (333 MiB at 8,160 patches) mostly reuses the fast prefill's transient pool.
+
 ## The 4-bit KV cache
 
 Each token's 256-element head vector (per KV head, separately for K and V) is rotated by the orthonormal Walsh-Hadamard transform, then quantised to 4 bits with a symmetric companded 16-level grid:

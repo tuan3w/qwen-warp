@@ -300,6 +300,29 @@ Ids: both routes are exact for their own verify and deterministic, but may resol
 
 **Not done:** a drafter ring buffer (long profile), sampling, an adaptive route for copy-heavy answers, carrying the window to a host-cache resume at an earlier snapshot ([Ideas](IDEAS.md#a-block-drafter-dflash2-style)).
 
+## Images
+
+Send images the OpenAI way: a user message whose `content` is a list with `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` (or an http URL) and a text part.
+
+```bash
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "swift", "max_tokens": 64,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 photo.png)"'"}},
+                                            {"type": "text", "text": "Describe this image."}]}]}'
+```
+
+| Flag | Effect |
+|---|---|
+| `--vision auto` (default) | the ViT's 879 MiB of weights on the GPU if 256 MiB stay free at `--max-model-len`, else its block weights stay in pinned host memory and are streamed per image (153 MiB on the GPU), else image input is off (the start log says which). It never changes what a text request gets: the prompt-lookup tail and the length are decided as with `--vision off` |
+| `--vision device` / `host` | demand a placement (the start is refused when it does not fit; `device` may turn the auto tail off to make room) |
+| `--vision off` | text only: the memory and behaviour of 0.7.0, an image request gets a 400 |
+| `--max-image-pixels N` | images are scaled down (aspect kept) to at most N pixels; default 2,097,152: 1920x1080 keeps its size, 2,040 placeholder tokens. One token per 32x32 pixels |
+| `--limit-mm-per-prompt '{"image": 8}'` | images per prompt (default 4); video is always refused with a 400 |
+
+Encode time of the ViT (median of 10): 16 / 65 / 220 ms at 448x448 / 1024x768 / 1920x1080 with the weights on the GPU; host-streamed weights add 51 ms at 448x448, 9 ms at 1024x768 and nothing at 1920x1080. Time to first token of an image request through the server: 218 ms / 617 ms / 1.47 s at the same sizes ([Performance](PERFORMANCE.md#6-image-input)).
+A follow-up turn about the same image resumes past it (`cached_tokens` counts the image rows); the prefix cache keys images by content, so the same text with another image never reuses the first image's state.
+Image requests are decoded by the MTP path even with `--drafter dflash2` (the block drafter's rope and its training are text-only).
+
 ## Using it from a coding agent
 
 Any tool that speaks the OpenAI API works: set the base URL to `http://<host>:8000/v1`, the model to `swift`, any API key, and the context window to what you started the server with

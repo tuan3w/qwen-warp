@@ -12,7 +12,7 @@ qwen-warp is a single-model, single-GPU project: Swift-1.5-Qwen3.8-27B INT4 on o
 
 | In scope | Out of scope for now |
 |---|---|
-| Speed, memory and quality on one RTX 3090 with this model | other GPUs, other models, batch size above 1, vision input |
+| Speed, memory and quality on one RTX 3090 with this model (text and image input) | other GPUs, other models, batch size above 1, video input |
 | Docs, tests, honest measurements, bug fixes | a general-purpose serving stack |
 
 Where to read first: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has a file map and a "where to start reading" table. What changed between versions: [CHANGELOG](CHANGELOG.md).
