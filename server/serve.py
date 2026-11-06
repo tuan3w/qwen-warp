@@ -7,8 +7,9 @@
 
 Every stock `vllm serve` frontend flag works (--served-model-name, --host/--port, --api-key, --chat-template, --reasoning-parser, --tool-call-parser, ...).
 Engine flags that map onto the engine (read from vLLM's config in smk_core_client.engine_cfg): --max-model-len, --kv-cache-dtype {auto,bfloat16 -> bf16 | fp8 |
-int4_per_token_head}, --num-speculative-tokens (k, 0..3; sugar for --speculative-config '{"method":"mtp","num_speculative_tokens":k}'), and the engine's own
---profile / --host-tables / --prompt-lookup / --stream-cycles / --snapshots.  Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto tool choice, language-model only.
+int4_per_token_head}, --num-speculative-tokens (k, 0..3; sugar for --speculative-config '{"method":"mtp","num_speculative_tokens":k}'), --max-num-seqs (1 = one request at a
+time, the default; 2..8 = that many requests decoded together, server/smk_batch.py) and the engine's own --profile / --host-tables / --prompt-lookup / --stream-cycles / --snapshots.
+Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto tool choice, language-model only.
 """
 import os
 import sys
@@ -55,8 +56,16 @@ def parse_args(argv=None):
         if args.kv_cache_dtype in (None, "auto"):
             args.kv_cache_dtype = "int4_per_token_head"
         args.host_tables = True
-        if args.max_model_len is None:
+        if args.max_model_len is None and args.max_num_seqs == 1:
             args.max_model_len = LONG_MAX_MODEL_LEN
+    if args.max_model_len is None and args.max_num_seqs > 1:  # S sequence slots, each with its own KV cache: the longest length per sequence the free GPU memory holds (capped at the profile's)
+        import torch
+
+        import smk_core_client as cc
+
+        cap = LONG_MAX_MODEL_LEN if args.profile == "long" else DEFAULT_MAX_MODEL_LEN
+        fit = cc.batch_max_len(torch.cuda.mem_get_info()[0] >> 20, cc.KV_DTYPES.get(args.kv_cache_dtype or "auto", 0), bool(args.host_tables), args.max_num_seqs, cc.AUTO_TAIL_HEADROOM_MIB)
+        args.max_model_len = max(1024, min(cap, fit))
     if args.max_model_len is None:
         args.max_model_len = DEFAULT_MAX_MODEL_LEN if args.prompt_lookup == "0" else DEFAULT_MAX_MODEL_LEN_PLD
     if args.num_speculative_tokens is None and args.speculative_config is None:

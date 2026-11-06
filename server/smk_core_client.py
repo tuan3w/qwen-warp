@@ -1,10 +1,12 @@
 """swift-mk as a vLLM EngineCore: an in-process `EngineCoreClient` that vLLM's stock `AsyncLLM` (= the `EngineClient` behind the OpenAI frontend) drives.
 
 AsyncLLM owns everything user-visible (input processing / chat template / tokenisation, detokenisation, stop strings, streaming deltas, usage, reasoning + tool parsers
-in the serving layer); it only needs an engine core that accepts `EngineCoreRequest`s and returns `EngineCoreOutputs`.  This file is that core: a FIFO queue in front of
-one worker thread that owns the swift-mk engine (smk_runner.Runner), vLLM's `EngineCoreClient.make_async_mp_client` is replaced by `install()`.
+in the serving layer); it only needs an engine core that accepts `EngineCoreRequest`s and returns `EngineCoreOutputs`.  This file is that core: a queue in front of
+one worker thread that owns the swift-mk engine: with --max-num-seqs 1 a FIFO over smk_runner.Runner (one request at a time), with --max-num-seqs S > 1 the continuous-batching
+scheduler of smk_batch.BatchRunner (S requests decoded together).  vLLM's `EngineCoreClient.make_async_mp_client` is replaced by `install()`.
 """
 import asyncio
+import collections
 import math
 import queue
 import threading
@@ -117,6 +119,37 @@ def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB, df=Fals
     return min(MODEL_MAX_LEN, max(0, int(n) // 1024 * 1024))
 
 
+# --max-num-seqs S > 1 (engine/batch.py, server/smk_batch.py): S sequence slots on one set of weights.  Every slot has ONE in-place DeltaNet state (151 MiB, instead of the 5- or 9-slot ring of the
+# single-sequence engine), a 9-slot conv ring, the lazy delta buffer, processor and spec state and its captured graphs (VRAM_BATCH_SLOT_MIB), and its own KV cache + MTP-layer KV at --max-model-len
+# (VRAM_BATCH_KIB_PER_SLOT_TOKEN); the fast-prefill K/V scratch (4 KiB per token) and everything else (weights, tables, activations, prefill scratch, the batched cycle graphs) is shared
+# (VRAM_BATCH_FIXED_MIB[host tables]).  The prompt-lookup tail costs no ring here (the conv ring has 9 slots anyway).  MEASURED with experiments/2026-11-06-qwen-warp-concurrent-vision memfit
+# (least free GPU memory after the warm-up, a request at --max-model-len on one slot and short ones on the others, RTX 3090): S x len x KV = 2 x 8k x bf16 16,926 MiB with host tables / 21,762
+# without, 4 x 8k bf16 18,750, 4 x 16k bf16 20,958, 4 x 32k int4 19,422 (host tables): the model below is within 8 MiB of every point (fp8: the same layout at 32 KiB, not measured).
+VRAM_BATCH_FIXED_MIB = {False: 19920, True: 15080}
+VRAM_BATCH_SLOT_MIB = 368
+VRAM_BATCH_KIB_PER_SLOT_TOKEN = (68.0, 36.0, 20.5)
+MAX_NUM_SEQS = 8  # rows of a weight pass (SMK_TMAX): at most one row per sequence
+
+
+def vram_need_batch_mib(ctx, dt, ht, S):
+    return VRAM_BATCH_FIXED_MIB[ht] + S * (VRAM_BATCH_SLOT_MIB + VRAM_KV_FIXED_MIB[dt]) + ctx * (S * VRAM_BATCH_KIB_PER_SLOT_TOKEN[dt] + 4.0) / 1024
+
+
+def batch_max_len(free_mib, dt, ht, S, headroom=MIN_HEADROOM_MIB):
+    """Largest --max-model-len (a multiple of 1024) per sequence for S slots that leaves `headroom` MiB of `free_mib`; 0 if none."""
+    n = (free_mib - headroom - vram_need_batch_mib(0, dt, ht, S)) * 1024 / (S * VRAM_BATCH_KIB_PER_SLOT_TOKEN[dt] + 4.0)
+    return min(MODEL_MAX_LEN, max(0, int(n) // 1024 * 1024))
+
+
+def batch_limits_text(free_mib, dt, ht, S, L):
+    """The largest --max-num-seqs at this --max-model-len and the largest --max-model-len at this --max-num-seqs (and at 2, 4, 8) for the memory free now."""
+    room = free_mib - MIN_HEADROOM_MIB
+    s_fit = max((s for s in range(1, MAX_NUM_SEQS + 1) if vram_need_batch_mib(L, dt, ht, s) <= room), default=0)
+    rows = [f"  at --max-model-len {L:,}: --max-num-seqs {s_fit}" + (" (1 = the single-sequence engine, which has its own memory model)" if s_fit <= 1 else "")]
+    rows += [f"  at --max-num-seqs {s}: --max-model-len {batch_max_len(free_mib, dt, ht, s):,}" for s in sorted({S, 2, 4, 8}) if s > 1]
+    return "\n".join(rows)
+
+
 def vram_limits_text(free_mib, k, df=False, cb_host=False):
     """One line per cache layout: the largest --max-model-len for the memory that is free now (with the tail, without it; --drafter dflash2: with the block drafter)."""
     rows = []
@@ -130,7 +163,7 @@ def vram_limits_text(free_mib, k, df=False, cb_host=False):
 
 
 def engine_cfg(vllm_config, free_mib):
-    """swift-mk engine settings from the stock vLLM config: --max-model-len, --kv-cache-dtype, --speculative-config (num_speculative_tokens).  free_mib: GPU memory free at start."""
+    """swift-mk engine settings from the stock vLLM config: --max-model-len, --kv-cache-dtype, --speculative-config (num_speculative_tokens), --max-num-seqs.  free_mib: GPU memory free at start."""
     mc, sc = vllm_config.model_config, vllm_config.speculative_config
     k = sc.num_speculative_tokens if sc is not None else 0
     if not 0 <= k <= 3:
@@ -143,6 +176,20 @@ def engine_cfg(vllm_config, free_mib):
     dt, ht = KV_DTYPES[kv], bool(OPTIONS["host_tables"])
     df, cbh = OPTIONS["drafter"] == "dflash2", OPTIONS["dflash_codebooks"] == "host"
     L = mc.max_model_len
+    S = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1) or 1)
+    if S > 1:
+        if df:
+            raise ValueError("swift-mk: --drafter dflash2 serves one sequence at a time: use --max-num-seqs 1 with it (or --drafter mtp, the batched decoder's drafter)")
+        if S > MAX_NUM_SEQS:
+            raise ValueError(f"swift-mk: --max-num-seqs {S}: at most {MAX_NUM_SEQS} sequences (one row each in a weight pass of {MAX_NUM_SEQS} rows)")
+        pld = k == 3 and pl is not False
+        need = vram_need_batch_mib(L, dt, ht, S)
+        if need > free_mib - MIN_HEADROOM_MIB:
+            raise RuntimeError(f"swift-mk: --max-num-seqs {S} with --max-model-len {L:,} per sequence and {KV_NAMES[dt]} KV{' + host tables' if ht else ''} needs about {need:.0f} MiB of GPU memory "
+                               f"but only {free_mib} MiB are free on the GPU (each sequence slot takes {VRAM_BATCH_SLOT_MIB} MiB + {VRAM_BATCH_KIB_PER_SLOT_TOKEN[dt]:.1f} KiB per token of --max-model-len).  "
+                               f"What fits the free memory with {KV_NAMES[dt]} KV{' + host tables' if ht else ''} (--profile long = int4 KV + host tables needs the least):\n{batch_limits_text(free_mib, dt, ht, S, L)}")
+        return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"],
+                               system_checkpoint=OPTIONS["system_checkpoint"], pld=pld, drafter="mtp", dflash_path=None, dflash_codebooks_host=cbh, max_num_seqs=S)
     if df:  # the 9-slot ring is paid by the drafter's verify anyway: the MTP route's tail is free
         pld = k == 3 and pl is not False
         need = vram_need_mib(L, dt, ht, True, True, cbh)
@@ -161,7 +208,7 @@ def engine_cfg(vllm_config, free_mib):
                                f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
                                f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k)}")
     return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld or df), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld,
-                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh)
+                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh, max_num_seqs=1)
 
 
 class SwiftCoreClient(EngineCoreClient):
@@ -178,19 +225,28 @@ class SwiftCoreClient(EngineCoreClient):
         self.aborted: set[str] = set()
         self.resources = SimpleNamespace(engine_dead=False)
         t0 = time.time()
+        self.max_num_seqs = S = cfg.max_num_seqs
         try:
-            self.runner = Runner(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables, prefix_cache_gb=cfg.prefix_cache_gb, system_checkpoint=cfg.system_checkpoint,
-                                 drafter=cfg.drafter, dflash_path=cfg.dflash_path, dflash_codebooks_host=cfg.dflash_codebooks_host)
+            kw = dict(ctx_max=cfg.ctx_max, kv_fp8=cfg.kv_fp8, k=cfg.k, group=cfg.group, max_snaps=cfg.snapshots, log=logger.info, pld=cfg.pld, host_tables=cfg.host_tables, prefix_cache_gb=cfg.prefix_cache_gb,
+                      system_checkpoint=cfg.system_checkpoint, drafter=cfg.drafter, dflash_path=cfg.dflash_path, dflash_codebooks_host=cfg.dflash_codebooks_host)
+            if S > 1:
+                from smk_batch import BatchRunner
+
+                self.runner = BatchRunner(max_num_seqs=S, **kw)
+            else:
+                self.runner = Runner(**kw)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "older than the sources" in str(e):
                 raise
-            raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
+            fits = batch_limits_text(free_mib, cfg.kv_fp8, cfg.host_tables, S, vllm_config.model_config.max_model_len) if S > 1 else vram_limits_text(free_mib, cfg.k, cfg.drafter == 'dflash2', cfg.dflash_codebooks_host)
+            raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,}{f' x --max-num-seqs {S}' if S > 1 else ''} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
                                f"{' and the prompt-lookup tail' if cfg.pld else ''}{' and --drafter dflash2' if cfg.drafter == 'dflash2' else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
-                               f"Largest --max-model-len that fits that memory:\n{vram_limits_text(free_mib, cfg.k, cfg.drafter == 'dflash2', cfg.dflash_codebooks_host)}\n{e}") from e
-        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s%s",
+                               f"What fits that memory:\n{fits}\n{e}") from e
+        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s%s%s",
                     time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, cfg.prefix_cache_gb, "on" if cfg.pld else "off",
-                    f", drafter dflash2 (greedy requests without logit processors; {self.runner.df_mib:.0f} MiB device, codebooks on the {'host' if cfg.dflash_codebooks_host else 'device'})" if cfg.drafter == "dflash2" else "")
-        self.thread = threading.Thread(target=self._worker, name="swift-mk-engine", daemon=True)
+                    f", drafter dflash2 (greedy requests without logit processors; {self.runner.df_mib:.0f} MiB device, codebooks on the {'host' if cfg.dflash_codebooks_host else 'device'})" if cfg.drafter == "dflash2" else "",
+                    f", {S} sequence slots (batched decode)" if S > 1 else "")
+        self.thread = threading.Thread(target=self._batch_worker if S > 1 else self._worker, name="swift-mk-engine", daemon=True)
         self.thread.start()
 
     # ------------------------------------------------------------------------------------------------ engine thread
@@ -223,11 +279,8 @@ class SwiftCoreClient(EngineCoreClient):
     def _serve(self, req):
         rid = req.request_id
         sp = req.sampling_params
-        t0 = time.time()
         first = True
-        n = 0
         for toks, fin, sr in self.runner.run(req.prompt_token_ids, to_gen_params(sp), cancelled=lambda: rid in self.aborted):
-            n += len(toks)
             out = EngineCoreOutput(request_id=rid, new_token_ids=toks,
                                    finish_reason=None if fin is None else (FinishReason.STOP if fin == STOP else FinishReason.LENGTH), stop_reason=sr)
             if first:
@@ -235,11 +288,77 @@ class SwiftCoreClient(EngineCoreClient):
                 out.prefill_stats = PrefillStats(num_prompt_tokens=st.prompt, num_computed_tokens=st.prompt - st.cached, num_cached_tokens=st.cached, num_local_cached_tokens=st.cached)
                 first = False
             self._emit([out])
-        st = self.runner.last
-        logger.info("%s: prompt %d (resumed at %d from %s) prefill %.3f s (spill %.0f ms, restore %.0f ms), %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s, host cache %d lineages %.2f GiB%s", rid, st.prompt, st.cached, st.source, st.prefill_s,
+        self._log_done(rid, self.runner.last)
+
+    def _log_done(self, rid, st, slot=None):
+        logger.info("%s: prompt %d (resumed at %d from %s) prefill %.3f s (spill %.0f ms, restore %.0f ms), %d tokens in %.2f s = %.1f tok/s, %.2f tok/cycle, snapshots %s, host cache %d lineages %.2f GiB%s%s", rid, st.prompt, st.cached, st.source, st.prefill_s,
                     st.spill_s * 1e3, st.restore_s * 1e3, st.tokens, st.gen_s, (st.tokens - 1) / st.gen_s if st.gen_s > 0 else 0.0, (st.tokens - 1) / st.cycles if st.cycles else 0.0, st.snaps,
                     len(self.runner.store.entries) if self.runner.store else 0, self.runner.store.bytes() / (1 << 30) if self.runner.store else 0.0,
-                    f", route {st.route}" + (f" (accepted drafts per cycle {st.hist})" if st.route == "dflash2" else "") if self.runner.df else "")
+                    f", route {st.route}" + (f" (accepted drafts per cycle {st.hist})" if st.route == "dflash2" else "") if self.runner.df else "",
+                    f", slot {slot}" if slot is not None else "")
+
+    # --max-num-seqs > 1: continuous batching (smk_batch.BatchRunner.step: at most one admission, then one sync group of cycles for every running request).
+    def _batch_worker(self):
+        R = self.runner
+        waiting = collections.deque()
+
+        def refuse(t, ex):
+            if isinstance(ex, ValueError):  # the prompt does not fit: this request fails, the others go on
+                logger.warning("request %s refused: %s", t.rid, ex)
+            self._emit([EngineCoreOutput(request_id=t.rid, new_token_ids=[], finish_reason=FinishReason.ERROR)])
+
+        while True:
+            try:
+                block = not R.tasks and not waiting
+                while True:
+                    req = self.req_q.get(block=block)
+                    if req is None:
+                        return
+                    waiting.append(self._task(req))
+                    block = False
+            except queue.Empty:
+                pass
+            try:
+                R.step(waiting, refuse)
+            except Exception:  # noqa: BLE001
+                logger.exception("batched decode failed: %d running requests fail", len(R.tasks))
+                dead = [t.rid for t in R.tasks]
+                R.fail_all()
+                self._emit([EngineCoreOutput(request_id=rid, new_token_ids=[], finish_reason=FinishReason.ERROR) for rid in dict.fromkeys(dead)])
+                for rid in dead:
+                    self._forget(rid)
+                R.drop_cache()  # the engine state is unknown after an exception
+                try:
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001  sticky CUDA error: the engine is gone, /health must say so
+                    logger.error("CUDA context is broken: marking the engine dead")
+                    self.resources.engine_dead = True
+                    return
+
+    def _forget(self, rid):
+        self.live.discard(rid)
+        self.aborted.discard(rid)
+
+    def _task(self, req):
+        from smk_batch import Task
+
+        rid = req.request_id
+        state = {"first": True}
+
+        def emit(t, toks, fin, sr):
+            out = EngineCoreOutput(request_id=rid, new_token_ids=toks, finish_reason=None if fin is None else (FinishReason.STOP if fin == STOP else FinishReason.LENGTH), stop_reason=sr)
+            if state["first"]:
+                st = t.st
+                out.prefill_stats = PrefillStats(num_prompt_tokens=st.prompt, num_computed_tokens=st.prompt - st.cached, num_cached_tokens=st.cached, num_local_cached_tokens=st.cached)
+                state["first"] = False
+            self._emit([out])
+
+        def done(t):
+            if t.st is not None and not state["first"]:
+                self._log_done(rid, t.st, t.seq.idx if t.seq is not None else None)
+            self._forget(rid)
+
+        return Task(rid, list(req.prompt_token_ids), to_gen_params(req.sampling_params), emit, done, cancelled=lambda: rid in self.aborted)
 
     # ------------------------------------------------------------------------------------------------ EngineCoreClient
     async def add_request_async(self, request) -> None:
