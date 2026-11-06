@@ -21,7 +21,9 @@ from weights import Checkpoint  # noqa: E402
 
 
 class Engine:
-    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None, lm_head_host=None):
+    def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None, lm_head_host=None, state_slots=None):
+        """state_slots: physical DeltaNet state slots (None = tmax + 1, the full ring; 1 = one in-place state, 151 MiB instead of (tmax + 1) x 151 MiB, bit-identical decode:
+        include/deltanet.h swiftmk_deltanet_step_lazy2).  The batched decoder (engine/batch.py) uses 1 for every sequence slot."""
         assert layers == pack.NL
         self.lib = smk.load(lib)
         smk.setup_engine_api(self.lib)
@@ -85,7 +87,10 @@ class Engine:
             m.head_q_kind, m.head_q, m.head_qs = self.hq_kind, p(G.hq.w), p(G.hq.s)
         self.m = m
         self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet ring has tmax + 1 slots (8: +0.56 GiB, needed for the prompt-lookup tail)
-        self.h = self.lib.smk_engine_create_ex(C.byref(m), ctx_max, kv_fp8, self.tmax)
+        if state_slots is None:
+            self.h = self.lib.smk_engine_create_ex(C.byref(m), ctx_max, kv_fp8, self.tmax)
+        else:
+            self.h = self.lib.smk_engine_create_slot(C.byref(m), ctx_max, kv_fp8, self.tmax, int(state_slots), None)
         if not self.h:
             raise RuntimeError("smk_engine_create failed (out of device memory?)")
         self.st = smk.stream()

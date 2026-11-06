@@ -47,6 +47,10 @@ cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
                               int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, void* out, void* ws,
                               cudaStream_t stream);
+// Same, with the layer cache read from device memory at launch when kv_pp != NULL: cache = (char*)*kv_pp + kv_off (kv ignored).  Batched decode writes each sequence's cache base
+// there before the graph launch, so one captured graph serves any set of sequences.
+cudaError_t swiftmk_attn_step_ind(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, void* const* kv_pp,
+                                  size_t kv_off, int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, void* out, void* ws, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

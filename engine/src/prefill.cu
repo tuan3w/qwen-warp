@@ -350,7 +350,7 @@ __global__ void k_head_finish(int* ds, int pos) {
 
 extern "C" {
 
-// ---- accessors into the opaque engine (what: 0 device state ints, 1 DeltaNet state fp32 [48 layers][tmax+1][48][128][128], 2 conv state bf16 [48][tmax+1][10240][3],
+// ---- accessors into the opaque engine (what: 0 device state ints, 1 DeltaNet state fp32 [48 layers][sslots][48][128][128] (smk_engine_sslots), 2 conv state bf16 [48][tmax+1][10240][3],
 //      3 KV cache base (16 layers of kv_layer_bytes), 4 = kv_layer_bytes (returned as a pointer-sized integer))
 // Exact sink + ring buffers of the int4 cache (kvrot.cuh) live behind the code/meta region of every layer; they are state that a DeltaNet snapshot must carry along (prefix reuse).
 // Bytes of all 16 layers' buffers (0 unless the cache is int4).
@@ -401,15 +401,15 @@ void* smkp_engine_ptr(smk_engine* e, int what) {
 // (a fused [qkv|z] GEMM output row), ab = [a 48 | b 48] row.  y = bf16 [6144].
 cudaError_t smkp_dn_row(smk_engine* e, int di, const void* qkvz_row, const void* ab_row, const void* conv_w, const void* A_log, const void* dt_bias, const void* norm_w, void* y,
                         cudaStream_t st) {
-  return swiftmk_deltanet_step_lazy(1, qkvz_row, (const char*)qkvz_row + CONVD * 2, ab_row, (const char*)ab_row + NV * 2, conv_w, A_log, dt_bias, norm_w,
-                                    e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
-                                    e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, e->ds + DS_CUR, e->slots, y, e->ws_dn,
-                                    e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), e->ds + DS_PEND, st);
+  return swiftmk_deltanet_step_lazy2(1, qkvz_row, (const char*)qkvz_row + CONVD * 2, ab_row, (const char*)ab_row + NV * 2, conv_w, A_log, dt_bias, norm_w,
+                                     e->dn_state + (size_t)di * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS,
+                                     e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, e->ds + DS_CUR, e->slots, e->sslots, y, e->ws_dn,
+                                     e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), e->ds + DS_PEND, nullptr, st);
 }
 
-// Write the pending lazy DeltaNet state of every layer into ring slot cur (the python prefill reads / writes dn_state[:, cur] directly) and clear the pending count.
+// Write the pending lazy DeltaNet state of every layer into ring slot cur (the python prefill reads / writes dn_state[:, cur % sslots] directly) and clear the pending count.
 cudaError_t smkp_materialize(smk_engine* e, cudaStream_t st) {
-  return swiftmk_deltanet_materialize(e->dn_state, e->dn_dbuf, 48, e->ds + DS_CUR, e->ds + DS_PEND, e->slots, st);
+  return swiftmk_deltanet_materialize(e->dn_state, e->dn_dbuf, 48, e->ds + DS_CUR, e->ds + DS_PEND, e->sslots, st);
 }
 
 cudaError_t smkp_head_finish(smk_engine* e, int pos, cudaStream_t st) {

@@ -80,12 +80,15 @@ class FastPrefill:
         self._fold = False
         self.taps = False  # test hook: write the last row's per-layer residual into the engine debug taps (a folded head has no step that does)
         self.tap = None  # DFlash2 drafter context capture (dflash.TapCapture): reads the residual entering the tap layers of every segment / group; never writes the prefill's own buffers
+        self.layer_hook = None  # called with the segment's (group's) row count after every layer of a fast segment: the batched server decodes the other sequences there (a long prefill does not freeze them)
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
         self.ds = _view(lib.smkp_engine_ptr(e, 0), 20 * 4, torch.int32)  # engine_impl.h DS_N = 20 (DS_PEND = 19: pending lazy DeltaNet rows)
-        nsl = eng.tmax + 1  # DeltaNet ring slots (K11: tmax + 1)
+        nsl = lib.smk_engine_sslots(e)  # physical DeltaNet state slots (tmax + 1, or 1 for a batched-decode sequence slot: ring slot cur lives in state slot cur % nsl)
+        self.nss = nsl
         self.dn_state = _view(lib.smkp_engine_ptr(e, 1), 48 * nsl * 48 * 128 * 128 * 4, torch.float32).view(48, nsl, 48, 128, 128)
-        self.dn_conv = _view(lib.smkp_engine_ptr(e, 2), 48 * nsl * 10240 * 3 * 2, torch.bfloat16).view(48, nsl, 10240 * 3)
+        ncv = eng.tmax + 1  # conv ring slots (K11: tmax + 1)
+        self.dn_conv = _view(lib.smkp_engine_ptr(e, 2), 48 * ncv * 10240 * 3 * 2, torch.bfloat16).view(48, ncv, 10240 * 3)
         self.kv_layer_bytes = lib.smkp_engine_ptr(e, 4)
         self.kv_base = lib.smkp_engine_ptr(e, 3)
         self.mtp_kv = None
@@ -98,10 +101,11 @@ class FastPrefill:
 
     # ------------------------------------------------------------------------------------------------ scratch
     def _scratch(self, S):
-        old = getattr(self.e, "_fp_alloc", None)  # shared by every FastPrefill of this engine
+        box = getattr(self.e, "_fp_holder", self.e)  # shared by every FastPrefill of this engine (and of the batched decoder's sequence slots, engine/batch.py)
+        old = getattr(box, "_fp_alloc", None)
         if old and old["S"] >= S and old["R"] == self.rows:
             return old
-        self.e._fp_alloc = old = None
+        box._fp_alloc = old = None
         torch.cuda.empty_cache()
         d, bf = "cuda", torch.bfloat16
         R = self.rows
@@ -124,7 +128,7 @@ class FastPrefill:
         a["vall"] = torch.empty(self.ctx_max, 4, 256, dtype=bf, device=d)
         a["conv_prev"] = torch.empty(10240 * 3, dtype=bf, device=d)
         a["tok"] = torch.empty(S + 1, dtype=torch.int32, device=d)
-        self.e._fp_alloc = a
+        box._fp_alloc = a
         return a
 
     # ------------------------------------------------------------------------------------------------ helpers
@@ -218,7 +222,7 @@ class FastPrefill:
             tmp = a["tmpA"]
             qc, kc, vc = tmp[: Tn * 2048], tmp[Tn * 2048 : Tn * 4096], tmp[Tn * 4096 : Tn * 10240]
             smk.check(lib.smkp_conv(qkvz.data_ptr(), 16384, a["conv_prev"].data_ptr(), L.conv_w.data_ptr(), qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), cs.data_ptr(), Tn, st), "conv")
-            S0 = self.dn_state[di, cur]
+            S0 = self.dn_state[di, cur % self.nss]
             o, sf = chunk_gated_delta_rule(
                 qc.view(1, Tn, 16, 128), kc.view(1, Tn, 16, 128), vc.view(1, Tn, 48, 128), a["g"][:Tn].view(1, Tn, 48), a["beta"][:Tn].view(1, Tn, 48),
                 scale=128**-0.5, initial_state=S0.view(1, 48, 128, 128), output_final_state=True, use_qk_l2norm_in_kernel=True, state_v_first=True)
@@ -308,6 +312,8 @@ class FastPrefill:
                 self._attention(li, L, a, T, pos0)
             self._norm(a["h"], a["mix"], L.ln2, a["xn"], T)
             self._mlp(L, a, T)
+            if self.layer_hook is not None:
+                self.layer_hook(T)
         if head:  # the engine's head tail takes the pre-norm (residual, last down_proj output) of the last row from its own buffers
             _view(self.lib.smkp_engine_ptr(e.h, 5), H * 2, torch.bfloat16).copy_(a["h"][T - 1])
             _view(self.lib.smkp_engine_ptr(e.h, 6), H * 2, torch.bfloat16).copy_(a["dn"][T - 1])
@@ -370,6 +376,8 @@ class FastPrefill:
             Wd = self._deq(L.down, a["W2"]) if big else None
             for av, T in zip(views, Ts):
                 self._mlp_seg(L, av, T, Wg, Wd)
+            if self.layer_hook is not None:
+                self.layer_hook(total)
         for av, (ids_seg, pos0, nxt), T in zip(views, segs, Ts):
             self._norm(av["h"], av["dn"], e.G.final_norm, av["xn"], T)
             if nxt is not None and len(nxt):
@@ -399,7 +407,7 @@ class FastPrefill:
             tmp = a["tmpA"]
             qc, kc, vc = tmp[: T * 2048], tmp[T * 2048 : T * 4096], tmp[T * 4096 : T * 10240]
             smk.check(lib.smkp_conv(qkvz.data_ptr(), 16384, a["conv_prev"].data_ptr(), L.conv_w.data_ptr(), qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), cs.data_ptr(), T, st), "conv")
-            S0 = self.dn_state[di, cur]
+            S0 = self.dn_state[di, cur % self.nss]
             o, sf = chunk_gated_delta_rule(
                 qc.view(1, T, 16, 128), kc.view(1, T, 16, 128), vc.view(1, T, 48, 128), a["g"][:T].view(1, T, 48), a["beta"][:T].view(1, T, 48),
                 scale=128**-0.5, initial_state=S0.view(1, 48, 128, 128), output_final_state=True, use_qk_l2norm_in_kernel=True, state_v_first=True)

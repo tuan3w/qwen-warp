@@ -105,6 +105,14 @@ typedef struct smk_engine smk_engine;
 smk_engine* smk_engine_create(const smk_model_w* w, int ctx_max, int kv_fp8);
 smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax);
 int smk_engine_tmax(smk_engine* e);
+// A sequence slot of the batched decoder (include/batch.h): sslots physical DeltaNet state slots (1..tmax+1; ring slot i keeps its state in slot i % sslots, 1 = 151 MiB per sequence
+// instead of (tmax+1) x 151 MiB, exact: deltanet.h swiftmk_deltanet_step_lazy2); share != NULL: use share's activations, debug taps, logits and workspaces instead of allocating them
+// (same tmax / ctx_max / kv dtype; the two engines must run on one stream).  smk_engine_create_ex = smk_engine_create_slot(w, ctx_max, kv_fp8, tmax, tmax + 1, NULL).
+smk_engine* smk_engine_create_slot(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax, int sslots, smk_engine* share);
+int smk_engine_sslots(smk_engine* e);
+// Memory guard (tests): with env SMK_DEBUG=1 every device buffer the engine (and the spec / batch objects on it) allocates has a 4 KiB tail of 0xA5 bytes; returns how many tails
+// were overwritten (after a device synchronize), -1 when SMK_DEBUG is off, -2 on a CUDA error.  Off: no extra memory, no cost.
+int smk_engine_canary_check(smk_engine* e);
 void smk_engine_destroy(smk_engine* e);
 // Zero all sequence state; pos0 = 0, cur = 0.
 cudaError_t smk_engine_reset(smk_engine* e, cudaStream_t st);
