@@ -26,6 +26,7 @@ class Tracer:
         self.q = {}  # li -> list of [n][24][256] bf16 cuda tensors
         self.kv = {}  # li -> dict(k=[Ltot][4][256] bf16, v=..., pos0, T) host copies (last segment)
         self.keep_kv = False
+        self.sink = None  # optional callback sink(li, kind, t [n][K] bf16 cuda, row0, pos0, T): sees the rows of EVERY layer / segment (statistics accumulation without storing rows)
 
     @classmethod
     def from_env(cls):
@@ -47,6 +48,8 @@ class Tracer:
     def x(self, kind, t, row0=0):
         """t: [n][K] bf16 cuda rows (segment rows row0 .. row0 + n)."""
         li = self.li
+        if self.sink is not None and self.seg is not None:
+            self.sink(li, kind, t, row0, self.seg[0], self.seg[1])
         if li not in self.layers or self.seg is None:
             return
         idx = self.seg[2]
