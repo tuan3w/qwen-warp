@@ -323,7 +323,7 @@ cycled), streaming. Aggregate = all output tokens / wall time; per request = (to
 Single user, `--max-num-seqs 1` against v0.7.0, runs interleaved (v0.7.0, this version, v0.7.0, this version; 3 + 4 runs of each prompt, 512 tokens): code 181.5 / 181.4, prose
 120.5 / 120.3, math 188.9 / 188.6 tok/s (v0.7.0 / this version, means), and the token ids of every run are identical to v0.7.0's.
 
-Rows per weight pass are the limit: the W4 GEMV reads the weights once for at most 8 rows, so the scheduler gives every sequence the most drafts that fit (engine level, greedy, 8 chat
+Rows per weight pass are the limit: the W4 GEMV read the weights once for at most 8 rows (before the 16-row pass below), so the scheduler gives every sequence the most drafts that fit (engine level, greedy, 8 chat
 prompts x 256 tokens, host tables, 2 prompt sets per cell, aggregate tok/s):
 
 | sequences B \ drafts k | 0 | 1 | 2 | 3 |
@@ -336,6 +336,30 @@ prompts x 256 tokens, host tables, 2 prompt sets per cell, aggregate tok/s):
 
 The largest k that fits is the best for every B. Four sequences with one draft (8 rows) beat eight without drafts (8 rows), which is why 8 concurrent clients get no more than 4.
 A cycle of 8 rows costs 23.7 ms against 17.3 ms for 1 row: besides the GEMVs, every extra sequence adds its own DeltaNet and attention launches (~0.8 ms).
+
+**16 rows per weight pass** (2026-11-07, `k_w4` with two n8 token tiles, [Architecture](ARCHITECTURE.md#batched-decode---max-num-seqs)): engine level, greedy, 8 long-answer prompts
+(code, prose, arithmetic), 2 prompt sets per cell, 48 cycles each after one warm-up call, aggregate tok/s / ms per cycle:
+
+| sequences B | 8 rows: best k | 16 rows: best k | rows |
+|---|---|---|---|
+| 3 | k = 1: 277.4 / 20.2 ms | k = 3: **366.8** / 24.8 ms | 12 |
+| 4 | k = 1: 346.5 / 21.5 ms | k = 3: **421.5** / 27.6 ms | 16 |
+| 5 | k = 0: 239.3 / 20.9 ms | k = 2: **465.5** / 27.0 ms | 15 |
+| 6 | k = 0: 274.9 / 21.8 ms | k = 1: **426.7** / 26.2 ms | 12 |
+| 7 | k = 0: 308.0 / 22.7 ms | k = 1: **468.1** / 28.0 ms | 14 |
+| 8 | k = 0: 337.6 / 23.7 ms | k = 1: **503.6** / 29.8 ms | 16 |
+
+Again the largest k that fits is the best for every B (`K_BY_B` in `server/smk_batch.py`). The W4 GEMVs at 16 rows against 8 (us, isolated launches): DeltaNet q|k|v|z 69 / 54, attention q|k|v 75 / 49,
+o 27 / 24, gate|up 131 / 113, down 64 / 56, quantised head 1,038 / 778: about 3 ms of the 6 ms that 16 rows add to a cycle; the rest are the sequences' own DeltaNet, attention and
+MTP rows. Batched ids equal the solo replays (45 sequences in 9 shapes of 9 to 16 rows, greedy, seeded sampling, min_p, penalties) and every row-wise kernel is bit-identical for T = 1..16.
+
+**Server, mixed text + image workload** (2026-11-07, autonomous optimisation campaign, `--profile multiuser` = `--max-num-seqs 5 --host-tables --vision device`): 6 closed-loop clients,
+84 requests (36 with an image, code / prose / arithmetic / thinking / a ~5k-token document), aggregate output tok/s against the same tree before this work at its benchmark
+configuration (`--profile long --max-model-len 16384 --max-num-seqs 8`, ~159 tok/s), 3 runs interleaved with it: **1.358x (+-0.017), ~216 tok/s**. Held-out workload (8 clients,
+other image sizes and prompts, a 12k-token document, 2 seeded sampled requests): 1.20x. Answer accuracy 1.0 on the arithmetic items; 97.6% of the greedy answers are identical to the
+reference tree's, the rest differ at bf16 near-ties (other draft depths, see Outputs below). The steps, each measured on the same workload: 16 rows per weight pass with drafts up
+to 16 rows (1.31x), one launch per layer for the DeltaNet / attention of all sequences and a prefill pause every 2,048 rows (+1 to 4%), a decode cap of 5 per sync group (6 slots:
+1.336x at TTFT p95 3.27 s against 1.272x / 3.17 s without it), asynchronous snapshot copies (13 ms -> 0.6 ms of every prompt over 240 tokens on the request path).
 Outputs: with the default schedule a request's draft depth changes with the number of running requests, and in these runs 4 of 9 (`--max-num-seqs 4`) and 6 of 9 (`--profile long`, 8 slots)
 requests at C = 8 diverged from the same prompt at C = 1 (at token 83 or 155 of 512); with the depth fixed (`SMK_BATCH_K`, the tests) every request equals its solo run exactly.
 These are bf16 near-ties, measured at engine level (`margins.py` in the same experiment directory; 20 prompts x 512 greedy tokens, the native path against batched cycles of 0, 1 and 3
