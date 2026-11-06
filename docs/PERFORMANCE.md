@@ -296,8 +296,8 @@ RTX 3090, 2026-11-06. ViT encode (`tests/test_vision.py --time`, median of 10 af
 
 Through the server (`tests/test_vision_server.py --bench 3`, `--max-model-len 16384`, `--vision auto`, streamed chat, thinking off, a fresh image per run so nothing is cached; median of 3):
 time to first token 218 ms / 617 ms / 1,468 ms at 448x448 / 1024x768 / 1920x1080 (the prefill of 223 / 795 / 2,067 prompt tokens included).
-Decode after a 1024x768 image: 108.6 tok/s against 123.4 for a text prompt asking for the same kind of story (385 tokens, n = 3); the two prompts produce different text, so the gap is the
-draft acceptance of that text, not a slower step (the decode step only adds one integer to the rope position).
+Decode after a 1024x768 image: 108.6 tok/s against 123.4 for a text prompt asking for the same kind of story (385 tokens, n = 3). The step is not slower: 19.27 against 19.20 ms per
+cycle (server log: 2.09 against 2.37 tokens per cycle, 184 against 162 cycles), so the gap is the draft acceptance of the two different texts.
 Text requests are unchanged: README short prompts (385 tokens, greedy, ignore_eos, median of 3, same session) 184.3 / 118.2 / 184.1 tok/s against 0.7.0's 184.9 / 118.4 / 184.5 (ratio
 0.997 to 0.998, within noise), with greedy ids identical to 0.7.0.
 GPU memory (`memfit_vision.py` in the research notes, difference of the free memory after warmup + a largest-image request + a full-length request, 8,192 tokens, tail on): +888 MiB

@@ -104,8 +104,16 @@ For a deeper check, `make test` (native path, needs an RTX 3090 and the weights;
 | `tests/test_prefill_plan.py` | the prefill segmentation depends on the prompt only, and a resume continues the cold plan | nothing (a few seconds) |
 | `tests/test_server_seed.py` | a seeded request gives the same tokens whatever the cache state; the `top_k` rules (65 and above is HTTP 400) | GPU, weights (starts a server) |
 | `tests/test_startup_configs.py` | every documented start (no flags, `--prompt-lookup 0`, fp8, `--profile long`, 262,144 with and without the tail, bf16 at 32,768) starts and serves a prompt of its full length, and two configurations that do not fit are refused within 60 s with the free memory and the lengths that fit (the longest test, about 4 minutes on its own) | GPU, weights (starts servers) |
+| `tests/test_vision_logic.py` | image input logic: the prefix-cache key with images, request parsing and rejections (video, `--vision off`, oversize, bad placeholders), the start-up `--vision` memory decisions | nothing (5 s) |
+| `tests/test_vision.py` | MRoPE positions == vLLM's on 27 prompts (`--no-gpu`: nothing else); the ViT against cached transformers references (fp32 per-token cosine >= 0.99999), bf16 determinism, host-streamed == device weights | GPU, weights |
+| `tests/test_vision_engine.py` | text ids == 0.7.0's exactly (`tests/data/text_ids_v070.json`: greedy, seeded sampling, a resumed turn), before and after image requests; an image request cold == resumed; another image shares nothing past it | GPU, weights (about 20 s) |
+| `tests/test_vision_server.py` | one server: colours, shapes and printed text at 448x448 to 1920x1080, 2 to 4 images in order, a 5th image and video -> 400, no false cache hit, multi-turn `cached_tokens`, text ids == 0.7.0 (`tests/data/server_text_ids_v070.json`); then a `--vision off` server | GPU, weights (starts servers, about 4 minutes) |
 
-Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py` and `uv run tests/test_prefill_plan.py`.
+Fast checks by tier: `tests/run_tier.sh 0|1|2` runs every test whose docstring has a line `Tier: <n> [arguments]`. Tier 0 needs no GPU (about 10 s), tier 1 is engine level (under 2 minutes),
+tier 2 starts one server per configuration (under 4 minutes). `PY=<python>` picks the interpreter, `GPU_WRAP=<command>` prefixes the GPU runs; tier-1 engines are built by
+`tests/_engine.py` (`SMK_RESIDENT=1` attaches weights kept resident by a holder process, for development).
+
+Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py`, `uv run tests/test_prefill_plan.py` and `tests/run_tier.sh 0`.
 
 ## Troubleshooting
 
