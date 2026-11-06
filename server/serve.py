@@ -8,7 +8,8 @@
 Every stock `vllm serve` frontend flag works (--served-model-name, --host/--port, --api-key, --chat-template, --reasoning-parser, --tool-call-parser, ...).
 Engine flags that map onto the engine (read from vLLM's config in smk_core_client.engine_cfg): --max-model-len, --kv-cache-dtype {auto,bfloat16 -> bf16 | fp8 |
 int4_per_token_head}, --num-speculative-tokens (k, 0..3; sugar for --speculative-config '{"method":"mtp","num_speculative_tokens":k}'), and the engine's own
---profile / --host-tables / --prompt-lookup / --stream-cycles / --snapshots.  Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto tool choice, language-model only.
+--profile / --host-tables / --prompt-lookup / --stream-cycles / --snapshots / --vision / --max-image-pixels.  Defaults for this model: reasoning parser qwen3, tool parser qwen3_coder + auto
+tool choice, image input on (at most 4 images per prompt, 2 megapixels each; video is refused).
 """
 import os
 import sys
@@ -21,6 +22,8 @@ DEFAULT_MODEL = os.environ.get("SWIFT_MODEL", os.path.expanduser("~/models/swift
 DEFAULT_MAX_MODEL_LEN = 28672
 DEFAULT_MAX_MODEL_LEN_PLD = 20480  # the prompt-lookup tail (default on) needs the 9-slot DeltaNet ring: +0.56 GiB
 LONG_MAX_MODEL_LEN = 196608  # --profile long: with the prompt-lookup tail (262144 starts too)
+MAX_IMAGE_PIXELS = 2097152  # 2 megapixels = 8192 patches of 16 x 16 = 2048 placeholder tokens per image (1920 x 1080 keeps its size)
+MAX_IMAGES = 4  # default --limit-mm-per-prompt image count
 
 
 def parse_args(argv=None):
@@ -47,10 +50,28 @@ def parse_args(argv=None):
                    "Needs the drafter checkpoint (--dflash-path), ~1.2 GiB + 20 KiB per context token of GPU memory on top of the MTP engine (needs --host-tables for any useful length; the --profile long length does not fit)")
     g.add_argument("--dflash-path", default=None, help="directory of the DFlash2 W4A16 checkpoint (compressed-tensors; model.safetensors) for --drafter dflash2; default $DFLASH_W4 or ~/llm-lab/models/dflash2-w4a16")
     g.add_argument("--dflash-codebooks", default="host", choices=["device", "host"], help="where the drafter's two 121 MiB candidate-selector codebooks live: host (default) = pinned memory, gathered by row over PCIe (same decode speed, same ids, 244 MiB less VRAM); device = GPU memory")
+    g.add_argument("--vision", default="auto", choices=["auto", "device", "host", "off"], help="image input with the checkpoint's vision tower.  device = its 879 MiB of bf16 weights on the GPU "
+                   "(fastest encode: 16 ms at 448x448, 65 ms at 1024x768); host = the 27 blocks' weights stay in pinned host memory and are streamed per image (153 MiB on the GPU, +51 ms at "
+                   "448x448, +9 ms at 1024x768, level at 1920x1080); auto (default) = device iff it leaves 256 MiB free at --max-model-len, else host; off = text only, the GPU memory and "
+                   "behaviour of 0.7.0 (an image request gets a 400)")
+    g.add_argument("--max-image-pixels", type=int, default=MAX_IMAGE_PIXELS, help="largest image after the processor's resize, in pixels (images are scaled down to fit, aspect kept; "
+                   f"256 pixels per ViT patch, 1,024 per placeholder token; default {MAX_IMAGE_PIXELS:,} = 2,048 tokens); the ViT's activation memory grows with it")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
-                        language_model_only=True, disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
+                        disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
     args = parser.parse_args(argv)
     validate_parsed_serve_args(args)
+    if args.vision == "off":
+        args.language_model_only = True
+    else:  # images on: at most MAX_IMAGES per prompt unless --limit-mm-per-prompt says otherwise, video always refused; the processor resizes to --max-image-pixels
+        if args.mm_processor_cache_type == "shm":
+            raise SystemExit("--mm-processor-cache-type shm is not supported by the swift-mk engine (use the default lru)")
+        lim = dict(args.limit_mm_per_prompt or {})
+        lim.setdefault("image", MAX_IMAGES)
+        lim["video"] = 0
+        args.limit_mm_per_prompt = lim
+        mk = dict(args.mm_processor_kwargs or {})
+        mk.setdefault("size", {"shortest_edge": 65536, "longest_edge": args.max_image_pixels})
+        args.mm_processor_kwargs = mk
     if args.profile == "long":
         if args.kv_cache_dtype in (None, "auto"):
             args.kv_cache_dtype = "int4_per_token_head"
@@ -73,7 +94,7 @@ def main(argv=None):
     import smk_core_client
 
     smk_core_client.install(stream_cycles=args.stream_cycles, snapshots=args.snapshots, prefix_cache_gb=args.prefix_cache_gb, system_checkpoint=args.system_checkpoint == "on", prompt_lookup={"0": False, "1": True}.get(args.prompt_lookup, "auto"), host_tables=args.host_tables, sort_tool_schema=args.sort_tool_schema == "on",
-                            drafter=args.drafter, dflash_path=args.dflash_path, dflash_codebooks=args.dflash_codebooks)
+                            drafter=args.drafter, dflash_path=args.dflash_path, dflash_codebooks=args.dflash_codebooks, vision=args.vision, max_image_pixels=args.max_image_pixels)
     from vllm.entrypoints.launchers.api_server.entry import run_server
 
     uvloop.run(run_server(args))

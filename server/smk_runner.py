@@ -17,6 +17,11 @@ Prefix reuse (DeltaNet state cannot be rewound, so the state is checkpointed ins
     end of R's plan, restore it into the current DeltaNet ring slot, continue the prefill at position q (main KV / MTP KV positions >= q are simply overwritten).  No snapshot -> reset + full prefill.
   * host tier (prefix_store.py): before the device lineage is overwritten by a request that does not continue it, its KV rows up to its last snapshot and its snapshots are SPILLED to a
     pinned host store (budget `prefix_cache_gb`); a later request that continues a stored conversation RESTORES it (KV rows, then the snapshot) and prefills only the new tokens.  Same exactness.
+
+Images (Runner(vision=True), run(..., images=[vision.ImageInput])): the placeholder rows of an image take the ViT's rows instead of token embeddings (target and MTP layer input), the prefill
+ropes every row at its 3-D MRoPE position (vision.mrope_positions), decode ropes at KV position + delta (engine ds[DS_RDELTA]).  Lineages and the host store match on
+vision.cache_key(ids, images): placeholder rows carry the image's hash, so two prompts that differ only in the image share nothing past it.  The ViT runs only for images that
+have rows after the resume position.  Image requests are decoded by the MTP path (the DFlash2 drafter's rope and context are text-only).
 """
 import ctypes as C
 import os
@@ -32,7 +37,8 @@ import torch
 ENGINE = Path(__file__).resolve().parent.parent / "engine"
 sys.path.insert(0, str(ENGINE))
 from spec import SpecEngine, make_pld, smk  # noqa: E402
-from prefill import FastPrefill  # noqa: E402
+from prefill import FastPrefill, MMRows  # noqa: E402
+from vision import IMAGE_TOKEN, VISION_END, VISION_START, ImageInput, cache_key, mrope_positions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prefix_store import Chunk, DfWindow, PrefixStore  # noqa: E402
 
@@ -91,14 +97,20 @@ class Stats:
     restore_s: float = 0.0  # time spent restoring a stored lineage (KV rows + snapshot)
     route: str = "mtp"  # the draft path that decoded the request: mtp (MTP chain + prompt-lookup tail) | dflash2 (block drafter)
     hist: list = field(default_factory=list)  # dflash2: cycles by number of accepted drafts (0..7)
+    images: int = 0  # images in the prompt
+    vit_images: int = 0  # images whose rows were encoded by the ViT for this request (the others were in the cached prefix)
+    vit_s: float = 0.0  # ViT encode time (part of prefill_s)
 
 
 class Runner:
     def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True,
-                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False):
+                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False, vision=False, vision_warmup_grid=(1, 64, 128)):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object.
         drafter: "mtp" (default) or "dflash2": greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter (engine/dflash.py: 7 drafts per cycle, verify T = 8) when
-        its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there."""
+        its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there.
+        vision: None / False = text only; "device" (or True) = load the ViT with its 879 MiB of bf16 weights on the GPU, "host" = its block weights in pinned host memory, streamed per encode
+        (engine/vision.py; 151 MiB on the GPU); loaded before the engine so that the engine sees the memory that is left; run(..., images=...) needs it;
+        vision_warmup_grid: the (t, h, w) patch grid of the warmup image, the largest the server admits (default 8192 patches = a 2-megapixel image, 2048 placeholder tokens)."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
         assert drafter in ("mtp", "dflash2"), drafter
@@ -111,6 +123,12 @@ class Runner:
         self.df_lookup = bool(dflash_lookup)  # the drafter's device n-gram lookup over the token history (SMK_DF_LOOKUP): the prompt is uploaded to its history at every dflash2 request
         self.df_mib = 0.0  # device memory of the drafter (weights, caches, ring, graphs of the first request not included), measured at construction
         t0 = time.time()
+        self.vit = None
+        self.vision_warmup_grid = tuple(vision_warmup_grid)
+        if vision:
+            from vision import Vision
+
+            self.vit = Vision(weights="device" if vision is True else vision)
         try:
             if self.df:
                 from dflash import DF_PATH, DflashEngine, TapCapture
@@ -122,9 +140,9 @@ class Runner:
                 self.df_mib = self.e.df_mib + self.tap.nbytes / 2**20  # drafter weights + K/V cache + scratch + the tap staging buffers
             else:
                 self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)
+            self.fp = FastPrefill(self.e, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))
         except AttributeError as ex:  # ctypes: symbol missing in an old libswiftmk.so
             raise RuntimeError(f"libswiftmk.so is older than the sources ({ex}): run `make -C engine` (or point SMK_BUILD at a current build dir)") from ex
-        self.fp = FastPrefill(self.e, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))
         self.ctx_max = ctx_max
         self.load_s = time.time() - t0
         self.lineage = None  # np.int32 array: tokens whose main KV is valid in the device caches (see module docstring)
@@ -378,16 +396,18 @@ class Runner:
             groups.append(cur)
         return groups
 
-    def _prefill(self, ids, q, ends, folded, cancelled, use_df=False):
+    def _prefill(self, ids, q, ends, folded, cancelled, use_df=False, key=None):
         """Process ids[q:] (state valid for [0, q), q = 0 or a segment end of the plan) following the plan; the last token as the head step.  Snapshots after the last (up to)
         two segment ends.  Returns False when cancelled (self.lineage then holds the valid prefix).  dflash2 Runner: also builds the drafter's context window (TapCapture); use_df: the
-        request is decoded by the block drafter, so the prefill ends with smk_dflash_start instead of the MTP draft (smk_spec_start)."""
+        request is decoded by the block drafter, so the prefill ends with smk_dflash_start instead of the MTP draft (smk_spec_start).  key: the prompt's cache key (vision.cache_key;
+        default: the ids), what self.lineage records."""
+        key = np.asarray(ids, dtype=np.int32) if key is None else key
         tap = self.tap
         if tap is not None:
             tap.begin(*self._df_window(len(ids), q))
             self.fp.tap = tap
         try:
-            return self._prefill_rows(ids, q, ends, folded, cancelled, use_df, tap)
+            return self._prefill_rows(ids, q, ends, folded, cancelled, use_df, tap, key)
         finally:
             self.fp.tap = None
 
@@ -398,7 +418,7 @@ class Runner:
             tap.flush(a, b)
             self._df_note(a, b)
 
-    def _prefill_rows(self, ids, q, ends, folded, cancelled, use_df, tap):
+    def _prefill_rows(self, ids, q, ends, folded, cancelled, use_df, tap, key):
         e, fp = self.e, self.fp
         snap_at = set(ends[len(ends) - min(2, self.max_snaps) :]) if self.max_snaps else set()
         sys_at = self._system_end(ids, ends)
@@ -407,7 +427,7 @@ class Runner:
         i = q
         for g in self.plan_groups(ends, q, fp.seg, fp.min_fast, snap_at, self.group_prefill):
             if cancelled():
-                self.lineage = np.asarray(ids[:i], dtype=np.int32)
+                self.lineage = key[:i]
                 return False
             j = g[-1][1]
             if g[0][1] - g[0][0] >= fp.min_fast:
@@ -423,6 +443,8 @@ class Runner:
                 if tap is not None:
                     self._df_flush(tap, i, j)
             else:
+                if fp.mm is not None and i < fp.mm.end:  # the decode-step path embeds tokens and ropes at KV position + delta: right only for text after the last image
+                    raise RuntimeError(f"prefill segment [{i}, {j}) of fewer than {fp.min_fast} rows before the end of an image (row {fp.mm.end})")
                 for a in range(i, j, 4):
                     T = min(4, j - a)
                     e._step(ids[a : a + T], 2)
@@ -434,10 +456,10 @@ class Runner:
             i = j
             if i in snap_at:
                 self._snapshot(i, sticky=(i == sys_at))
-            self.lineage = np.asarray(ids[:i], dtype=np.int32)
+            self.lineage = key[:i]
         if folded:
             if cancelled():
-                self.lineage = np.asarray(ids[:i], dtype=np.int32)
+                self.lineage = key[:i]
                 return False
             cur = self._cur()
             fp._ev = []
@@ -459,16 +481,37 @@ class Runner:
             self._df_note(n, n + 1)
         elif self.k:
             smk.check(e.lib.smk_spec_start(e.sp, self.k, e.st), "spec_start")
-        self.lineage = np.asarray(ids, dtype=np.int32)
+        self.lineage = key
         return True
 
+    def _mm_rows(self, images, pos3, q, st):
+        """The fast prefill's image inputs for a prompt resumed at q: the MRoPE table of every row and the ViT rows of the images that have rows at or after q.  One ViT call per image, so
+        the activation peak is that of the largest image (334 MiB at 1920x1080) whatever the number of images."""
+        need = [im for im in images if im.offset + im.n > q]
+        embs = {}
+        if need:
+            t0 = time.time()
+            for im in need:
+                embs[id(im)] = self.vit.encode(im.pixels, [im.grid])
+            torch.cuda.synchronize()
+            st.vit_s, st.vit_images = time.time() - t0, len(need)
+        pos3d = torch.from_numpy(np.ascontiguousarray(pos3.T, dtype=np.int32)).to("cuda")
+        return MMRows(pos3d, [(im.offset, im.offset + im.n, embs.get(id(im))) for im in images])
+
     # ------------------------------------------------------------------------------------------------ generation
-    def run(self, ids, p: GenParams, cancelled=lambda: False, route=None):
+    def run(self, ids, p: GenParams, cancelled=lambda: False, route=None, images=None):
         """Generator of (new_tokens, finish_reason | None, stop_reason); tokens are cut exactly at the stop / length.  Nothing is yielded after a cancel.
-        route: None = the router's choice; "mtp" forces the MTP path (a dflash2 Runner otherwise decodes greedy requests without logit processors with the block drafter when its window is covered)."""
+        route: None = the router's choice; "mtp" forces the MTP path (a dflash2 Runner otherwise decodes greedy requests without logit processors with the block drafter when its window is covered).
+        images: the prompt's images (vision.ImageInput: placeholder rows, patch grid, mm hash, pixel values; Runner(vision=True) only); None or [] = a text prompt."""
         e, k = self.e, self.k
         ids = [int(t) for t in ids]
-        st = self.last = Stats(prompt=len(ids))
+        images = sorted(images or [], key=lambda im: im.offset)
+        if images and self.vit is None:
+            raise ValueError("image input needs Runner(vision=True)")
+        for im in images:
+            if im.offset < 0 or im.offset + im.n > len(ids) or any(t != IMAGE_TOKEN for t in ids[im.offset : im.offset + im.n]):
+                raise ValueError(f"image placeholder rows [{im.offset}, {im.offset + im.n}) are not image tokens of the prompt")
+        st = self.last = Stats(prompt=len(ids), images=len(images))
         n_new = min(p.max_tokens, self.ctx_max - self.slack(self.group, k, bool(self.pld) or self.df) - len(ids))
         if n_new < 1 or len(ids) < 1:
             raise ValueError(f"prompt of {len(ids)} tokens does not fit the engine context {self.ctx_max}")
@@ -485,7 +528,8 @@ class Runner:
         if procs or self._procs_on:  # requests without processors touch nothing (a previous request's processors are switched off once)
             e.set_procs(**(procs or {}))
             self._procs_on = bool(procs)
-        pick = self._pick(ids, set(ends))
+        key = cache_key(ids, images) if images else np.asarray(ids, dtype=np.int32)  # what lineages and the host store match on
+        pick = self._pick(key, set(ends))
         if pick is None:
             st.spill_s = self._spill_device()
             e.reset()  # (a dflash2 engine also zeroes the drafter's K/V cache)
@@ -503,7 +547,7 @@ class Runner:
             _, ent, snap = pick
             tr = time.time()
             st.spill_s = self._spill_device(keep=ent)
-            self._load_entry(ent, snap, ids)
+            self._load_entry(ent, snap, key)
             st.restore_s = time.time() - tr - st.spill_s
             self.df_lo = self.df_hi = 0  # the drafter cache holds another lineage's rows ...
             if self.df and ent.dfw is not None:  # ... unless the entry carries the window of the conversation it holds
@@ -513,11 +557,20 @@ class Runner:
             q = snap.pos
             st.source = "host"
         st.cached = q
-        use_df = self.df and route != "mtp" and p.temperature <= 0 and not procs and self._df_covered(len(ids), q)
+        use_df = self.df and route != "mtp" and p.temperature <= 0 and not procs and not images and self._df_covered(len(ids), q)
         st.route = "dflash2" if use_df else "mtp"
         if use_df and self.df_lookup:
             e.df_set_hist(ids)
-        if not self._prefill(ids, q, ends, folded, cancelled, use_df):
+        delta = 0
+        if images:
+            pos3, delta = mrope_positions(len(ids), [(im.offset, im.grid) for im in images])
+            self.fp.mm = self._mm_rows(images, pos3, q, st)
+        self.fp.ds[FastPrefill.DS_RDELTA] = delta  # every request sets it (a text prompt after an image one ropes at its KV position again)
+        try:
+            ok = self._prefill(ids, q, ends, folded, cancelled, use_df, key)
+        finally:
+            self.fp.mm = None
+        if not ok:
             return
         if use_df:
             ss0 = e.df_state()  # the counters run on across requests that resume a cached lineage: this request's share is the difference
@@ -584,5 +637,12 @@ class Runner:
             ids = rng.integers(1000, 100000, size=n).tolist()
             for _ in self.run(ids, GenParams(max_tokens=2 * (self.group * (8 if self.pld or self.df else self.k + 1)) + 2, temperature=0.0), route=route):
                 pass
+        if self.vit is not None:  # the image path at the largest admitted image: FlashAttention / cuBLAS set-up and the ViT's activation peak are paid now
+            t, h, w = self.vision_warmup_grid
+            im = ImageInput(9, (t, h, w), "warmup", torch.randn(t * h * w, 3 * 2 * 16 * 16))
+            ids = rng.integers(1000, 100000, size=8).tolist() + [VISION_START] + [IMAGE_TOKEN] * im.n + [VISION_END] + rng.integers(1000, 100000, size=8).tolist()
+            if len(ids) + 64 <= self.ctx_max:
+                for _ in self.run(ids, GenParams(max_tokens=8, temperature=0.0), images=[im]):
+                    pass
         self.drop_cache()
         torch.cuda.empty_cache()
