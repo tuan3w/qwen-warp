@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Experimental DFlash2 block drafter inside the engine (`engine/dflash.py`, `engine/src/dflash.cu`, `include/dflash.h`, [Architecture](docs/ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)): a 5-layer W4A16 drafter proposes 7 tokens per cycle, the target verifies 8 rows, and the whole cycle (verify, accept, drafter, selector) is one CUDA graph. Greedy only, not wired into the server. Measured on one RTX 3090 against MTP k = 3 in the same process (256 greedy tokens, 11 prompts, 3 interleaved repetitions): 213 against 155 tok/s on average (x1.37), code 263 against 179, math 252 against 173, prose 175 against 138; 4.48 against 3.0 tokens per cycle; the cycle takes 21.0 ms against 19.1 ms, of which the drafter is 2.5 ms.
+- Engine API `smk_engine_verify`, `smk_engine_commit`, `smk_engine_tap_gather` (an external draft verified over T <= 8 rows with the host accepting, tap readout) and `smk_bf16_gemv_f32_cfg` (mma configuration of the bf16 GEMV).
+
 ## 0.5.0 - 2026-11-05
 
 ### Added

@@ -56,6 +56,7 @@ make room for a 262,144-token context.
 | | `engine/src/attn.cu` | attention and the KV cache |
 | | `engine/src/head_q.cu` | quantised lm_head |
 | | `engine/src/mtp.cu`, `mtp_sample.cu`, `pld.cu` | MTP, sampling, prompt lookup |
+| | `engine/src/dflash.cu`, `engine/dflash.py` | DFlash2 block drafter (experimental, greedy only): 5-layer W4A16 drafter + candidate selector inside the cycle graph |
 | | `engine/src/proc.cu`, `proc.h` | request-level logit processors (penalties, `logit_bias`, `min_tokens`, `allowed_token_ids`, `min_p`) inside the sampling graphs |
 | | `engine/src/engine.cu`, `misc.cu`, `prefill.cu` | engine glue, norms and misc ops, prefill kernels |
 
@@ -81,6 +82,24 @@ so one captured graph serves every step.
 | **Logit processors** | the processors (`proc.cu`) run on every verify row, with the draft tokens before the row counted as generated, so they stay exact under speculation (stock vLLM refuses `min_p` and `logit_bias` there). Draft proposals ignore them, which lowers acceptance. Order and costs: [Usage](USAGE.md#sampling-parameters) |
 | **Prompt-lookup tail** (`pld.cu`) | a host n-gram proposer adds up to 4 more rows to the verification pass (up to 8 rows). It needs a 9-slot DeltaNet ring (+0.56 GiB, 0.67 GiB with `--host-tables`), which is why `--prompt-lookup auto` turns it on only where the length leaves 256 MiB of the free GPU memory next to it (`vram_need_mib` in `server/smk_core_client.py`) |
 | **Exact rescoring head** | draft and verify use a quantised lm_head (int4 or int8) whose top-R candidates are rescored with the bf16 head (R = 16 for greedy, 64 for sampling), so the output ids equal what the bf16 head would give. This is also why the bf16 table can live in host memory: only the R candidate rows are read per step |
+
+## DFlash2 block drafter (experimental, greedy only)
+
+`engine/dflash.py` (`DflashEngine`, a `SpecEngine` that keeps the MTP path) and `engine/src/dflash.cu` (`include/dflash.h`) run the 7-token block drafter of `incoai/Qwen3.8-27B-DFlash2` inside the engine.
+One CUDA graph per cycle, no host work between cycles: the host launches n graphs and reads the output ring, like the MTP cycle.
+
+| Stage | What runs |
+|---|---|
+| verify | the engine step over T = 8 rows `[anchor, d1..d7]` (quantised head + exact rescoring), same kernels as `smk_engine_verify` |
+| accept | one thread: leading drafts equal to the previous row's argmax, `spec_finish` bookkeeping (pos, DeltaNet ring slot, anchor), output ring, per-cycle log, the drafter's new context rows (`a` rows at the positions of the accepted verify rows) |
+| ctx append | the debug taps of target layers 5, 19, 33, 47, 61 of the new rows -> `fc` (W4 GEMV, K = 25600) -> `hidden_norm` -> K/V of all 5 drafter layers in ONE fused W4 GEMV (the context path does not depend on the layer input) -> per-head norm + RoPE -> positional write into the drafter KV cache (`[5][8 heads][ctx_max + 8][128]` bf16 K and V; rows past the committed length are overwritten by the next cycle, no rollback) |
+| noise block | `embed([anchor] + [mask] * 7)` with the target's table, then per layer: norm, conv-kernel projection (bf16 GEMV), dynamic grouped conv, q/k/v W4 GEMV, qk-norm + RoPE, attention over cache rows `[max(0, start - 2047), start + 8)` (the noise rows' K/V are written at `start..start + 7`, so one contiguous range; non-causal), o GEMV, conv + residual, norm, conv, gate|up (SiLU epilogue) + down, conv + residual; final norm |
+| head + selector | quantised lm_head over rows 1..7 + exact bf16 rescoring of the top-R (R = 32), top-16 per row in `torch.topk(sorted=False)` order, selector hidden projection, the greedy path `score = unary + <pred_codebook[pred] * hproj, succ_codebook[cand]>` over 7 sequential positions (one kernel) -> `ds[TOK + 1 ..]` |
+
+Weights: the W4A16 compressed-tensors checkpoint (pack-quantized, group 128; fp16 scales are rounded to bf16 because the engine kernels take bf16) is repacked with `pack.repack_w4`; every GEMM is `smk_w4r_gemv`.
+Device memory: 1.19 GiB of W4 weights + 0.25 GiB selector codebooks (device; pinned host memory works too: `codebooks_host=True`) + 20 KiB per context position of drafter KV (`ctx_max` 2048: 42 MiB).
+Limits: needs `tmax = 8` and the int4 head; greedy only (no sampling, no logit processors); the drafter KV is indexed by absolute position, so long contexts pay 20 KiB/token although the window is 2048 (a ring would cap it at 42 MiB); prefill appends the drafter context in 8-row engine steps (the layer-major fast prefill does not feed it yet); not wired into the server.
+`tests/test_dflash.py` checks the ids against the T = 8 greedy decode.
 
 ## The 4-bit KV cache
 

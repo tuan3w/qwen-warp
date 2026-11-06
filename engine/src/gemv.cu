@@ -441,6 +441,21 @@ cudaError_t smk_bf16_gemv_f32(const void* w, const void* x, int N, int K, int T,
   return run_bf16_mma<8, 4, 4, 2>(w, x, N, K, T, &e, st);
 }
 
+// Same as smk_bf16_gemv_f32 for T in 2..8 with an explicit mma configuration (tuning; the DFlash2 drafter's 1280-row conv projections): 0 w8k4u4 (default), 1 w8k8u2, 2 w8k8u4, 3 w4k4u4, 4 w4k2u4, 5 w16k8u2.
+cudaError_t smk_bf16_gemv_f32_cfg(const void* w, const void* x, int N, int K, int T, float* out, int cfg, cudaStream_t st) {
+  smk_epi e = {};
+  e.kind = SMK_EPI_F32; e.out[0] = out;
+  switch (cfg) {
+    case 0: return run_bf16_mma<8, 4, 4, 2>(w, x, N, K, T, &e, st);
+    case 1: return run_bf16_mma<8, 8, 2, 2>(w, x, N, K, T, &e, st);
+    case 2: return run_bf16_mma<8, 8, 4, 2>(w, x, N, K, T, &e, st);
+    case 3: return run_bf16_mma<4, 4, 4, 4>(w, x, N, K, T, &e, st);
+    case 4: return run_bf16_mma<4, 2, 4, 4>(w, x, N, K, T, &e, st);
+    case 5: return run_bf16_mma<16, 8, 2, 1>(w, x, N, K, T, &e, st);
+  }
+  return cudaErrorInvalidValue;
+}
+
 cudaError_t smk_bf16_gemv_small(const void* w, const void* x, int N, int na, int K, int T, void* out_a, void* out_b, cudaStream_t st) {
   if (T < 1 || T > 8 || (K & 7)) return cudaErrorInvalidValue;
   k_bf16_small<<<N, 128, 0, st>>>((const uint4*)w, (const uint4*)x, N, na, K, T, (uint16_t*)out_a, (uint16_t*)out_b);
