@@ -225,6 +225,15 @@ def image_checks(t, cl, base):
     # two images in one prompt
     out, a = ask([solid((220, 20, 20)), solid((20, 40, 220))], "There are two images. What are their colours, in order? Answer as 'first, second'.")
     t.check("two images in one prompt -> both colours in order", "red" in a.lower() and "blue" in a.lower() and a.lower().index("red") < a.lower().index("blue"), f"{a!r}")
+    cols = [((220, 20, 20), "red"), ((20, 160, 40), "green"), ((20, 40, 220), "blue"), ((250, 220, 0), "yellow")]
+    for n, order in ((3, [2, 0, 1]), (4, [3, 1, 0, 2])):
+        names = [cols[i][1] for i in order]
+        out, a = ask([solid(cols[i][0], 320 + 64 * j, 320) for j, i in enumerate(order)],
+                     f"There are {n} images. Name the colour of each image, in order. Reply with only a comma-separated list of {n} colour words.", max_tokens=96)
+        pos = [a.lower().find(c) for c in names]
+        t.check(f"{n} images in one prompt -> the {n} colours in order", all(p >= 0 for p in pos) and pos == sorted(pos), f"expected {names}, got {a!r}")
+    r = httpx.post(base + "/v1/chat/completions", json=dict(model="swift", max_tokens=8, messages=[user([solid(c) for c, _ in cols] + [solid((0, 0, 0))], "Colours?")]), timeout=60)
+    t.check("5 images (above the default limit of 4) -> 400", r.status_code == 400 and "image" in r.text.lower(), f"{r.status_code} {r.text[:200]}")
 
     # video is refused with a 400 that says so
     r = httpx.post(base + "/v1/chat/completions", json=dict(model="swift", max_tokens=8, messages=[{"role": "user", "content": [
