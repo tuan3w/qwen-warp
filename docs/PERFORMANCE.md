@@ -338,6 +338,12 @@ The largest k that fits is the best for every B. Four sequences with one draft (
 A cycle of 8 rows costs 23.7 ms against 17.3 ms for 1 row: besides the GEMVs, every extra sequence adds its own DeltaNet and attention launches (~0.8 ms).
 Outputs: with the default schedule a request's draft depth changes with the number of running requests, and in these runs 4 of 9 (`--max-num-seqs 4`) and 6 of 9 (`--profile long`, 8 slots)
 requests at C = 8 diverged from the same prompt at C = 1 (at token 83 or 155 of 512); with the depth fixed (`SMK_BATCH_K`, the tests) every request equals its solo run exactly.
+These are bf16 near-ties, measured at engine level (`margins.py` in the same experiment directory; 20 prompts x 512 greedy tokens, the native path against batched cycles of 0, 1 and 3
+drafts, the prose prompt diverges at token 83 as in the server runs): 20 of 60 answers diverged before their end, and at every first divergent token the reference's two best
+exact logits were 0.011 to 0.14 apart (median 0.044; 0.08th to 1.9th percentile of the gap over all 16,432 answer positions, whose median is 6.6), and the batched run's token was the
+reference's second best every time. The two runs agree bit for bit on the embedding and on layer 0, and differ from a DeltaNet layer on (layer 1 at 0 / 1 drafts; layer 4 at 3 drafts,
+where only the prompt-lookup-tail cycles differ) by 0.0002 to 0.004 (rounding), which grows to at most 0.13 to 0.41 at the final norm output (|x| up to 12 to 40); the top-2 gap
+moves between the two runs by 0.028 (median) and 0.17 (p99) at positions that do not flip.
 
 ## 8. Reproducing
 
