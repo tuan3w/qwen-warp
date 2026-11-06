@@ -1,0 +1,11 @@
+# Opt-in DFlash2 drafter (experimental).  Use it on top of docker-compose.yml:
+#   hf download syvai/Qwen3.8-27B-DFlash2-W4A16 --local-dir ~/models/dflash2-w4a16     # 1.2 GB, once
+#   EXTRA_ARGS="--drafter dflash2 --max-model-len 122880" docker compose -f docker-compose.yml -f docker-compose.dflash2.yml up -d
+# PROFILE=long (4-bit KV + host tables) is kept; --drafter dflash2 needs a --max-model-len the drafter fits next to (122,880 here, the 196,608 default is refused).
+# DFLASH_DIR overrides the host directory of the drafter checkpoint.
+services:
+  qwen-warp:
+    environment:
+      DFLASH_W4: /models/dflash2-w4a16
+    volumes:
+      - ${DFLASH_DIR:-${HOME}/models/dflash2-w4a16}:/models/dflash2-w4a16:ro
