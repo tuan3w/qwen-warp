@@ -9,7 +9,12 @@
 2. ViT (engine/vision.py Vision.encode) against transformers' Qwen3_5VisionModel on the processor's pixel values of synthetic images of several sizes (one image per call, and three in
    one call): (a) the implementation: our fp32 forward == transformers' fp32 forward, per-token cosine >= 0.99999 (max abs diff reported); (b) the served bf16 path against the
    fp32 forward: mean cosine >= 0.9995 and the worst token no worse than transformers' own bf16 model (- 0.01): 27 bf16 blocks leave a few tokens at a cosine of 0.97-0.99 in
-   both implementations, so a per-token 0.999 bar in bf16 is one that the reference itself misses.  --time: encode ms for 448x448, 1024x768, 1920x1080 (median of 10 after warmup).
+   both implementations, so a per-token 0.999 bar in bf16 is one that the reference itself misses; (c) the served path is deterministic (two calls, same bits); (d) weights="host"
+   (block weights streamed from pinned memory) == weights="device" bit for bit.  --time: encode ms for 448x448, 1024x768, 1920x1080 (median of 10 after warmup).
+The transformers references come from a disk cache ($QW_TEST_CACHE, default ~/.cache/qwen-warp-tests) after the first run, so the reference models load only once.
+
+Tier: 0 --no-gpu
+Tier: 1
 """
 import argparse
 import os
@@ -23,6 +28,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "engine"))
 MODEL = os.environ.get("SWIFT_MODEL", os.path.expanduser("~/models/swift-1.5-int4"))
+CACHE = Path(os.environ.get("QW_TEST_CACHE", os.path.expanduser("~/.cache/qwen-warp-tests")))
 
 
 def check(name, ok, detail=""):
@@ -103,60 +109,92 @@ def test_vit(timing):
     vit32 = Vision(dtype=torch.float32, attn="sdpa")
     print(f"ViT weights on the GPU: {vit.mib:.0f} MiB", flush=True)
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False  # the fp32 references are fp32
-    vc = AutoConfig.from_pretrained(MODEL).vision_config
-    vc._attn_implementation = "sdpa"
-    sd = {k: (v.view(vit.hid, 3, vit.tp, vit.patch, vit.patch) if k == "patch_embed.proj.weight" else v) for k, v in vit32.W.items()}
     refs = {}
     ok = True
-    for dt in (torch.float32, torch.bfloat16):
-        with torch.device("cuda"):
-            refs[dt] = Qwen3_5VisionModel._from_config(vc, dtype=dt).eval()
-        missing, unexpected = refs[dt].load_state_dict({k: v.to(dt) for k, v in sd.items()}, strict=False)
-        ok &= check(f"transformers reference ({dt}) loads every ViT tensor", not unexpected and not missing, f"missing {missing} unexpected {unexpected}")
+
+    def reference(pv, g):
+        """transformers' fp32 output and its own bf16 model's cosine to it, cached on disk by (pixels, grid, transformers / torch versions): the reference models load only on a miss."""
+        import hashlib
+        import transformers
+
+        h = hashlib.sha256(pv.numpy().tobytes() + str(g.tolist()).encode() + transformers.__version__.encode() + torch.__version__.encode()).hexdigest()[:24]
+        f = CACHE / f"vit_ref_{h}.pt"
+        if f.exists():
+            return torch.load(f)
+        if not refs:
+            vc = AutoConfig.from_pretrained(MODEL).vision_config
+            vc._attn_implementation = "sdpa"
+            sd = {k: (v.view(vit.hid, 3, vit.tp, vit.patch, vit.patch) if k == "patch_embed.proj.weight" else v) for k, v in vit32.W.items()}
+            for dt in (torch.float32, torch.bfloat16):
+                with torch.device("cuda"):
+                    refs[dt] = Qwen3_5VisionModel._from_config(vc, dtype=dt).eval()
+                missing, unexpected = refs[dt].load_state_dict({k: v.to(dt) for k, v in sd.items()}, strict=False)
+                assert not missing and not unexpected, (missing, unexpected)
+        with torch.inference_mode():
+            r32 = refs[torch.float32](pv.cuda().float(), grid_thw=g.cuda()).pooler_output.float()
+            r16 = refs[torch.bfloat16](pv.cuda().to(torch.bfloat16), grid_thw=g.cuda()).pooler_output.float()
+        ch = torch.nn.functional.cosine_similarity(r16, r32, dim=-1)
+        out = dict(r32=r32.cpu(), hf16_min=ch.min().item(), hf16_mean=ch.mean().item())
+        CACHE.mkdir(parents=True, exist_ok=True)
+        torch.save(out, f)
+        return out
+
     sizes = [(448, 448), (640, 480), (300, 500), (500, 300), (1024, 768), (1920, 1080), (64, 64)]
     cosf = torch.nn.functional.cosine_similarity
 
     def run(ims, tag):
         b = proc.image_processor(images=ims, return_tensors="pt")
         pv, g = b["pixel_values"], b["image_grid_thw"]
+        ref = reference(pv, g)
+        r32 = ref["r32"].cuda()
         with torch.inference_mode():
-            r32 = refs[torch.float32](pv.cuda().float(), grid_thw=g.cuda()).pooler_output.float()
-            r16 = refs[torch.bfloat16](pv.cuda().to(torch.bfloat16), grid_thw=g.cuda()).pooler_output.float()
             m32 = vit32.encode(pv, g).float()
             m16 = vit.encode(pv, g).float()
-        c32, c16, ch = cosf(m32, r32, dim=-1), cosf(m16, r32, dim=-1), cosf(r16, r32, dim=-1)
+        c32, c16 = cosf(m32, r32, dim=-1), cosf(m16, r32, dim=-1)
         name = f"ViT {tag} grid {g.tolist()} -> {tuple(m16.shape)}"
         # (a) the implementation: fp32 forward == transformers' fp32 forward, every token
         r = check(f"{name}: fp32 == transformers fp32, per-token cosine >= 0.99999", c32.min() >= 0.99999, f"min {c32.min():.7f}, max abs diff {(m32 - r32).abs().max():.2e} (max |ref| {r32.abs().max():.0f})")
         # (b) the served bf16 path against the fp32 forward, next to transformers' own bf16 model (the bf16 noise floor of a 27-block ViT)
-        r &= check(f"{name}: served bf16 vs fp32: mean cosine >= 0.9995, worst token no worse than transformers bf16 - 0.01", c16.mean() >= 0.9995 and c16.min() >= ch.min() - 0.01,
-                   f"served bf16: mean {c16.mean():.6f} min {c16.min():.5f} max abs diff {(m16 - r32).abs().max():.3f} | transformers bf16: mean {ch.mean():.6f} min {ch.min():.5f}"
-                   f" | served vs transformers bf16: min {cosf(m16, r16, dim=-1).min():.5f}")
+        r &= check(f"{name}: served bf16 vs fp32: mean cosine >= 0.9995, worst token no worse than transformers bf16 - 0.01", c16.mean() >= 0.9995 and c16.min() >= ref["hf16_min"] - 0.01,
+                   f"served bf16: mean {c16.mean():.6f} min {c16.min():.5f} max abs diff {(m16 - r32).abs().max():.3f} | transformers bf16: mean {ref['hf16_mean']:.6f} min {ref['hf16_min']:.5f}")
+        # (c) determinism: the same input twice gives the same bits
+        r &= check(f"{name}: served bf16 deterministic (two calls bit-identical)", torch.equal(vit.encode(pv, g).float(), m16))
         return r
 
     for i, (w, h) in enumerate(sizes):
         ok &= run([synth(w, h, i % 2)], f"{w}x{h}")
     ok &= run([synth(448, 448, 0), synth(640, 480, 1), synth(300, 500, 0)], "3 images in one call")
     del refs, vit32
+    torch.cuda.empty_cache()
+    # (c) weights="host" (blocks streamed from pinned memory) runs the same kernels on the same values: bit-identical to "device", back-to-back calls included
+    vh = Vision(weights="host")
+    print(f"ViT weights on the GPU with weights='host': {vh.mib:.0f} MiB", flush=True)
+    for ims in ([synth(448, 448, 0)], [synth(1024, 768, 1), synth(300, 500, 0)]):
+        b = proc.image_processor(images=ims, return_tensors="pt")
+        pv, g = b["pixel_values"], b["image_grid_thw"]
+        outs = [vh.encode(pv, g) for _ in range(3)]
+        ref = vit.encode(pv, g)
+        ok &= check(f"ViT weights='host' == weights='device' bit for bit, 3 calls in a row, grid {g.tolist()}", all(torch.equal(o, ref) for o in outs))
     if timing:
-        torch.cuda.empty_cache()
-        for w, h in [(448, 448), (1024, 768), (1920, 1080)]:
-            b = proc.image_processor(images=[synth(w, h, 0)], return_tensors="pt")
-            pv, g = b["pixel_values"].pin_memory(), b["image_grid_thw"]
-            for _ in range(3):
-                vit.encode(pv, g)
-            ts = []
-            for _ in range(10):
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                vit.encode(pv, g)
-                torch.cuda.synchronize()
-                ts.append((time.perf_counter() - t0) * 1e3)
-            torch.cuda.reset_peak_memory_stats()
-            base = torch.cuda.memory_allocated()
-            vit.encode(pv, g)
-            peak = (torch.cuda.max_memory_allocated() - base) / 2**20
-            print(f"TIME  ViT encode {w}x{h} (grid {g[0].tolist()}, {pv.shape[0]} patches -> {pv.shape[0] // 4} tokens): median {np.median(ts):.1f} ms (min {min(ts):.1f}, n=10), activation peak {peak:.0f} MiB", flush=True)
+        for name, v in (("device", vit), ("host", vh)):
+            for w, h in [(448, 448), (1024, 768), (1920, 1080)]:
+                b = proc.image_processor(images=[synth(w, h, 0)], return_tensors="pt")
+                pv, g = b["pixel_values"].pin_memory(), b["image_grid_thw"]
+                for _ in range(3):
+                    v.encode(pv, g)
+                ts = []
+                for _ in range(10):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    v.encode(pv, g)
+                    torch.cuda.synchronize()
+                    ts.append((time.perf_counter() - t0) * 1e3)
+                torch.cuda.reset_peak_memory_stats()
+                base = torch.cuda.memory_allocated()
+                v.encode(pv, g)
+                peak = (torch.cuda.max_memory_allocated() - base) / 2**20
+                print(f"TIME  ViT weights={name} encode {w}x{h} (grid {g[0].tolist()}, {pv.shape[0]} patches -> {pv.shape[0] // 4} tokens): median {np.median(ts):.1f} ms (min {min(ts):.1f}, n=10), "
+                      f"activation peak {peak:.0f} MiB", flush=True)
     return ok
 
 
