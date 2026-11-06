@@ -4,7 +4,7 @@
 
 I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
 At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than the MTP engine (about 1.5x on code); the experimental in-engine DFlash2 drafter is level with it in a same-session comparison, and the server can use it for greedy requests with `--drafter dflash2` (through the server: code 277 against 184 tok/s, math 254 against 184, prose 113 against 118, and 31% slower on copy-heavy agent turns; [Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)); neither was measured at long context.
-I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
+I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), text only; one request at a time by default, up to 8 decoded together with `--max-num-seqs` ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
 
 ## Numbers
 
@@ -41,7 +41,7 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
 | Ready after | 21 to 30 s |
 | Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), perplexity +0.056% over bf16 at 98k (previous: +0.26%), a minimal tool schema in the usual key order 92% to 96% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found in every run (previous format: missed in every run). Coding pass@1 was measured on the previous format only (241 against 244 of 283) and not repeated. On one 61-token loop prompt, caused by the exact ring, sampled text repeats more than with bf16; four other prompts match. [KV cache](docs/KV_CACHE.md) |
-| Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers with DFlash2's own drafter beyond two prompts (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and many concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine serves one request at a time) |
+| Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers with DFlash2's own drafter beyond two prompts (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and more than 8 concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine decodes at most 8 requests together) |
 
 HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
 
@@ -109,7 +109,7 @@ The server measures the free GPU memory at start and refuses a context that does
 | Sampling | `temperature`, `top_p`, `top_k` (up to 64), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` ([table](docs/USAGE.md#sampling-parameters)) |
 | Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
 | Tool calls | They work, with one caveat: the previous 4-bit format gave a well-formed call in 39% to 46% of requests for a minimal one-parameter schema in the usual key order (bf16: 91%); with the rotated 4-bit cache of this version it is 92% (n = 200, through the server). The default `--sort-tool-schema` stays on ([details](docs/USAGE.md#tool-calls)) |
-| Concurrency | One request decodes at a time; the rest queue |
+| Concurrency | `--max-num-seqs 1` (default): one request decodes at a time, the rest queue. `--max-num-seqs 2..8`: that many requests decode together in one weight pass per cycle ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs), [Performance](docs/PERFORMANCE.md#6-concurrent-requests---max-num-seqs)) |
 
 ## Documentation
 

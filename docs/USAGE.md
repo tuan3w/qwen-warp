@@ -210,6 +210,33 @@ Set `SWIFT_MODEL` (or pass `--model`) when the weights are not in `~/models/swif
 **vLLM version.** The environment pins `vllm==0.30.0` (`pyproject.toml`, `uv.lock`). The engine-core client (`server/smk_core_client.py`) and the tool-schema hook (`server/tool_schema.py`, which wraps
 `vllm.renderers.hf.safe_apply_chat_template`) use vLLM internals of that version; other versions are untested (a newer one, 0.33.0, exists). Install from the lock file rather than upgrading vLLM by hand.
 
+## Concurrent requests (`--max-num-seqs`)
+
+`--max-num-seqs 1` (the default) decodes one request at a time and queues the rest, exactly as before. `--max-num-seqs S` with S = 2..8 gives the engine S sequence slots on one set of
+weights and decodes the running requests together: every cycle reads the weights once for the rows of all of them ([Architecture](ARCHITECTURE.md#batched-decode---max-num-seqs)).
+
+| Running requests | How a cycle decodes them |
+|---|---|
+| 1 | the single-sequence path: MTP k = 3 + the prompt-lookup tail (the speed of `--max-num-seqs 1`) |
+| 2 | batched, 3 drafts each (8 rows) |
+| 3, 4 | batched, 1 draft each (6 / 8 rows) |
+| 5 to 8 | batched, no drafts (one row each) |
+
+- More requests than slots queue FIFO. A new request is prefilled while the others keep streaming: every ~512 tokens of prefill work the running requests get one sync group (`--stream-cycles`), so a long prompt pauses them for about 0.3 s at a time instead of for its whole prefill.
+- Every request keeps its own sampling parameters, seed, logit processors, stops, `max_tokens` and abort; prefix reuse (`cached_tokens`, the host prefix cache) works per slot: a request goes to the free slot whose conversation it continues, else the least recently used free slot, whose conversation is spilled to the host cache first.
+- Outputs: a request's tokens are the same whether other requests run next to it as long as its draft depth stays the same; the scheduler changes the depth with the number of running requests (table above), and a different depth can change a greedy token at a bf16 near-tie (as `--num-speculative-tokens` does). `SMK_BATCH_K=k` (tests) fixes the depth at every batch size, so a request's ids are exactly those it gets alone.
+- `--drafter dflash2` needs `--max-num-seqs 1`.
+- Memory: every slot has its own KV cache at `--max-model-len` (368 MiB + 68 / 36 / 20.5 KiB per token with bf16 / fp8 / int4 KV, on top of 19.9 GiB, or 15.1 GiB with `--host-tables`). Without `--max-model-len` the server picks the longest length per sequence that fits; a configuration that does not fit is refused with the largest `--max-num-seqs` at that length and the largest length at 2, 4 and 8 slots. With 23.7 GB free (a desktop holding 0.3 GB):
+
+| Cache | 2 slots | 4 slots | 8 slots |
+|---|---|---|---|
+| bf16 (default profile) | 19,456 | 7,168 | 1,024 |
+| fp8 | 36,864 | 13,312 | 1,024 |
+| bf16 + `--host-tables` | 55,296 | 24,576 | 9,216 |
+| int4 + `--host-tables` (`--profile long`) | 172,032 | 79,872 | 30,720 |
+
+Speed: [Performance](PERFORMANCE.md#6-concurrent-requests---max-num-seqs).
+
 ## Memory and context
 
 The KV cache is the only thing that grows with context. The server sizes the engine for `--max-model-len` up front and **measures the free GPU memory at start** (`torch.cuda.mem_get_info`): it compares

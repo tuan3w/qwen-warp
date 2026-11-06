@@ -1,7 +1,7 @@
 # Performance and quality: what was measured, and how far to trust it
 
-Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) |
-[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Reproducing](#6-reproducing) | [Back to README](../README.md)
+Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) | [6. Concurrent requests](#6-concurrent-requests---max-num-seqs) |
+[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Reproducing](#7-reproducing) | [Back to README](../README.md)
 
 Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
 the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
@@ -284,7 +284,43 @@ With 4-bit KV (`--kv-cache-dtype int4_per_token_head --host-tables`, same proced
 
 **Not measured**: sampling (greedy only: sampled requests and requests with logit processors use the MTP path), DFlash2 beyond the lengths in [Usage](USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental) (the drafter KV cache is indexed by absolute position, 20 KiB per token; `--profile long` does not fit and the ring buffer that would cap it is not built), the device lm_head table of `DflashEngine` (the server keeps it on the host), the long-context presets of HyperQwen, and any quoting prompt other than the two above (where HyperQwen's lookup drafter reports 381 tok/s).
 
-## 6. Reproducing
+## 6. Concurrent requests (`--max-num-seqs`)
+
+Measured 2026-11-06 on one RTX 3090 (23.7 GB free), one session, through the server with `experiments/2026-11-06-qwen-warp-concurrent-vision/bench_conc.py` (research repository):
+C closed-loop clients, each sending 3 greedy chat requests back to back (thinking off, `max_tokens` 512, stop at the end token; the 8 short code / prose / math prompts of that script,
+cycled), streaming. Aggregate = all output tokens / wall time; per request = (tokens - 1) / (last chunk - first chunk); TTFT = request sent to first content chunk. One run per cell.
+
+| Server | C = 1 | C = 2 | C = 4 | C = 8 |
+|---|---|---|---|---|
+| v0.7.0 (FIFO), default profile: aggregate tok/s | 155.3 | 153.6 | 154.8 | 151.7 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 2.80 / 4.75 | 10.0 / 11.6 | 22.9 / 25.9 |
+| `--max-num-seqs 4`, default profile (7,168 tokens per slot): aggregate tok/s | 154.9 | 272.2 | **334.1 (2.16x)** | 331.8 |
+| ... per request tok/s | 163.5 | 146.4 | 85.7 | 84.9 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.12 / 0.21 | 6.0 / 6.5 (4 queue) |
+| `--max-num-seqs 8 --profile long` (30,720 tokens per slot): aggregate tok/s | 150.6 | 260.6 | 317.3 | 314.0 |
+| ... per request tok/s | 160.0 | 141.1 | 82.0 | 39.9 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.08 / 0.21 | 0.13 / 0.56 |
+
+Single user, `--max-num-seqs 1` against v0.7.0, runs interleaved (v0.7.0, this version, v0.7.0, this version; 3 + 4 runs of each prompt, 512 tokens): code 181.5 / 181.4, prose
+120.5 / 120.3, math 188.9 / 188.6 tok/s (v0.7.0 / this version, means), and the token ids of every run are identical to v0.7.0's.
+
+Rows per weight pass are the limit: the W4 GEMV reads the weights once for at most 8 rows, so the scheduler gives every sequence the most drafts that fit (engine level, greedy, 8 chat
+prompts x 256 tokens, host tables, 2 prompt sets per cell, aggregate tok/s):
+
+| sequences B \ drafts k | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| 1 | 57.8 | 105.8 | 138.3 | 159.0 (native k = 3 + tail: 164.9) |
+| 2 | 109.6 | 195.3 | 254.3 | 291.1 |
+| 3 | 156.8 | 278.0 | | |
+| 4 | 199.5 | 348.6 | | |
+| 5 / 6 / 7 / 8 | 239.2 / 274.9 / 308.1 / 338.1 | | | |
+
+The largest k that fits is the best for every B. Four sequences with one draft (8 rows) beat eight without drafts (8 rows), which is why 8 concurrent clients get no more than 4.
+A cycle of 8 rows costs 23.7 ms against 17.3 ms for 1 row: besides the GEMVs, every extra sequence adds its own DeltaNet and attention launches (~0.8 ms).
+Outputs: with the default schedule a request's draft depth changes with the number of running requests, and in these runs 4 of 9 (`--max-num-seqs 4`) and 6 of 9 (`--profile long`, 8 slots)
+requests at C = 8 diverged from the same prompt at C = 1 (at token 83 or 155 of 512); with the depth fixed (`SMK_BATCH_K`, the tests) every request equals its solo run exactly.
+
+## 7. Reproducing
 
 | What | How | Takes |
 |---|---|---|

@@ -3,12 +3,12 @@
 How the engine is put together and where to read the code. Back to the [README](../README.md); to run it, see [Getting started](GETTING_STARTED.md).
 
 Contents: [In one paragraph](#in-one-paragraph) | [Where to start reading](#where-to-start-reading) | [Repository layout](#repository-layout) | [Layers and files](#layers-and-files) | [Conventions the kernels share](#conventions-the-kernels-share) |
-[Speculative decoding](#speculative-decoding) | [The 4-bit KV cache](#the-4-bit-kv-cache) | [Host-pinned tables](#host-pinned-tables) | [Server behaviour](#server-behaviour) | [Design choices](#design-choices-and-what-they-cost)
+[Speculative decoding](#speculative-decoding) | [The 4-bit KV cache](#the-4-bit-kv-cache) | [Batched decode](#batched-decode---max-num-seqs) | [Host-pinned tables](#host-pinned-tables) | [Server behaviour](#server-behaviour) | [Design choices](#design-choices-and-what-they-cost)
 
 ## In one paragraph
 
 The engine targets one thing: single-stream decode of `Swift-1.5-Qwen3.8-27b-INT4` on one RTX 3090 (sm_86, CUDA 13.0, no PDL, no TMA). It was tuned and tested on a 3090 only;
-batch size is 1 by design. It is named **swift-mk** internally (library `engine/build/libswiftmk.so`, C API prefix `smk_`, environment prefix `SMK_`); the repository is `qwen-warp`.
+one request at a time by default; `--max-num-seqs 2..8` decodes that many sequences together in one weight pass per cycle ([batched decode](#batched-decode---max-num-seqs)). It is named **swift-mk** internally (library `engine/build/libswiftmk.so`, C API prefix `smk_`, environment prefix `SMK_`); the repository is `qwen-warp`.
 A decode step is one CUDA graph of fused kernels over W4A16 weights; the checkpoint's own MTP head drafts tokens that the same pass verifies; a 4-bit KV cache and host-pinned tables
 make room for a 262,144-token context.
 
@@ -45,9 +45,11 @@ make room for a 262,144-token context.
 | Server | `server/serve.py` | vLLM 0.30 OpenAI frontend (`run_server`) with our engine-core client |
 | | `server/smk_core_client.py` | in-process vLLM `EngineCoreClient`: maps the vLLM config to engine settings, checks the length against the free GPU memory (`vram_need_mib`), rejects unsupported parameters, FIFO queue, abort, streaming |
 | | `server/smk_runner.py` | engine driver: fast prefill (a plan that depends on the prompt only), MTP cycles, sampling, DeltaNet snapshots for multi-turn prefix reuse |
+| | `server/smk_batch.py` | `BatchRunner` (`--max-num-seqs > 1`): continuous batching over sequence slots: admission, prefills interleaved with decode groups, batched or single-sequence cycles per step |
 | | `server/tool_schema.py` | sorts the keys of every tool's `function.parameters` before vLLM's chat template renders them (`--sort-tool-schema`) |
 | | `server/plugin/` | a small vLLM plugin |
 | Engine (Python) | `engine/spec.py` | `SpecEngine`: MTP speculative decoding (k <= 3, plus a prompt-lookup tail) on top of `Engine` |
+| | `engine/batch.py` | `BatchDecoder`: S sequence slots (SpecEngine views with their own C engine + spec objects) and the batched cycle |
 | | `engine/prefill.py` | `FastPrefill`: chunked prefill writing the engine's caches |
 | | `engine/engine.py` | `Engine`: weight packing, buffers, the CUDA-graph decode step (ctypes into `libswiftmk.so`) |
 | | `engine/pack.py`, `pack_mtp.py`, `weights.py`, `smk.py` | weight and MTP packing, safetensors reader for the compressed-tensors layout, C-API bindings |
@@ -57,6 +59,7 @@ make room for a 262,144-token context.
 | | `engine/src/head_q.cu` | quantised lm_head |
 | | `engine/src/mtp.cu`, `mtp_sample.cu`, `pld.cu` | MTP, sampling, prompt lookup |
 | | `engine/src/dflash.cu`, `engine/dflash.py` | DFlash2 block drafter (experimental, greedy only): 5-layer W4A16 drafter + candidate selector inside the cycle graph |
+| | `engine/src/batch.cu`, `include/batch.h` | batched cycle over B sequences in one weight pass ([batched decode](#batched-decode---max-num-seqs)) |
 | | `engine/src/proc.cu`, `proc.h` | request-level logit processors (penalties, `logit_bias`, `min_tokens`, `allowed_token_ids`, `min_p`) inside the sampling graphs |
 | | `engine/src/engine.cu`, `misc.cu`, `prefill.cu` | engine glue, norms and misc ops, prefill kernels |
 
@@ -115,6 +118,17 @@ as before (`--drafter mtp` is byte-identical to the previous release). The Runne
 conversation's rows, and nothing carries the window of a spilled lineage). A request whose window is not covered after the prefill is decoded by the MTP path; the output is never wrong either way (the greedy accept is an argmax equality of the T = 8
 verify, the drafter only changes how many tokens a cycle commits). MTP-layer KV is still computed by the fast prefill for every request, so a later sampled turn on the same lineage reads it.
 
+## Batched decode (`--max-num-seqs`)
+
+| Piece | What it does |
+|---|---|
+| Sequence slot | its own `smk_engine` + `smk_spec` (`smk_engine_create_slot(..., sslots = 1, share = owner)`): device scalars, DeltaNet state + 9-slot conv ring + lazy delta buffer, KV cache, MTP-layer KV, processors, sampling config, spec state and output ring. Weights, activations, logits and workspaces are the owner's (one stream). Prefill, snapshots and single-sequence decode are the slot's own API |
+| One DeltaNet state per slot | ring slot i keeps its state in state slot i % sslots (`swiftmk_deltanet_step_lazy2`): the lazy entry never needs two states at once and every state write is an in-place update by the thread that read the element, so 1 state is exact (151 MiB per sequence instead of 9 x 151 MiB) |
+| Batched cycle (`engine/src/batch.cu`, `include/batch.h`) | `smk_batch_cycles` gathers the small per-sequence state into batch positions, launches n cycle graphs and scatters it back. A cycle: B x (kv + 1) verify rows through the 64 layers (embedding, norms, W4 GEMVs, quantised head + rescoring once for all rows; DeltaNet and attention per sequence through device pointer tables, `swiftmk_attn_step_ind`), per-sequence greedy accept or exact speculative sampling (both kernels in the graph, `SampP.greedy` selects), MTP catch-up of all rows and kd chained drafts as B-row passes. One graph per (B, kv, kd, any sampling), captured at start-up |
+| Row-count invariance | every row-wise kernel gives a row the same bits whatever the other rows of the launch are (`tests/test_batch_engine.py` part A), so a sequence decoded in a batch emits exactly what it emits alone with the same per-cycle rows |
+| Scheduler (`server/smk_batch.py`) | admission into the free slot whose lineage resumes the prompt furthest, else the least recently used free slot (spilled to the host prefix store first); one prefill at a time, and every 512 x 64 row-layers of it the running requests decode one sync group (FastPrefill layer hook), so a long prompt delays running streams by ~0.3 s, not by its prefill; then one sync group for all running requests: B = 1 uses the slot's native path (MTP k = 3 + prompt-lookup tail), B >= 2 batched cycles with `K_BY_B` = {2: 3, 3: 1, 4: 1, 5-8: 0} drafts (8 rows per pass; the best k for every B, [Performance](PERFORMANCE.md#6-concurrent-requests---max-num-seqs)) |
+| Exact mode (`SMK_BATCH_K=k`) | batched cycles of k drafts at every batch size: a request's ids are then a function of the request alone (tests compare concurrent requests with each alone, exactly) |
+
 ## The 4-bit KV cache
 
 Each token's 256-element head vector (per KV head, separately for K and V) is rotated by the orthonormal Walsh-Hadamard transform, then quantised to 4 bits with a symmetric companded 16-level grid:
@@ -141,7 +155,7 @@ to the KV cache. Decode output is bit-identical (`tests/test_host_tables.py`). I
 
 | Behaviour | Detail |
 |---|---|
-| Concurrency | one request decodes at a time; the rest queue FIFO; a client disconnect aborts the running request |
+| Concurrency | `--max-num-seqs 1`: one request decodes at a time, the rest queue FIFO; `--max-num-seqs S > 1`: continuous batching over S sequence slots ([batched decode](#batched-decode---max-num-seqs)); a client disconnect aborts its request |
 | Start-up memory check | the server reads the free GPU memory at start, compares it with a fitted model of what the engine needs (fixed part + KiB per token x length) and refuses a length that does not fit before any weight is loaded ([Usage](USAGE.md#memory-and-context)) |
 | Prefix reuse | DeltaNet states are snapshotted at the last two cut points of a prefill plan that depends on the prompt only, and at the end of the system prompt (`--snapshots N`, 151 MB of pinned host RAM each, 183 MB with the 4-bit cache, which also saves its exact sink and ring rows); a follow-up turn reuses the cached prefix and reports `cached_tokens`; a resumed prefill is bit-identical to a cold one |
 | Layer-major prefill groups | the prefill plan cuts a segment at every chat-turn boundary and each segment dequantizes every layer's int4 weights again; `FastPrefill._group` runs consecutive segments (total rows <= the 4,096-row scratch, a group ends at each snapshot position, `Runner.plan_groups`) layer by layer so each layer is dequantized once per group. Same kernels and row counts per segment, so bit-identical to `_segment` one at a time |
@@ -153,7 +167,7 @@ to the KV cache. Decode output is bit-identical (`tests/test_host_tables.py`). I
 | Choice | Why | Cost |
 |---|---|---|
 | A graph of fused kernels, not a persistent kernel | within 2.5% of a persistent kernel for the GEMV chain when this was decided, and far easier to maintain | a little headroom on the table |
-| Batch size 1 | the goal is single-stream decode speed on one card | no batching, concurrent requests queue |
+| Single-stream first, batching up to 8 sequences | the goal is single-stream decode speed on one card; the W4 GEMV reads the weights once for up to 8 rows, so up to 8 sequences share a pass | at most 8 rows per weight pass: 5 to 8 sequences decode without drafts |
 | One GPU generation (sm_86) | kernels use its instruction set directly (mma.sync, cp.async, lop3) | no portability |
 | Exact speculative sampling | drafts never change the output distribution | no approximate-acceptance speedup |
 | 4-bit KV cache without rotation | simplest format that makes 262k fit | lossy: [rotation was measured](IDEAS.md#a-rotated-4-bit-kv-cache) and only helps about 2x; the well-formed tool-call rate of a minimal schema fell to 39% as clients send it ([Usage](USAGE.md#tool-calls)) |

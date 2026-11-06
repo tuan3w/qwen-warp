@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--max-num-seqs 2..8`: that many requests decode together in one weight pass per cycle (continuous batching, `server/smk_batch.py`; engine: sequence slots with one in-place DeltaNet state each and a batched speculative cycle, `engine/src/batch.cu`, `engine/batch.py`). 4 concurrent clients on the default profile: 334 tok/s aggregate against 155 for the 0.7.0 FIFO, TTFT p50 0.12 s against 10 s ([Performance](docs/PERFORMANCE.md#6-concurrent-requests---max-num-seqs)). A long prompt prefilling pauses the running streams for ~0.3 s at a time. Per-request sampling, seeds, processors, stops, aborts and prefix reuse. A measured start-up memory model refuses configurations that do not fit and names the largest slot count / length; without `--max-model-len` the longest length per slot that fits is used. `--drafter dflash2` needs `--max-num-seqs 1`. `--max-num-seqs 1` (default) is the previous engine: same speed, same ids.
+- `SMK_BATCH_K=k`: fixed draft depth at every batch size (exact mode: a request's ids do not depend on the other requests).
+- `SMK_DEBUG=1`: a canary after every device buffer of the engine (`smk_engine_canary_check`).
+- Tests in tiers (`tests/run_tier.sh 0|1|2`): `tests/test_batch_sched.py` (tier 0: the scheduler against a deterministic fake engine, 2 s), `tests/test_batch_engine.py` (tier 1: row-count invariance of the row-wise kernels, every batch size x draft depth and a 48-request fuzz against exact solo replays, canaries), `tests/test_server_batch.py` (tier 2: one server start, concurrent clients exactly equal to each alone, processor isolation, abort, join / leave, prefill stall bound, `cached_tokens`).
+
 ## 0.7.0 - 2026-11-06
 
 ### Added
