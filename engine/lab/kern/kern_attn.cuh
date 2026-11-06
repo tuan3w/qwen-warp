@@ -45,7 +45,7 @@ __global__ void __launch_bounds__(256) k_kvfill(uint8_t* kv, int ctx_max, int nc
 // one warp per (query row t, q head h): exact sink rows (keys 0..3), the selected 64-token blocks of the 4-bit region (kvrot::dequant_row, the decoder gains), the exact ring keys
 // (causal), softmax in fp32, un-rotate, gate.  rowm[kvh][blk] bit t = row t attends block blk.
 __global__ void k_ref_attn(const uint8_t* __restrict__ kv, int ctx_max, int pos0, int T, const uint16_t* __restrict__ qbuf, const uint16_t* __restrict__ qproj, const uint8_t* __restrict__ rowm,
-                           int nbt, uint16_t* __restrict__ out, float* __restrict__ dbgml) {
+                           int nbt, uint16_t* __restrict__ out, float* __restrict__ dbgml, const uint8_t* __restrict__ tokm = nullptr, int tokstride = 0) {
   const int lane = threadIdx.x, t = blockIdx.x / NH, h = blockIdx.x % NH, kvh = h / GRP;
   const int ctx = max(pos0 + T - kvrot::RING_W, 0);
   float q[8];
@@ -84,7 +84,8 @@ __global__ void k_ref_attn(const uint8_t* __restrict__ kv, int ctx_max, int pos0
   }
   for (int pos = kvrot::NSINK; pos < ctx; pos++) {
     const int blk = pos >> 6;
-    if (!((rowm[(size_t)kvh * nbt + blk] >> t) & 1)) { pos = ((blk + 1) << 6) - 1; continue; }
+    if (tokm) { if (!tokm[(size_t)kvh * tokstride + pos]) continue; }
+    else if (!((rowm[(size_t)kvh * nbt + blk] >> t) & 1)) { pos = ((blk + 1) << 6) - 1; continue; }
     kvrot::dequant_row(kc + (size_t)pos * (HD / 2), km[pos], lane, kvrot::LOG2_KGAIN, yk);
     kvrot::dequant_row(vc + (size_t)pos * (HD / 2), vm[pos], lane, kvrot::LOG2_VGAIN, yv);
     step(yk, yv);
@@ -130,6 +131,22 @@ static cudaError_t launch_split_i4s(int T, const void* kv, int ctx_max, const in
   return cudaGetLastError();
 }
 
+
+template <int NTG, int NG, int DS, int KS>
+static cudaError_t launch_split_i4t(int T, const void* kv, int ctx_max, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, const uint32_t* lst, int lst_stride, int bps, cudaStream_t st) {
+  constexpr int NTT = NTG * NG;
+  constexpr size_t merge_b = ((size_t)KS * NTT * 8 * 128 + (size_t)KS * NTT * 16) * sizeof(float);
+  constexpr size_t loop_b = ((size_t)NTT * 16 * 64 + (size_t)KS * NG * 2 * DS * NTG * 4 * 32) * sizeof(float);
+  constexpr size_t smem = merge_b > loop_b ? merge_b : loop_b;
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaError_t e = cudaFuncSetAttribute(attn_split_i4t_kernel<NTG, NG, DS, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    if (e != cudaSuccess) return e;
+    attr_set = true;
+  }
+  attn_split_i4t_kernel<NTG, NG, DS, KS><<<dim3(S_MAX, NKV), 32 * DS * KS * NG, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part, lst, lst_stride, 0, bps);
+  return cudaGetLastError();
+}
 struct AttnBufs {
   int ctx_max = 0, nctx = 0, nc = 0;
   size_t kvbytes = 0;
@@ -265,7 +282,86 @@ static Sel make_sel(int T, int nbt, int stride, double f, bool indep, std::mt199
   return s;
 }
 
-static void run_attn(int nctx, const std::vector<int>& Ts, const std::vector<double>& fs, bool full) {
+
+// ---------------------------------------------------------------------------------------------------------------- token-granular gather (--tok)
+// One selection per KV head shared by all rows and the 6 q heads: sorted token list (0..3 = exact sink keys first).  random: aligned groups of g tokens at random; clustered: runs of g at random
+// unaligned starts.  Bytes needed per token and KV head: 128 B code + 4 B meta for K and V = 264 B; sector bytes count the 32 B sectors the 4 B meta words really touch.
+static void run_tok(AttnBufs& A, int T, int p0, uint16_t* qbuf, std::mt19937_64& rng, int nctx, bool full) {
+  const int ctxq = nctx - kvrot::RING_W;
+  const int TS = 16384 + 4 + 16;  // list stride (exactly ntok selected tokens + 4 sink keys)
+  uint32_t* tl = (uint32_t*)dmalloc((size_t)A.nc * NKV * TS * 4);
+  uint8_t* tokmd = (uint8_t*)dmalloc((size_t)NKV * ctxq);
+  const size_t nout = (size_t)T * NH * HD;
+  auto fetch = [&](uint16_t* d) { std::vector<uint16_t> h(nout); CK(cudaStreamSynchronize(g_st)); CK(cudaMemcpy(h.data(), d, nout * 2, cudaMemcpyDeviceToHost)); return h; };
+  const double FIXED_HEAD = 2.0 * kvrot::NSINK * HD * 2 + 2.0 * kvrot::RING_W * HD * 2;
+  const double dense_bytes = NKV * ((double)A.nbt * 2.0 * (64 * 128 + 64 * 4) + FIXED_HEAD) + (double)T * NH * HD * 2;
+  std::vector<int> ntoks = nctx >= 100000 ? std::vector<int>{4096, 8192, 16384} : std::vector<int>{1024, 2048, 4096};
+  if (!full) ntoks.resize(1);
+  const std::vector<int> gs = full ? std::vector<int>{1, 2, 4, 8, 16, 32, 64} : std::vector<int>{1, 4, 16, 64};
+  const int bps = 64;
+  for (int ntok : ntoks) for (int mode = 0; mode < 2; mode++) for (int g : gs) {
+    std::vector<uint8_t> m((size_t)NKV * ctxq, 0);
+    std::vector<uint32_t> lst((size_t)NKV * TS, 0);
+    double bytes_need = 0, bytes_sec = 0;
+    for (int h = 0; h < NKV; h++) {
+      uint8_t* mh = m.data() + (size_t)h * ctxq;
+      int cnt = 0;
+      if (mode == 0) {  // aligned groups, first group start >= 32 (clear of the sink)
+        const int g0 = (32 + g - 1) / g, g1 = ctxq / g;
+        std::vector<int> p; for (int q = g0; q < g1; q++) p.push_back(q);
+        std::shuffle(p.begin(), p.end(), rng);
+        for (int q = 0; q < ntok / g; q++) for (int i = 0; i < g; i++) { mh[p[q] * g + i] = 1; cnt++; }
+      } else {
+        while (cnt < ntok) {
+          const int st = 4 + (int)(rng() % (uint64_t)(ctxq - g - 4));
+          for (int i = 0; i < g && cnt < ntok; i++) if (!mh[st + i]) { mh[st + i] = 1; cnt++; }
+        }
+      }
+      uint32_t* lh = lst.data() + (size_t)h * TS;
+      int n = 0;
+      for (int q = 0; q < 4; q++) lh[1 + n++] = q;
+      for (int q = 4; q < ctxq; q++) if (mh[q]) lh[1 + n++] = q;
+      lh[0] = n;
+      // sectors: K / V rows 128 B each, meta words 4 B -> distinct 32 B sectors
+      std::vector<uint8_t> sec((ctxq + 7) / 8 + 1, 0);
+      for (int q = 0; q < n; q++) sec[lh[1 + q] >> 3] = 1;
+      int nsec = 0; for (auto v : sec) nsec += v;
+      bytes_need += (double)n * 264.0;
+      bytes_sec += (double)n * 256.0 + 2.0 * nsec * 32.0;
+    }
+    for (int c = 0; c < A.nc; c++) CK(cudaMemcpy(tl + (size_t)c * NKV * TS, lst.data(), lst.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(tokmd, m.data(), m.size(), cudaMemcpyHostToDevice));
+    auto run = [&](int c, cudaStream_t st, uint16_t* out) -> cudaError_t {
+      char* w = reinterpret_cast<char*>(A.ws);
+      uint16_t* qb = reinterpret_cast<uint16_t*>(w + WS_Q);
+      float2* ml = reinterpret_cast<float2*>(w + WS_ML);
+      float* part = reinterpret_cast<float*>(w + WS_PART);
+      const uint32_t* l = tl + (size_t)c * NKV * TS;
+      cudaError_t e = T == 1 ? launch_split_i4t<1, 1, 2, 4>(T, A.kv[c], A.ctx_max, A.pos0, qb, ml, part, l, TS, bps, st) : launch_split_i4t<3, 2, 2, 2>(T, A.kv[c], A.ctx_max, A.pos0, qb, ml, part, l, TS, bps, st);
+      if (e != cudaSuccess) return e;
+      attn_reduce_s_kernel<true><<<dim3(GRP * T, NKV), HD, 0, st>>>(T, (const __nv_bfloat16*)A.qproj, 1.f, A.pos0, ml, part, (__nv_bfloat16*)out, A.kv[c], A.ctx_max, qb, l, TS, bps);
+      return cudaGetLastError();
+    };
+    CK(run(0, g_st, A.out_sp));
+    k_ref_attn<<<T * NH, 32, 0, g_st>>>(A.kv[0], A.ctx_max, p0, T, qbuf, A.qproj, A.rowm, A.nbt, A.out_ref, nullptr, tokmd, ctxq);
+    CK(cudaGetLastError());
+    const Err er = compare_bf16(fetch(A.out_sp), fetch(A.out_ref));
+    const double d0 = time_graph([&](int i, cudaStream_t s) { dense_split_reduce(A, T, i % A.nc, s); }, 30);
+    const double ms = time_graph([&](int i, cudaStream_t s) { run(i % A.nc, s, A.out_sp); });
+    const double d1 = time_graph([&](int i, cudaStream_t s) { dense_split_reduce(A, T, i % A.nc, s); }, 30);
+    const double dl = 0.5 * (d0 + d1), dgbs = dense_bytes / dl * 1e-6;
+    const double bn = bytes_need + NKV * FIXED_HEAD + (double)T * NH * HD * 2, bs = bytes_sec + NKV * FIXED_HEAD + (double)T * NH * HD * 2;
+    const double g1 = bn / ms * 1e-6, g2 = bs / ms * 1e-6;
+    printf("  ctx %6d T %d %-9s ntok %5d g %2d | dense %7.1f us (%4.0f GB/s) | gather %7.1f us | GB/s needed %5.0f sector %5.0f | frac of dense GB/s %.2f | speedup %5.2fx (ideal %.1fx) | 16L save %.2f ms | err %.1e\n", nctx, T,
+           mode ? "clustered" : "random", ntok, g, dl * 1e3, dgbs, ms * 1e3, g1, g2, g1 / dgbs, dl / ms, dense_bytes / bn, 16 * (dl - ms), er.max_over_rms);
+    ja.rec("{\"what\":\"tok\",\"ctx\":%d,\"T\":%d,\"mode\":\"%s\",\"ntok\":%d,\"g\":%d,\"dense_us\":%.2f,\"dense_GBps\":%.1f,\"gather_us\":%.2f,\"bytes_needed\":%.0f,\"bytes_sector\":%.0f,\"GBps_needed\":%.1f,\"GBps_sector\":%.1f,"
+           "\"frac_dense_GBps\":%.4f,\"speedup\":%.4f,\"ideal_bytes_ratio\":%.3f,\"saving_16_layers_ms\":%.4f,\"err_max_over_rms\":%.3e}", nctx, T, mode ? "clustered" : "random", ntok, g, dl * 1e3, dgbs, ms * 1e3, bn, bs, g1, g2,
+           g1 / dgbs, dl / ms, dense_bytes / bn, 16 * (dl - ms), er.max_over_rms);
+  }
+  cudaFree(tl); cudaFree(tokmd);
+}
+
+static void run_attn(int nctx, const std::vector<int>& Ts, const std::vector<double>& fs, bool full, bool tokmode = false) {
   AttnBufs A;
   A.nctx = nctx; A.ctx_max = nctx; A.nc = 4;
   A.kvbytes = swiftmk_attn_kv_bytes(A.ctx_max, 2);
@@ -332,6 +428,7 @@ static void run_attn(int nctx, const std::vector<int>& Ts, const std::vector<dou
     ja.rec("{\"what\":\"dense\",\"ctx\":%d,\"T\":%d,\"engine_step_us\":%.2f,\"split_reduce_us\":%.2f,\"bytes\":%.0f,\"GBps\":%.1f}", nctx, T, ms_engine * 1e3, ms_dense * 1e3, dense_bytes, dense_gbs);
 
     if (getenv("KERN_DBG")) attn_debug(A, T, p0, qbuf, h_engine);
+    if (tokmode) { run_tok(A, T, p0, qbuf, rng, nctx, full); continue; }
     // sparse
     struct Case { double f; bool indep; };
     std::vector<Case> cases;
@@ -378,6 +475,7 @@ static void run_attn(int nctx, const std::vector<int>& Ts, const std::vector<dou
   }
   // where does the fixed cost go?  (timing only: dbg bits skip the exact sink path / the exact ring, numerics are then wrong on purpose)
   for (int T : Ts) {
+    if (tokmode) break;
     const int p0 = nctx - T;
     CK(cudaMemcpy(A.pos0, &p0, 4, cudaMemcpyHostToDevice));
     Sel sel = make_sel(T, A.nbt, A.stride, 0.0, false, rng);  // block 0 only
@@ -402,6 +500,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--quick")) g_quick = true;
     else if (!strncmp(argv[i], "--part=", 7)) part = argv[i] + 7;
+    else if (!strcmp(argv[i], "--tok")) part = "tok";
     else if (!strncmp(argv[i], "--out=", 6)) outdir = argv[i] + 6;
     else if (!strncmp(argv[i], "--launches=", 11)) { g_n_launch = atoi(argv[i] + 11); launches_given = true; }
   }
@@ -417,6 +516,9 @@ int main(int argc, char** argv) {
     struct S { const char* n; int kind; };
     const std::vector<S> shapes = full ? std::vector<S>{{"l31_qkv", 0}, {"l31_o", 0}, {"l31_gu", 1}, {"l31_dn", 0}, {"l20_qkvz", 0}} : std::vector<S>{{"l31_qkv", 0}, {"l31_dn", 0}};
     for (const S& s : shapes) run_gemv(s.n, s.kind, full, {1, 8});
+  }
+  if (part == "tok") {
+    for (int ctx : {131072, 32768}) run_attn(ctx, {1, 8}, {}, full, true);
   }
   if (part == "all" || part == "attn") {
     const std::vector<double> fs = full ? std::vector<double>{1.0, 0.5, 0.25, 0.10, 0.0} : std::vector<double>{1.0, 0.25, 0.10, 0.0};

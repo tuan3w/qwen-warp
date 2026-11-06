@@ -7,6 +7,7 @@
 #include "gemv.cu"
 #include "attn.cu"
 #include "attn_sparse.cuh"
+#include "attn_tok.cuh"
 
 #include <algorithm>
 #include <chrono>
