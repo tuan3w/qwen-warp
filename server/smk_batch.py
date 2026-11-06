@@ -10,10 +10,10 @@ Scheduling (one thread owns the GPU; smk_core_client._batch_worker drives it):
   * admission: a free slot whose device lineage holds the longest resumable prefix of the prompt (else the host prefix cache, else a cold start on the least recently used free
     slot, whose lineage is spilled to the host store first: Runner._begin).  The prefill, prefix reuse, snapshots and the exactness of a resumed prefill are the Runner's (smk_runner.py).
   * prefills run one at a time (they share the fast prefill's scratch); after every PREFILL_STALL_ROWS x 64 row-layers of a prefill the running requests decode one sync group (the
-    FastPrefill layer hook), so a long prompt delays the running streams by the time of a ~512-token prefill (about 0.3 s), not by its whole prefill.
+    FastPrefill layer hook), so a long prompt delays the running streams by the time of a ~2048-token prefill (about 1 s) at a time, not by its whole prefill.
   * decode: B = 1 running request uses the single-sequence path of its slot (MTP k = 3 + the prompt-lookup tail: the speed of --max-num-seqs 1); B >= 2 run batched cycles
-    (engine/batch.py) with K_BY_B[B] drafts per sequence (B x (k + 1) <= ROWS = 16 rows per weight pass).  Every request keeps its own sampling parameters, seed, processors and
-    stops.
+    (engine/batch.py) with K_BY_B[B] drafts per sequence (B x (k + 1) <= ROWS = 16 rows per weight pass), at most DECODE_CAP of them per sync group (round robin).  Every request keeps
+    its own sampling parameters, seed, processors and stops.
 """
 import os
 import time
@@ -28,7 +28,12 @@ from smk_runner import GenParams, Runner, Seq, Stats, cache_key
 # drafts per sequence by the number of running requests: the most that fit the ROWS = 16 rows of a weight pass (B x (k + 1) <= 16), measured best for every B (docs/PERFORMANCE.md,
 # section 7)
 K_BY_B = {1: 3, 2: 3, 3: 3, 4: 3, 5: 2, 6: 1, 7: 1, 8: 1}
-PREFILL_STALL_ROWS = 512  # a prefill pauses for one decode group of the running requests every 512 x 64 row-layers (the work of a 512-token prefill)
+# a prefill pauses for one decode group of the running requests every 2048 x 64 row-layers (the work of a 2048-token prefill).  Throughput: a decode group inside a prefill runs
+# without the prefilling sequence (B - 1 sequences, fewer rows per weight pass) while the same group after the prefill runs with it, so fewer interruptions = more tokens per pass.
+PREFILL_STALL_ROWS = 2048
+# at most DECODE_CAP running requests decode in one sync group (round robin over the others, least recently decoded first): B = 5 carries two drafts each (15 rows) while B = 6 would
+# get one (12 rows); the slots beyond it let a new request prefill and stream its first token without queueing.  Exact mode (SMK_BATCH_K) decodes all of them.
+DECODE_CAP = 5
 # Exact mode (tests): SMK_BATCH_K=k decodes EVERY request with batched cycles of k drafts, whatever the batch size (needs max_num_seqs x (k + 1) <= ROWS).  A request's tokens are then a
 # function of the request alone (every cycle runs the same per-sequence kernels, and the row-wise kernels are row-count invariant: tests/test_batch_engine.py part A), so a request
 # decoded next to others equals the same request decoded alone, token for token, greedy and seeded sampling.  Default (unset): the fastest schedule (K_BY_B, the native path at B = 1).
@@ -53,6 +58,7 @@ class Task:
     calls: list = field(default_factory=list)  # the decode calls that produced its tokens, in order (tests replay them alone: an exact oracle, tests/test_batch_engine.py)
     t1: float = 0.0
     finished: bool = False
+    dtick: int = -1  # BatchRunner._tick of the last sync group that decoded it (DECODE_CAP round robin)
 
 
 class BatchRunner(Runner):
@@ -61,6 +67,7 @@ class BatchRunner(Runner):
         self.tasks: list[Task] = []  # decoding requests, in admission order
         self.prefilling = None
         self._rows = 0
+        self._tick = 0  # sync groups so far (decode_step)
         self.batched_cycles = self.single_cycles = 0
         self.exact_k = EXACT_K
         assert self.exact_k is None or (0 <= self.exact_k <= 3 and max_num_seqs * (self.exact_k + 1) <= ROWS), f"SMK_BATCH_K={self.exact_k}: needs max_num_seqs x (k + 1) <= {ROWS}"
@@ -149,13 +156,19 @@ class BatchRunner(Runner):
 
     # ------------------------------------------------------------------------------------------------ decode
     def decode_step(self):
-        """One sync group (`group` cycles) for every running request; tokens go out through each task's emit."""
+        """One sync group (`group` cycles) for the running requests (at most DECODE_CAP of them outside exact mode); tokens go out through each task's emit."""
         for t in [t for t in self.tasks if t.cancelled()]:
             t.st.gen_s = time.time() - t.t1
             self._release(t)
         ts = list(self.tasks)
         if not ts:
             return
+        if self.exact_k is None and len(ts) > DECODE_CAP:  # the DECODE_CAP running requests that decoded least recently, ties in admission order (round robin)
+            pick = set(sorted(ts, key=lambda t: t.dtick)[:DECODE_CAP])
+            ts = [t for t in ts if t in pick]
+        self._tick += 1
+        for t in ts:
+            t.dtick = self._tick
         g = self.group
         if len(ts) == 1 and self.k and self.exact_k is None:
             t = ts[0]
@@ -237,7 +250,7 @@ class BatchRunner(Runner):
                 for _ in self.run(ids, GenParams(max_tokens=2 * (self.group * (8 if self.pld else self.k + 1)) + 2, temperature=0.0)):
                     pass
         self.seq = self.seqs[0]
-        for B in range(1, self.max_num_seqs + 1):
+        for B in range(1, (self.max_num_seqs if self.exact_k is not None else min(self.max_num_seqs, DECODE_CAP)) + 1):
             k = self.kb(B) if B > 1 or self.exact_k is not None or not self.k else self.k  # B = 1 (native path): the transition cycle out of a batched phase drafts the full chain
             for kv0 in range(0, k + 1):
                 for samp in (0, 1):

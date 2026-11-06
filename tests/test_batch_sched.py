@@ -7,8 +7,9 @@ The fake engine's next token is a function of the hash of everything its sequenc
 by the real snapshot / restore code), its KV and MTP-KV caches hold the token ids (spilled to / restored from the host store by the real code).  So a wrong resume point, a wrong
 KV or snapshot restore, a token delivered to the wrong request or a decode call on the wrong slot changes the stream.  Asserted for every request: the delivered tokens are exactly
 the expected stream cut at its own stop / max_tokens (a prefix of it when aborted, and nothing after the abort), each request is admitted in arrival order and finishes, every
-slot is released, the decode calls respect the engine's limits (rows <= 16, verified drafts <= drafted), the running requests decode while a long prompt prefills (stall bound),
-the prompt-lookup proposer gets the true context, and the snapshot buffers and host-store bytes add up (no leak).
+slot is released, the decode calls respect the engine's limits (rows <= 16, verified drafts <= drafted) and the decode cap (at most DECODE_CAP sequences per group outside exact mode,
+no running request skipped by two groups in a row), the running requests decode while a long prompt prefills (stall bound), the prompt-lookup proposer gets the true context, and the
+snapshot buffers and host-store bytes add up (no leak).
   python tests/test_batch_sched.py [--seeds N]
 """
 import argparse
@@ -219,6 +220,7 @@ class FakeBD:
     def cycles(self, seqs, kv0, kd, n):
         B = len(seqs)
         assert len(set(id(s) for s in seqs)) == B and 1 <= B <= 8
+        assert B <= SB.DECODE_CAP or self.world.runner.exact_k is not None, f"{B} sequences decode in one group (cap {SB.DECODE_CAP})"
         assert B * (kv0 + 1) <= SB.ROWS and B * (kd + 1) <= SB.ROWS and 0 <= kv0 <= 3 and 0 <= kd <= 3
         for s in seqs:
             assert kv0 <= s.drafted, f"slot {s.idx}: batched cycle verifies {kv0} drafts, it drafted {s.drafted}"
@@ -252,7 +254,7 @@ class World:
 
 class FakeRunner(SB.BatchRunner):
     def __init__(self, S, world, budget, max_snaps, ctx_max=4096, exact_k=None):
-        self.tasks, self.prefilling, self._rows, self.batched_cycles, self.single_cycles = [], None, 0, 0, 0
+        self.tasks, self.prefilling, self._rows, self._tick, self.batched_cycles, self.single_cycles = [], None, 0, 0, 0, 0
         self.k, self.group, self.max_snaps, self.log = 3, 2, max_snaps, print
         self.pld, self.drafter, self.df, self.df_lo, self.df_hi, self.tap, self.df_lookup, self.df_mib = True, "mtp", False, 0, 0, None, False, 0.0
         self.max_num_seqs, self.bd, self.exact_k, self.vit = S, FakeBD(world), exact_k, None
@@ -288,7 +290,8 @@ def expected(prompt, p, n_new):
         h = H(h, y)
 
 
-def run(seed, S, n_req, budget, max_snaps, verbose=False, exact_k=None):
+def run(seed, S, n_req, budget, max_snaps, verbose=False, exact_k=None, burst=False):
+    """burst: 2..4 arrivals every iteration and long answers, so that more requests run than DECODE_CAP lets decode in one group."""
     world = World(seed)
     rng = world.rng
     r = FakeRunner(S, world, budget, max_snaps, exact_k=exact_k)
@@ -306,7 +309,7 @@ def run(seed, S, n_req, budget, max_snaps, verbose=False, exact_k=None):
         else:
             sysp = rng.choice([None, [R.IM_START] + [5000 + i for i in range(120)]])  # a shared system prompt sometimes
             prompt = (sysp or []) + [R.IM_START] + [rng.randrange(2000, 3000) for _ in range(rng.randint(1, 300))]
-        p = R.GenParams(max_tokens=rng.randint(1, 120), eos=EOS, stop_ids=frozenset([STOP_ID]) if rng.random() < 0.5 else frozenset(),
+        p = R.GenParams(max_tokens=rng.randint(60, 240) if burst else rng.randint(1, 120), eos=EOS, stop_ids=frozenset([STOP_ID]) if rng.random() < 0.5 else frozenset(),
                         temperature=rng.choice([0.0, 0.7]), seed=rng.randrange(1 << 30))
         rec = dict(prompt=prompt, p=p, toks=[], fin=None, done=0, abort_at=None, aborted=False, arrive=it, start=None)
         if rng.random() < 0.15:
@@ -330,14 +333,17 @@ def run(seed, S, n_req, budget, max_snaps, verbose=False, exact_k=None):
         raise ex
 
     while it < 4000:
-        if len(reqs) < n_req and rng.random() < 0.5:
-            for _ in range(rng.randint(1, 3)):
+        if len(reqs) < n_req and (burst or rng.random() < 0.5):
+            for _ in range(rng.randint(2, 4) if burst else rng.randint(1, 3)):
                 if len(reqs) < n_req:
                     new_request()
         for rec in reqs:
             if rec["abort_at"] is not None and it >= rec["abort_at"] and rec["fin"] is None:
                 rec["aborted"] = True
+        COUNT["capped"] += len(r.tasks) > SB.DECODE_CAP
         r.step(waiting, refuse)
+        late = [t.rid for t in r.tasks if r._tick - t.dtick > 1]
+        assert not late, f"seed {seed}: requests {late} were left out of two sync groups in a row (DECODE_CAP round robin)"
         for rec in reqs:
             t = rec["task"]
             if rec["start"] is None and (t.seq is not None or t.finished):
@@ -387,7 +393,7 @@ def run(seed, S, n_req, budget, max_snaps, verbose=False, exact_k=None):
     return src
 
 
-COUNT = dict(batched=0, single=0, stall_max=0)
+COUNT = dict(batched=0, single=0, stall_max=0, capped=0)
 
 
 def main():
@@ -400,10 +406,12 @@ def main():
         S = [2, 3, 4, 8][seed % 4]
         exact_k = [None, None, 1, 0][seed % 4] if seed % 3 == 2 else None  # the exact mode (SMK_BATCH_K) on some seeds: batched cycles at every batch size
         srcs += run(seed, S, n_req=40, budget=[0, 3000, 20000][seed % 3], max_snaps=[4, 8, 16][seed % 3], verbose=seed < 4, exact_k=exact_k)
+    for seed in range(a.seeds, a.seeds + 4):  # bursts on 6 and 8 slots: more running requests than DECODE_CAP (round robin), once in exact mode (no cap)
+        srcs += run(seed, [6, 8][seed % 2], n_req=40, budget=20000, max_snaps=16, exact_k=1 if seed == a.seeds + 3 else None, burst=True)
     for s in ("cold", "device", "host"):
         assert s in srcs, f"no request resumed from {s}: the fuzz does not cover it"
-    assert COUNT["batched"] > 0 and COUNT["single"] > 0, f"coverage: {COUNT}"
-    print(f"PASS: {a.seeds} seeds, {len(srcs)} requests, sources {dict((s, srcs.count(s)) for s in set(srcs))}, cycles {COUNT}")
+    assert COUNT["batched"] > 0 and COUNT["single"] > 0 and COUNT["capped"] > 0, f"coverage: {COUNT}"
+    print(f"PASS: {a.seeds} + 4 burst seeds, {len(srcs)} requests, sources {dict((s, srcs.count(s)) for s in set(srcs))}, cycles and capped groups {COUNT}")
 
 
 if __name__ == "__main__":

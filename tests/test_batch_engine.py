@@ -234,8 +234,9 @@ def part_b(r, prompts):
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- C
-def part_c(r, tk, prompts, long_prompts, n_req, seed=7):
-    """prompts / long_prompts: (ids, images | None) entries.  Returns the request records (task, toks, aborted, ...)."""
+def part_c(r, tk, prompts, long_prompts, n_req, seed=7, burst=False):
+    """prompts / long_prompts: (ids, images | None) entries.  burst: 2..3 arrivals per step and longer answers, so that more requests run than DECODE_CAP decodes per group (the
+    default schedule's round robin).  Returns the request records (task, toks, aborted, ...)."""
     rng = random.Random(seed)
     reqs, waiting, convs = [], deque(), []
     SB.PREFILL_STALL_ROWS = 64  # interleave the (short) prefills with decode groups often
@@ -248,7 +249,7 @@ def part_c(r, tk, prompts, long_prompts, n_req, seed=7):
         else:
             ids, ims = (long_prompts if rng.random() < 0.5 else prompts)[rng.randrange(len(prompts))]
         rec = dict(ids=ids, toks=[], fin=None, aborted=False, abort_at=len(reqs) + rng.randint(1, 6) if rng.random() < 0.12 else None, done=0)
-        p = params(rng, i, rng.randint(2, 48))
+        p = params(rng, i, rng.randint(24, 96) if burst else rng.randint(2, 48))
 
         def emit(t, toks, fin, sr):
             assert not rec["aborted"]
@@ -264,8 +265,8 @@ def part_c(r, tk, prompts, long_prompts, n_req, seed=7):
 
     it, t0, maxB = 0, time.time(), 0
     while len(reqs) < n_req or waiting or r.tasks:
-        if len(reqs) < n_req and rng.random() < 0.45:
-            for _ in range(rng.randint(1, 3)):
+        if len(reqs) < n_req and (burst or rng.random() < 0.45):
+            for _ in range(rng.randint(2, 3) if burst else rng.randint(1, 3)):
                 if len(reqs) < n_req:
                     add()
         for rec in reqs:
@@ -294,6 +295,7 @@ def part_c(r, tk, prompts, long_prompts, n_req, seed=7):
     print(f"C: {len(reqs)} requests ({n_img} with images, {sum(x['aborted'] for x in reqs)} aborted, up to {maxB} running, resumed from {srcs}) in {it} scheduler steps, {dt:.1f} s: "
           "every stream identical to its solo replay", flush=True)
     assert srcs.get("device", 0) + srcs.get("host", 0) > 0, "no prefix-cache hit: the fuzz does not cover resumes"
+    assert not burst or maxB > SB.DECODE_CAP, f"burst: at most {maxB} running, the decode cap ({SB.DECODE_CAP}) never applied"
     return reqs
 
 
@@ -312,6 +314,7 @@ def main():
     part_a(r)
     part_b(r, prompts)
     part_c(r, tk, prompts, long_prompts, a.fuzz)
+    part_c(r, tk, prompts, long_prompts, 24, seed=11, burst=True)
     bad = [int(r.e.lib.smk_engine_canary_check(q.e.h)) for q in r.seqs]
     assert all(b == 0 for b in bad), f"D: canaries overwritten per slot {bad} (-1 = SMK_DEBUG off)"
     print(f"D: canaries intact after every device buffer of the {len(r.seqs)} slots and the batch buffers", flush=True)
