@@ -42,11 +42,11 @@ def parse_args(argv=None):
                    "more often than with the type-first order most clients send (server/tool_schema.py); off = render the schemas exactly as sent")
     g.add_argument("--profile", default="default", choices=["default", "long"], help="long = --kv-cache-dtype int4_per_token_head --host-tables and a default --max-model-len of 196608 (explicit flags win)")
     g.add_argument("--drafter", default="mtp", choices=["mtp", "dflash2"], help="mtp (default): MTP chain + prompt-lookup tail.  dflash2 (experimental): greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter "
-                   "(7 drafts per cycle, W4A16, ~+30..45% decode tok/s on code and math, about equal on prose); sampled requests, requests with logit processors and requests whose drafter window is not on the GPU "
-                   "(resumed from the host prefix cache) use the MTP path.  Needs the drafter checkpoint (--dflash-path), ~1.6 GiB + 20 KiB per context token of GPU memory (practically needs --host-tables; "
-                   "the --profile long length does not fit)")
+                   "(7 drafts per cycle, W4A16 checkpoint): +50% decode tok/s on code, +38% on math, -4% on prose and +34% over 8 chat prompts with bf16 KV (docs/PERFORMANCE.md section 5); an answer that copies a long stretch of "
+                   "its prompt can be slower than with the prompt-lookup tail.  Sampled requests, requests with logit processors and requests whose drafter window is not on the GPU (resumed from the host prefix cache) use the MTP path.  "
+                   "Needs the drafter checkpoint (--dflash-path), ~1.2 GiB + 20 KiB per context token of GPU memory on top of the MTP engine (needs --host-tables for any useful length; the --profile long length does not fit)")
     g.add_argument("--dflash-path", default=None, help="directory of the DFlash2 W4A16 checkpoint (compressed-tensors; model.safetensors) for --drafter dflash2; default $DFLASH_W4 or ~/llm-lab/models/dflash2-w4a16")
-    g.add_argument("--dflash-codebooks", default="device", choices=["device", "host"], help="where the drafter's two 242 MiB candidate-selector codebooks live (host = pinned memory, gathered by row over PCIe: 484 MiB less VRAM)")
+    g.add_argument("--dflash-codebooks", default="host", choices=["device", "host"], help="where the drafter's two 121 MiB candidate-selector codebooks live: host (default) = pinned memory, gathered by row over PCIe (same decode speed, same ids, 244 MiB less VRAM); device = GPU memory")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
                         language_model_only=True, disable_log_stats=True, dtype="bfloat16", max_num_seqs=1, enable_prompt_tokens_details=True)
     args = parser.parse_args(argv)

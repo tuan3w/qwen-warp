@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
-from prefix_store import Chunk, PrefixStore, common_prefix  # noqa: E402
+from prefix_store import Chunk, DfWindow, PrefixStore, common_prefix  # noqa: E402
 
 
 def snap(pos):
@@ -95,6 +95,30 @@ def main():
     check(st.evict_lru(keep=tuple(ents)) is None, "evict_lru with everything protected returns None")
     rel = st.clear()
     check(len(rel) == 2 and st.entries == [] and st.bytes() == 0, "clear returns every snapshot buffer")
+
+    # DFlash2 drafter window carried by an entry: counted in the byte budget, replaced by a longer lineage's window, kept when that has none, freed with the entry
+    class Buf:
+        def __init__(self, n):
+            self.n = n
+
+        def numel(self):
+            return self.n
+
+        def element_size(self):
+            return 2
+
+    st = PrefixStore(budget_bytes=2000)
+    w1 = DfWindow(100, 900, (Buf(200), Buf(200)))  # 800 bytes
+    e, _ = st.add(ids, 1000, chunk(0, 1000, 500), [snap(1000)], w1)
+    check(e.dfw is w1 and st.bytes() == 1300, "an entry's drafter window counts against the byte budget")
+    w2 = DfWindow(300, 1900, (Buf(100), Buf(100)))  # 400 bytes
+    st.extend(e, ids[:2001], 2000, chunk(1000, 1000, 500), [snap(2000)], w2)
+    check(e.dfw is w2 and st.bytes() == 1400, "extend replaces the stored drafter window")
+    st.extend(e, ids[:3001], 3000, chunk(2000, 1000, 500), [snap(3000)])
+    check(e.dfw is w2 and st.bytes() == 1900, "an extension without a window keeps the stored one")
+    e2, _ = st.add([5] * 10, 5, chunk(0, 5, 300), [snap(5)], None)
+    st.fit(0, keep=None)
+    check(st.entries == [e2] and st.bytes() == 300, "evicting the entry frees its window's bytes with its chunks")
     print("ALL PASS")
 
 

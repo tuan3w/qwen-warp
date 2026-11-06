@@ -68,6 +68,8 @@ cudaError_t smk_dflash_launch(smk_dflash* s, int which, int n, cudaStream_t st);
 cudaError_t smk_dflash_read(smk_dflash* s, int what, void* host, size_t bytes);
 size_t smk_dflash_bytes(smk_dflash* s);
 int smk_dflash_ctxd(smk_dflash* s);
+// Device pointer of the drafter's K (which 0) / V (1) cache, bf16 [5][8][ctxd][128]: the host prefix cache copies the rows of the drafter's window with it (server/smk_runner.py).
+void* smk_dflash_kv_ptr(smk_dflash* s, int which);
 
 #ifdef __cplusplus
 }

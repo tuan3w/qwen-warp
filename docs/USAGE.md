@@ -196,6 +196,9 @@ Every stock `vllm serve` frontend flag works (`--host`, `--port`, `--api-key`, `
 | `--host-tables` | off | keep the bf16 embedding and rescoring head (4.7 GiB) in pinned host memory: bit-identical decode, about 0 to 2% slower, about 4.8 GiB more VRAM for the cache |
 | `--prompt-lookup {0,1,auto}` | `auto` | an n-gram draft tail that needs about 0.56 GiB more VRAM (0.67 GiB with `--host-tables`); `auto` turns it on only if the length leaves 256 MiB of the free memory next to it (bf16 KV up to about 23k, fp8 up to 42k, 4-bit up to 68k, any length on 4-bit with `--host-tables`), and the log says what it chose. `1` forces it (refused like any other length that does not fit) |
 | `--num-speculative-tokens {0..3}` | 3 | MTP drafts per step; 0 = plain decode (the prompt-lookup tail needs 3) |
+| `--drafter {mtp,dflash2}` | `mtp` | `dflash2` (experimental): greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter, everything else by the MTP path ([below](#the-dflash2-drafter---drafter-dflash2-experimental)); needs the drafter checkpoint and practically `--host-tables` |
+| `--dflash-path DIR` | `$DFLASH_W4`, else `~/llm-lab/models/dflash2-w4a16` | the W4A16 compressed-tensors DFlash2 checkpoint (`model.safetensors`) for `--drafter dflash2` |
+| `--dflash-codebooks {host,device}` | `host` | the drafter's two 121 MiB selector codebooks in pinned host memory (same speed and ids, 244 MiB less VRAM) or on the GPU |
 | `--sort-tool-schema {on,off}` | `on` | render the keys of every tool's `function.parameters` sorted, which gives well-formed tool calls more often ([tool calls](#tool-calls)) |
 | `--snapshots N` | 16 | multi-turn prefix snapshots (GPU conversation + host cache) |
 | `--prefix-cache-gb G` | 6 | pinned host RAM for the KV rows of other conversations (0 = off) |
@@ -272,6 +275,30 @@ Rules of thumb:
 - A 24 GB desktop card also drives a monitor (about 0.6 GiB); the numbers above were measured that way (589 MiB in use before the server started).
 - Context length trades against VRAM only: it does not change output quality except through the 4-bit cache's own loss ([Quality](PERFORMANCE.md#2-quality-of-the-4-bit-kv-cache)) and the tool-call numbers above.
 - Not measured: cards other than this 3090 with a 0.6 GiB desktop, a headless card, `--num-speculative-tokens` below 3.
+
+## The DFlash2 drafter (`--drafter dflash2`, experimental)
+
+`--drafter dflash2` adds the 5-layer block drafter of `incoai/Qwen3.8-27B-DFlash2` (W4A16) to the engine. `--drafter mtp` (the default) is byte-identical to the previous release. What it does, measured through the server ([Performance, section 5](PERFORMANCE.md#5-dflash2-block-drafter-experimental)):
+
+| Request | Route | Decode tok/s against `--drafter mtp` (bf16 KV) |
+|---|---|---|
+| greedy, no logit processor, drafter window on the GPU | DFlash2 | code +51%, math +38%, 8 chat prompts +34%, 12 pooled chat tasks +7%, prose -4%, **copy-heavy agent turns -31%** |
+| `temperature` > 0, `presence`/`frequency`/`repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids` | MTP path, as before | unchanged |
+| greedy, window not on the GPU (a host-cache restore whose entry does not hold the rows the prompt needs, e.g. a resume at an earlier snapshot or a prompt shorter than the stored lineage) | MTP path | unchanged |
+
+Ids: both routes are exact for their own verify and deterministic, but may resolve a bf16 near-tie differently (8 of 11 benchmark prompts identical; the rest diverge after token 58 to 241). Prefix reuse is unchanged: `cached_tokens` is identical to `--drafter mtp` on the 12k-token and agent-shaped traces, a cold 12k prefill takes 1.3% longer, a cached follow-up turn 3 ms. The host prefix cache carries the drafter's window (40 MiB of pinned memory per entry, counted in `--prefix-cache-gb`).
+
+**Memory.** The drafter takes 1.15 GiB (1.4 GiB with `--dflash-codebooks device`) plus **20 KiB per context token** (absolute positions; no ring buffer yet) on top of the MTP engine with the prompt-lookup ring (the tail is free with it). Measured as the difference to `--drafter mtp` after a request at the full length: +1,872 / +2,352 MiB at 24,576 / 49,152 tokens (bf16, device codebooks), +2,670 MiB at 65,536 with fp8 KV, +3,310 MiB at 98,304 with 4-bit KV. Without `--host-tables` it fits only a few thousand tokens, so the server refuses it with the usual table of lengths (`vram_need_mib`, `server/smk_core_client.py`). Largest `--max-model-len` the model accepts on a card with 23,228 MiB free (all with `--host-tables`, codebooks on the host), each of which started and served a 32,768-token prompt plus 64 tokens on the measuring card (23.7 GiB free, 0.1 GiB desktop):
+
+| KV cache | accepted | in use after the request (measuring card) | one step above (measuring card) |
+|---|---|---|---|
+| bf16 | 61,440 | 23,669 MiB | 66,560 starts, a request fails with HTTP 500 (out of memory) |
+| fp8 | 94,208 | 23,669 MiB | 102,400 still serves (24,045 MiB in use); the Runner measurement ran out of memory at 102,400 and 100,352 was the last that served there |
+| 4-bit | 125,952 | 23,655 MiB | 138,240 serves (24,085 MiB in use); 143,360 ran out of memory |
+
+`--profile long` (196,608 tokens) does not fit with the drafter and is refused with the largest length that does (the ring buffer is not built); the start-up check for `--drafter dflash2` without `--host-tables` or at an absurd length refuses within seconds (`tests/test_startup_configs.py`). Time to ready 29 to 47 s.
+
+**Not done:** a drafter ring buffer (long profile), sampling, an adaptive route for copy-heavy answers, carrying the window to a host-cache resume at an earlier snapshot ([Ideas](IDEAS.md#a-block-drafter-dflash2-style)).
 
 ## Using it from a coding agent
 

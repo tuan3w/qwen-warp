@@ -218,26 +218,43 @@ def part3(a, tok, code, r):
 
 
 def part4(a, tok, code, r, A, B):
-    """Host restore: the drafter cache holds another lineage -> MTP route, ids equal the cold MTP run; the lineage is covered again once the prompt outgrew the gap."""
+    """Host tier: the spilled lineage carries its drafter window, a host restore decodes with the block drafter (rows bit-identical to a cold prefill's) and a request that needs rows the
+    entry does not hold goes to the MTP path (ids equal the cold MTP run)."""
     mk = lambda: R.PrefixStore(int(2.0 * (1 << 30)))  # noqa: E731
     r.store = None
     r.drop_cache()
-    ref_mtp, _ = gen(r, B, 40, route="mtp")  # cold reference of the MTP route
+    ref_df, cst = gen(r, B, 40)  # cold references of both routes
+    lo = max(0, len(B) - W)
+    cold_rows = df_rows(r.e, lo, len(B))
+    cold_tpc = (cst.tokens - 1) / cst.cycles
     r.drop_cache()
     r.store = mk()
     C = chat_prompt(tok, code[::-1][:20000][::-1], 3100, code[:400])
     gen(r, B[: len(B) - 300], 30)  # conversation B on the device
-    gen(r, C, 30)  # another one: B's prefix is spilled to the host tier
+    gen(r, C, 30)  # another one: B's prefix is spilled to the host tier together with its drafter window
+    check(any(e.dfw is not None for e in r.store.entries), f"the spilled entry carries a drafter window ({[(e.dfw.lo, e.dfw.hi) for e in r.store.entries if e.dfw is not None]}, {r.store.bytes() / 2**20:.0f} MiB in the store)")
     got, hst = gen(r, B, 40)
     check(hst.source == "host" and hst.cached > 0, f"B resumes from the host tier at {hst.cached}")
-    check(hst.route == "mtp", "the drafter window is not on the device after a host restore: MTP route")
-    check(got == ref_mtp, "host-restored turn on the MTP route: ids equal the cold MTP run")
-    D = B + got + code[900:1100]
-    _, dst = gen(r, D, 20)
-    check(dst.cached > 0 and dst.route == "mtp", f"the next turn (resumed at {dst.cached} from the {dst.source}) is still short of its window (the host-restored turn captured only rows [{hst.cached}, {len(B)})): MTP route")
-    E = D + code[1300 : 1300 + W + 100]  # grown by more than the window: every row of the window is captured by this prefill
-    _, est = gen(r, E, 20)
-    check(est.route == "dflash2", f"a prompt that grew by more than the window decodes with the block drafter again (resumed at {est.cached})")
+    check(hst.route == "dflash2", "host restore with the carried window: block drafter")
+    check(got == ref_df, "host-restored turn: ids equal the cold dflash2 run")
+    check(torch.equal(df_rows(r.e, lo, len(B)), cold_rows), f"drafter K/V rows [{lo}, {len(B)}) after the host restore are bit-identical to a cold prefill's")
+    tpc = (hst.tokens - 1) / hst.cycles
+    check(tpc >= 0.9 * cold_tpc, f"tokens per cycle after the host restore {tpc:.2f} vs cold {cold_tpc:.2f}")
+    # an earlier resume point needs rows below the stored window: MTP route
+    gen(r, C, 30)  # spill B again (its entry is extended, the window replaced)
+    F = B[:2500] + code[3000:3300]
+    stored = [e.dfw.lo for e in r.store.entries if e.dfw is not None]
+    got_f, fst = gen(r, F, 40)
+    lo_f = max(0, len(F) - W)
+    print(f"F: {len(F)} tokens, resumed at {fst.cached} from the {fst.source}, route {fst.route}, window needed from {lo_f}", flush=True)
+    if fst.source == "host" and fst.cached > lo_f and all(x > lo_f for x in stored):
+        check(fst.route == "mtp", "a host resume whose window starts below the stored rows decodes with the MTP path")
+        r.drop_cache()
+        r.store = mk()
+        ref_f, _ = gen(r, F, 40, route="mtp")
+        check(got_f == ref_f, "... and its ids equal the cold MTP run")
+    else:
+        print("SKIP  no host resume below the stored window in this configuration", flush=True)
     r.store = None
 
 

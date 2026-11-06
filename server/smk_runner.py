@@ -19,6 +19,7 @@ Prefix reuse (DeltaNet state cannot be rewound, so the state is checkpointed ins
     pinned host store (budget `prefix_cache_gb`); a later request that continues a stored conversation RESTORES it (KV rows, then the snapshot) and prefills only the new tokens.  Same exactness.
 """
 import ctypes as C
+import os
 import random
 import sys
 import time
@@ -33,7 +34,7 @@ sys.path.insert(0, str(ENGINE))
 from spec import SpecEngine, make_pld, smk  # noqa: E402
 from prefill import FastPrefill  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prefix_store import Chunk, PrefixStore  # noqa: E402
+from prefix_store import Chunk, DfWindow, PrefixStore  # noqa: E402
 
 IM_START = 248045  # <|im_start|>
 MAX_TOP_K = 64  # the engine's sampler keeps at most the 64 highest logits (top_k > 64 is rejected by the server; top_k <= 0 = no top-k filter = these 64)
@@ -94,7 +95,7 @@ class Stats:
 
 class Runner:
     def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True,
-                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False):
+                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object.
         drafter: "mtp" (default) or "dflash2": greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter (engine/dflash.py: 7 drafts per cycle, verify T = 8) when
         its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there."""
@@ -107,12 +108,15 @@ class Runner:
         self.df = drafter == "dflash2"
         self.df_lo = self.df_hi = 0  # drafter K/V rows [df_lo, df_hi) of the device lineage's prompt are valid (see _df_note); empty when equal
         self.tap = None
+        self.df_lookup = bool(dflash_lookup)  # the drafter's device n-gram lookup over the token history (SMK_DF_LOOKUP): the prompt is uploaded to its history at every dflash2 request
         self.df_mib = 0.0  # device memory of the drafter (weights, caches, ring, graphs of the first request not included), measured at construction
         t0 = time.time()
         try:
             if self.df:
                 from dflash import DF_PATH, DflashEngine, TapCapture
 
+                if self.df_lookup:
+                    os.environ["SMK_DF_LOOKUP"] = "1"  # read once by smk_dflash_create
                 self.e = DflashEngine(dflash_path=dflash_path or DF_PATH, codebooks_host=dflash_codebooks_host, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables, lm_head_host=True)
                 self.tap = TapCapture(self.e, self.DF_WINDOW)
                 self.df_mib = self.e.df_mib + self.tap.nbytes / 2**20  # drafter weights + K/V cache + scratch + the tap staging buffers
@@ -258,23 +262,29 @@ class Runner:
         start = ent.n_kv if ent is not None else 0
         m = s_max - start
         e = self.e
-        chunk = None
+        chunk = dfw = None
         if m > 0:
             main, mtp = e.kv_chunk_new(m), e.mtp_chunk_new(m)
             nb = main.numel() + mtp.numel()
-            if nb > store.budget:  # can never fit: do not keep a lineage the budget cannot hold
+            dnb = 0
+            if self.df and self.df_hi > self.df_lo and min(self.df_hi, s_max) > self.df_lo:  # the drafter rows of this lineage (a resume at <= s_max needs the rows below it)
+                dfw = DfWindow(self.df_lo, min(self.df_hi, s_max), None)
+                dnb = 5 * 8 * (dfw.hi - dfw.lo) * 128 * 2 * 2
+            if nb + dnb > store.budget:  # can never fit: do not keep a lineage the budget cannot hold
                 self._free_snaps([])
                 return time.time() - t0
-            self.pool += store.fit(nb, keep=(keep, ent))
+            self.pool += store.fit(nb + dnb, keep=(keep, ent))
             e.kv_chunk_copy(main, m, start, 0, m, True)
             e.mtp_chunk_copy(mtp, m, start, 0, m, True)
+            if dfw is not None:
+                dfw.kv = e.df_window_save(dfw.lo, dfw.hi)
             torch.cuda.synchronize()
             chunk = Chunk(start, m, main, mtp, nb)
         moved, self.snaps = self.snaps, []  # the snapshot buffers now belong to the entry
         if ent is None:
-            _, rel = store.add(ids, s_max, chunk, moved)
+            _, rel = store.add(ids, s_max, chunk, moved, dfw)
         else:
-            rel = store.extend(ent, ids, s_max, chunk, moved)
+            rel = store.extend(ent, ids, s_max, chunk, moved, dfw)
         self.pool += rel
         return time.time() - t0
 
@@ -495,12 +505,18 @@ class Runner:
             st.spill_s = self._spill_device(keep=ent)
             self._load_entry(ent, snap, ids)
             st.restore_s = time.time() - tr - st.spill_s
-            self.df_lo = self.df_hi = 0  # the drafter cache holds another lineage's rows
+            self.df_lo = self.df_hi = 0  # the drafter cache holds another lineage's rows ...
+            if self.df and ent.dfw is not None:  # ... unless the entry carries the window of the conversation it holds
+                e.df_window_load(ent.dfw.lo, ent.dfw.kv)
+                self.df_lo, self.df_hi = ent.dfw.lo, ent.dfw.hi
+                self._df_cut(snap.pos)
             q = snap.pos
             st.source = "host"
         st.cached = q
         use_df = self.df and route != "mtp" and p.temperature <= 0 and not procs and self._df_covered(len(ids), q)
         st.route = "dflash2" if use_df else "mtp"
+        if use_df and self.df_lookup:
+            e.df_set_hist(ids)
         if not self._prefill(ids, q, ends, folded, cancelled, use_df):
             return
         if use_df:

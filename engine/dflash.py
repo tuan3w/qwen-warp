@@ -52,6 +52,8 @@ def setup_df_api(lib):
     lib.smk_dflash_bytes.restype = C.c_size_t
     lib.smk_dflash_ctxd.argtypes = [vp]
     lib.smk_dflash_ctxd.restype = ci
+    lib.smk_dflash_kv_ptr.argtypes = [vp, ci]
+    lib.smk_dflash_kv_ptr.restype = vp
 
 
 class DfPack:
@@ -170,6 +172,8 @@ class DflashEngine(SpecEngine):
         t0 = time.time()
         self.P = load_dflash(dflash_path, codebooks_host=codebooks_host, verbose=kw.get("verbose", True))
         self.dfw = make_dfw(self.P, mask_id, rescore_r)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # the weight repack leaves idle blocks in torch's pool: smk_dflash_create's cudaMallocs (K/V cache, 20 KiB per position) must see that memory
         self.df = self.lib.smk_dflash_create(self.h, C.byref(self.dfw))
         if not self.df:
             raise RuntimeError("smk_dflash_create failed (out of device memory, or the engine has no int4 head / tmax != 8)")
@@ -253,9 +257,34 @@ class DflashEngine(SpecEngine):
         """Append the tap of the last prompt row (dbg row 0 of the head=1 step / folded head) as drafter context and draft d1..d7: the DFlash2 counterpart of smk_spec_start."""
         smk.check(self.lib.smk_dflash_start(self.df, self.st), "dflash_start")
 
+    def df_set_hist(self, ids):
+        """Token history by position for the device n-gram lookup (SMK_DF_LOOKUP=1): the prompt ids, before df_start."""
+        buf = (C.c_int * len(ids))(*ids)
+        smk.check(self.lib.smk_dflash_set_hist(self.df, buf, len(ids), self.st), "dflash_set_hist")
+
     def df_append(self, T, pos0):
         """Append dbg rows 0..T-1 (T <= 8: taps of prompt rows pos0 .. pos0 + T - 1) as drafter context (no drafting)."""
         smk.check(self.lib.smk_dflash_prefill_chunk(self.df, T, pos0, self.st), "dflash_prefill_chunk")
+
+    def df_kv(self, which):
+        """The drafter's device K (which 0) / V (1) cache as a bf16 tensor [5 layers][8 kv heads][ctxd positions][128]."""
+        from prefill import _view
+
+        return _view(self.lib.smk_dflash_kv_ptr(self.df, which), 5 * 8 * self.ctxd * 128 * 2, torch.bfloat16).view(5, 8, self.ctxd, 128)
+
+    def df_window_save(self, lo, hi):
+        """Drafter K and V rows [lo, hi) -> pinned host tensors [5][8][hi - lo][128] (stream ordered: synchronise before reading them)."""
+        out = []
+        for w in (0, 1):
+            t = torch.empty(5, 8, hi - lo, 128, dtype=torch.bfloat16, pin_memory=True)
+            t.copy_(self.df_kv(w)[:, :, lo:hi], non_blocking=True)
+            out.append(t)
+        return tuple(out)
+
+    def df_window_load(self, lo, kv):
+        """The inverse of df_window_save: write the rows back at positions lo.. (stream ordered)."""
+        for w, t in zip((0, 1), kv):
+            self.df_kv(w)[:, :, lo : lo + t.shape[2]].copy_(t, non_blocking=True)
 
     def df_state(self):
         """The drafter's device state ints (ss[12] = tokens emitted, ss[13] = cycles, ss[16 + m] = cycles with m accepted drafts); counters run on across requests that resume a cached lineage."""

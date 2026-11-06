@@ -78,7 +78,7 @@ def to_gen_params(sp) -> GenParams:
                      allowed_token_ids=tuple(dict.fromkeys(sp.allowed_token_ids)) if sp.allowed_token_ids else None)
 
 
-OPTIONS = dict(stream_cycles=2, snapshots=16, prefix_cache_gb=6.0, system_checkpoint=True, prompt_lookup="auto", host_tables=False, sort_tool_schema=True, drafter="mtp", dflash_path=None, dflash_codebooks="device")
+OPTIONS = dict(stream_cycles=2, snapshots=16, prefix_cache_gb=6.0, system_checkpoint=True, prompt_lookup="auto", host_tables=False, sort_tool_schema=True, drafter="mtp", dflash_path=None, dflash_codebooks="host")
 KV_DTYPES = {"auto": 0, "bfloat16": 0, "fp8": 1, "fp8_e4m3": 1, "int4_per_token_head": 2}  # engine kv dtype: 0 bf16, 1 fp8 (checkpoint scales), 2 int4 (per token+head, asymmetric, fp16 scale+min)
 KV_NAMES = ("bf16", "fp8", "int4")
 

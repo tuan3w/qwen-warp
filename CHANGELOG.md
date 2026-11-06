@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--drafter dflash2` (experimental, default `mtp`, which is byte-identical to 0.6.0): the server decodes greedy requests without logit processors with the in-engine DFlash2 block drafter ([Usage](docs/USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental), [Architecture](docs/ARCHITECTURE.md#in-the-server---drafter-dflash2)). The fast prefill captures the drafter's context window from the residual stream of target layers 6/20/34/48/62 (`FastPrefill.tap`, read-only; `dflash.TapCapture`), so prompts are prefilled once, layer-major, as before: +1.3% on a cold 12k-token prefill, +3 ms on a cached follow-up turn, `cached_tokens` unchanged. A router sends sampled requests, requests with logit processors and requests whose drafter window is not on the GPU to the MTP path. Through the server (bf16 KV, `--host-tables`, same-session, stop at the end token): code 276.7 against 183.9 tok/s (+51%), math 254.0 against 183.9 (+38%), prose 113.4 against 118.0 (-4%), +34% over the 8 chat prompts of `bench_common`, +7% over 12 pooled chat tasks; **31% slower on copy-heavy agent turns** where the prompt-lookup tail copies (230 against 334 tok/s); 4-bit KV: +50% / +10% / +42%. [Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental).
+- `--dflash-path`, `--dflash-codebooks {host,device}` (host: the two 121 MiB selector codebooks in pinned memory, same speed and ids, 244 MiB less VRAM); memory model terms for the drafter (+1.15 GiB with host codebooks, +20 KiB per context token, measured) and a start-up refusal that names the largest `--max-model-len` per cache layout. `--drafter dflash2` practically needs `--host-tables`; `--profile long` does not fit (no ring buffer for the drafter's KV cache yet).
+- The host prefix cache carries the drafter window of a spilled lineage (`DfWindow`, 40 MiB of pinned memory per entry), so a host restore keeps decoding with the block drafter; `smk_dflash_kv_ptr` exposes the drafter's K/V cache.
+- `tests/test_dflash_server.py` (tap capture is read-only, ids equal the host-driven T = 8 decode after the same fast prefill, drafter K/V rows against `df_prefill`, window bookkeeping across device resumes, a sampled turn in between and host restores), `tests/test_prefix_store.py` and `tests/test_startup_configs.py` cover the new paths.
+
 ## 0.6.0 - 2026-11-06
 
 ### Added
