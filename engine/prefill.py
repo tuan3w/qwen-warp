@@ -29,6 +29,7 @@ from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 H, I = pack.H, pack.I
 EPS = 1e-6
+TAP_LI = {6: 0, 20: 1, 34: 2, 48: 3, 62: 4}  # target layers whose INPUT residual is a DFlash2 drafter tap (the residual after layers 5, 19, 33, 47, 61) -> index in the tap staging buffer
 
 
 class _Buf:
@@ -78,6 +79,7 @@ class FastPrefill:
         self._small = False
         self._fold = False
         self.taps = False  # test hook: write the last row's per-layer residual into the engine debug taps (a folded head has no step that does)
+        self.tap = None  # DFlash2 drafter context capture (dflash.TapCapture): reads the residual entering the tap layers of every segment / group; never writes the prefill's own buffers
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
         self.ds = _view(lib.smkp_engine_ptr(e, 0), 20 * 4, torch.int32)  # engine_impl.h DS_N = 20 (DS_PEND = 19: pending lazy DeltaNet rows)
@@ -294,6 +296,10 @@ class FastPrefill:
             self._tap(0, a["h"][T - 1])
         for li, L in enumerate(e.Ls):
             self._norm(a["h"], None if li == 0 else a["dn"], L.ln1, a["xn"], T)
+            if self.tap is not None and li in TAP_LI:
+                self.tap.take(TAP_LI[li], a["h"][:T], pos0)
+                if head:
+                    self.tap.take_last(TAP_LI[li], a["h"][T - 1])
             if head and self.taps and li:
                 self._tap(li, a["h"][T - 1])
             if L.kind == "linear":
@@ -346,6 +352,9 @@ class FastPrefill:
         for li, L in enumerate(e.Ls):
             for av, T in zip(views, Ts):
                 self._norm(av["h"], None if li == 0 else av["dn"], L.ln1, av["xn"], T)
+            if self.tap is not None and li in TAP_LI:
+                for av, T, pos0 in zip(views, Ts, poss):
+                    self.tap.take(TAP_LI[li], av["h"], pos0)
             W = self._deq(L.qkvz, a["W2"]) if big else None  # one dequant of the qkv(z) weights for every segment of the group
             for av, T, pos0 in zip(views, Ts, poss):
                 if L.kind == "linear":

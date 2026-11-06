@@ -39,16 +39,29 @@ class Chunk:
 
 
 @dataclass(eq=False)  # identity comparison: the fields hold arrays / tensors, whose == is not a bool
+class DfWindow:
+    """DFlash2 drafter K/V rows [lo, hi) of the lineage (pinned host tensors [5][8][hi - lo][128], K and V): what a resume needs to keep decoding with the block drafter (smk_runner.py)."""
+    lo: int
+    hi: int
+    kv: tuple
+
+    @property
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in self.kv)
+
+
+@dataclass(eq=False)  # identity comparison: the fields hold arrays / tensors, whose == is not a bool
 class Entry:
     ids: np.ndarray
     n_kv: int
     chunks: list = field(default_factory=list)
     snaps: list = field(default_factory=list)
     tick: int = 0
+    dfw: object = None  # DfWindow of a dflash2 Runner's lineage (None: the drafter rows are not carried, a resume decodes with the MTP path)
 
     @property
     def kv_bytes(self):
-        return sum(c.nbytes for c in self.chunks)
+        return sum(c.nbytes for c in self.chunks) + (self.dfw.nbytes if self.dfw is not None else 0)
 
 
 class PrefixStore:
@@ -86,15 +99,15 @@ class PrefixStore:
         return None
 
     # ---------------------------------------------------------------- updates; every method returns the snapshot buffers it released (the caller pools them)
-    def add(self, ids, n_kv, chunk, snaps):
+    def add(self, ids, n_kv, chunk, snaps, dfw=None):
         """New entry; returns released snaps (none)."""
-        e = Entry(ids=np.asarray(ids[: n_kv + 1], dtype=np.int32).copy(), n_kv=n_kv, chunks=[chunk] if chunk is not None else [], snaps=list(snaps))
+        e = Entry(ids=np.asarray(ids[: n_kv + 1], dtype=np.int32).copy(), n_kv=n_kv, chunks=[chunk] if chunk is not None else [], snaps=list(snaps), dfw=dfw)
         self.entries.append(e)
         self.touch(e)
         return e, self._cap_snaps(e)
 
-    def extend(self, e, ids, n_kv, chunk, snaps):
-        """Append the rows of a longer lineage of the same conversation; its snapshots replace same-position ones.  Returns released snaps."""
+    def extend(self, e, ids, n_kv, chunk, snaps, dfw=None):
+        """Append the rows of a longer lineage of the same conversation; its snapshots replace same-position ones (and its drafter window replaces the stored one).  Returns released snaps."""
         assert chunk is None or chunk.a == e.n_kv, "chunk must start where the entry ends"
         released = []
         new_pos = {s.pos for s in snaps}
@@ -104,6 +117,8 @@ class PrefixStore:
         if chunk is not None:
             e.chunks.append(chunk)
         e.ids = np.asarray(ids[: n_kv + 1], dtype=np.int32).copy()
+        if dfw is not None:
+            e.dfw = dfw
         e.n_kv = n_kv
         self.touch(e)
         return released + self._cap_snaps(e)

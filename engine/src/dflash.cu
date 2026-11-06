@@ -678,5 +678,6 @@ cudaError_t smk_dflash_read(smk_dflash* s, int what, void* host, size_t bytes) {
 
 size_t smk_dflash_bytes(smk_dflash* s) { return s->bytes; }
 int smk_dflash_ctxd(smk_dflash* s) { return s->ctxd; }
+void* smk_dflash_kv_ptr(smk_dflash* s, int which) { return which == 0 ? (void*)s->kc : which == 1 ? (void*)s->vc : nullptr; }
 
 }  // extern "C"

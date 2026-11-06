@@ -7,6 +7,7 @@ default ~/models/swift-1.5-int4); starts and stops its own servers, one after th
 For each configuration: start serve.py, wait for /health, send a short chat request, then a /v1/completions request with a prompt of (--max-model-len - 64) tokens and 64 generated tokens,
 and report the time to ready and the GPU memory in use afterwards.  --max-model-len defaults come from serve.py, so a default that no longer fits fails here.
   no flags | --prompt-lookup 0 | --kv-cache-dtype fp8 | --profile long | --profile long --max-model-len 262144 --prompt-lookup 0 | bf16 KV at the longest length a 24 GB card takes
+  --drafter dflash2 --host-tables (default length, and the longest length that fits) when the drafter checkpoint is present; --drafter dflash2 without --host-tables, with --profile long and at 98,304 tokens must be refused
 Beyond the memory there must be a fast, actionable refusal: two configurations that need more than the card has must exit non-zero within 60 s (not hang, not die with a raw CUDA OOM
 after loading the weights) and the message must give the free memory and the largest --max-model-len per cache layout.
 A prompt of ~200k tokens takes 3 minutes to prefill: without --full the long profiles get a 32,768-token prompt (their KV cache is allocated up front and the request-time scratch does not
@@ -28,6 +29,8 @@ import serve  # noqa: E402  (only the default constants; no CUDA, no vLLM import
 EDGE_BF16 = 32768  # bf16 KV without the tail: measured to start and serve up to 34,816 on a 24 GB card with a 0.6 GiB desktop
 JUST_ABOVE = 36864  # first length above that edge that fails (35,840 does not serve)
 ABSURD = 131072  # bf16 KV: 29 GB of cache alone
+EDGE_DF = 53248  # --drafter dflash2 --host-tables, bf16 KV: starts and serves (smk_core_client.vram_need_mib: 22.7 GB of the 23.2 GB free; memfit.py: 21.2 GB used at 49,152 tokens)
+ABSURD_DF = 98304  # --drafter dflash2 --host-tables, bf16 KV: 17.9 GB + 8.8 GB
 QUICK_PROMPT = 32768
 
 
@@ -99,7 +102,7 @@ def serves(t, name, flags, limit, prompt_len, port):
         stop(srv)
 
 
-def refuses(t, name, flags, port, hint):
+def refuses(t, name, flags, port, hint, pl=True):
     import httpx
 
     log = f"/tmp/swift_mk_startup_{port}.log"
@@ -111,7 +114,7 @@ def refuses(t, name, flags, port, hint):
         dt = time.time() - t0
         text = Path(log).read_text()
         t.check(f"{name}: exits with an error within 60 s", srv.poll() not in (None, 0), f"exit {srv.poll()} after {dt:.1f} s")
-        t.check(f"{name}: message names the free memory and the largest lengths", "MiB are free" in text and "Largest --max-model-len" in text and "--prompt-lookup 0" in text and hint in text,
+        t.check(f"{name}: message names the free memory and the largest lengths", "MiB are free" in text and "Largest --max-model-len" in text and (not pl or "--prompt-lookup 0" in text) and hint in text,
                 "; ".join(text.strip().splitlines()[-3:])[:400])
         try:
             httpx.get(f"http://127.0.0.1:{port}/health", timeout=1)
@@ -139,6 +142,13 @@ def main():
     serves(t, "--profile long", ["--profile", "long"], serve.LONG_MAX_MODEL_LEN, cap(serve.LONG_MAX_MODEL_LEN - 64), a.port)
     serves(t, "--profile long --max-model-len 262144 --prompt-lookup 0", ["--profile", "long", "--max-model-len", "262144", "--prompt-lookup", "0"], 262144, cap(262144 - 64), a.port)
     serves(t, f"bf16 --max-model-len {EDGE_BF16:,} --prompt-lookup 0", ["--max-model-len", str(EDGE_BF16), "--prompt-lookup", "0"], EDGE_BF16, EDGE_BF16 - 64, a.port)
+    # --drafter dflash2 (experimental; needs the drafter checkpoint $DFLASH_W4): the drafter's K/V cache is 20 KiB per token on top of the engine, so it practically needs --host-tables
+    if Path(os.environ.get("DFLASH_W4", os.path.expanduser("~/llm-lab/models/dflash2-w4a16"))).is_dir():
+        serves(t, "--drafter dflash2 --host-tables", ["--drafter", "dflash2", "--host-tables"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port)
+        serves(t, f"--drafter dflash2 --host-tables --max-model-len {EDGE_DF:,}", ["--drafter", "dflash2", "--host-tables", "--max-model-len", str(EDGE_DF)], EDGE_DF, cap(EDGE_DF - 64), a.port)
+        refuses(t, "--drafter dflash2 (default length, no --host-tables)", ["--drafter", "dflash2"], a.port, "--drafter dflash2", pl=False)
+        refuses(t, "--drafter dflash2 --profile long (196,608 tokens need a ring buffer for the drafter's cache)", ["--drafter", "dflash2", "--profile", "long"], a.port, "--drafter dflash2", pl=False)
+        refuses(t, f"--drafter dflash2 --host-tables --max-model-len {ABSURD_DF:,}", ["--drafter", "dflash2", "--host-tables", "--max-model-len", str(ABSURD_DF)], a.port, "--drafter dflash2", pl=False)
     refuses(t, f"--max-model-len {ABSURD:,}", ["--max-model-len", str(ABSURD)], a.port, "--profile long")
     if 450 <= used <= 900:  # the edge is defined for the 0.6 GiB desktop
         refuses(t, f"--max-model-len {JUST_ABOVE:,} --prompt-lookup 0", ["--max-model-len", str(JUST_ABOVE), "--prompt-lookup", "0"], a.port, "--profile long")

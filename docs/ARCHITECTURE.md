@@ -97,9 +97,23 @@ One CUDA graph per cycle, no host work between cycles: the host launches n graph
 | head + selector | quantised lm_head over rows 1..7 + exact bf16 rescoring of the top-R (R = 32), top-16 per row in `torch.topk(sorted=False)` order, selector hidden projection, the greedy path `score = unary + <pred_codebook[pred] * hproj, succ_codebook[cand]>` over 7 sequential positions (one kernel) -> `ds[TOK + 1 ..]` |
 
 Weights: the W4A16 compressed-tensors checkpoint (pack-quantized, group 128; fp16 scales are rounded to bf16 because the engine kernels take bf16) is repacked with `pack.repack_w4`; every GEMM is `smk_w4r_gemv`.
-Device memory: 1.19 GiB of W4 weights + 0.25 GiB selector codebooks (device; pinned host memory works too: `codebooks_host=True`) + 20 KiB per context position of drafter KV (`ctx_max` 2048: 42 MiB).
-Limits: needs `tmax = 8` and the int4 head; greedy only (no sampling, no logit processors); `DflashEngine` keeps the bf16 lm_head table on the device when the free VRAM covers the rest of the engine (2.5 GiB, about 0.15 GiB spare at a 31k context on bf16 KV; it falls back to the pinned host table, and `Engine` keeps that default for the server); an optional device n-gram lookup over the token history (`SMK_DF_LOOKUP=1`) is off by default; the drafter KV is indexed by absolute position, so long contexts pay 20 KiB/token although the window is 2048 (a ring would cap it at 42 MiB); prefill appends the drafter context in 8-row engine steps (the layer-major fast prefill does not feed it yet); not wired into the server.
-`tests/test_dflash.py` checks the ids against the T = 8 greedy decode.
+Device memory (measured on the server's Runner, [Usage](USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental)): the drafter takes 1.4 GiB (1.15 GiB with `codebooks_host=True`: the two 121 MiB selector codebooks stay in pinned host memory) on top of the engine with the 9-slot ring, plus 20 KiB per context position of drafter KV; the W4 weights are 1.0 GiB, the rest is the output ring and log, the selector scratch, the tap staging buffers of the fast prefill (105 MiB) and the captured graphs of both draft routes.
+Limits: needs `tmax = 8` and the int4 head; greedy only (no sampling, no logit processors); `DflashEngine` keeps the bf16 lm_head table on the device when the free VRAM covers the rest of the engine (2.5 GiB, about 0.15 GiB spare at a 31k context on bf16 KV; it falls back to the pinned host table; the server's `Runner` passes `lm_head_host=True` so that its memory model holds); an optional device n-gram lookup over the token history (`SMK_DF_LOOKUP=1`) is off by default; the drafter KV is indexed by absolute position, so long contexts pay 20 KiB/token although the window is 2048 (a ring would cap it at 42 MiB; not built: `--profile long` does not fit with the drafter).
+`tests/test_dflash.py` checks the ids against the T = 8 greedy decode; `tests/test_dflash_server.py` does the same for the server's path (fast prefill, tap capture, router).
+
+### In the server (`--drafter dflash2`)
+
+The drafter's K/V rows at position p are a function of the target's residual stream at the five tap layers **of row p alone** (`fc` and the K/V projections have no mixing across rows), so any row can be rebuilt from the taps without the
+target's KV cache. The fast prefill is layer-major, and the residual entering layer l is the engine's debug tap slot l, so `FastPrefill.tap` (read-only: nothing it writes is touched) copies, after the ln1 norm of layers 6, 20, 34, 48 and 62,
+the rows of the drafter's window (the last 2,047 prompt rows, minus what a resume skips) into a 105 MiB staging buffer; `dflash.TapCapture.flush` then appends them in 8-row chunks through the same `smk_dflash_prefill_chunk` the engine-direct
+prefill uses (no kernel change). The folded last row of a short final segment gets its taps from the batch (`take_last`), segments of fewer than `min_fast` rows run as 4-row engine steps that leave the taps in place already.
+Cost: 1.3% on the cold prefill of a 12k-token prompt and 3 ms on a cached follow-up turn ([Performance](PERFORMANCE.md#5-dflash2-block-drafter-experimental)).
+
+`Runner.run` routes a request to the block drafter iff `drafter == dflash2`, `temperature` is 0, no logit processor is active (`GenParams.procs()` is `None`) **and the drafter window is on the device**; everything else runs the MTP path exactly
+as before (`--drafter mtp` is byte-identical to the previous release). The Runner tracks the valid interval `[df_lo, df_hi)` of the drafter rows of the device lineage's prompt: every prefill captures its window whatever route decodes the request
+(so a sampled turn in the middle of a conversation does not break the next greedy turn), a device resume keeps the rows below its resume position, a cold prefill or a **host-tier restore** invalidates them (the drafter cache then holds another
+conversation's rows, and nothing carries the window of a spilled lineage). A request whose window is not covered after the prefill is decoded by the MTP path; the output is never wrong either way (the greedy accept is an argmax equality of the T = 8
+verify, the drafter only changes how many tokens a cycle commits). MTP-layer KV is still computed by the fast prefill for every request, so a later sampled turn on the same lineage reads it.
 
 ## The 4-bit KV cache
 

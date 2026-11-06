@@ -17,7 +17,7 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | How fast is decode? | 94 to 133 tok/s from 32k to 262k tokens (4-bit cache); 105 to 181 tok/s on short prompts | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | long context: decode is 1.2x to 1.3x faster than its `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than its `mtp-huge` at 32k to 190k; short prompts: 1.2x to 1.3x faster than its MTP presets but slower than its DFlash2 preset (about 1.5x on code, earlier session); DFlash2 was not measured at long context; prefill within about 10% | same day, same card, prompts and client for the MTP presets; one pinned build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
-| How fast is the experimental DFlash2 drafter? | engine-direct, short prompts: 276 / 112 / 261 tok/s on code / prose / math (MTP k=3 in the same engine 185 / 119 / 184); level with HyperQwen's DFlash2 in the same session (254 / 103 / 226) after a server-overhead correction of the engine-direct numbers; greedy only, not in the server | interleaved rounds, same session | [5](#5-dflash2-block-drafter-experimental) |
+| How fast is the experimental DFlash2 drafter? | through the server (`--drafter dflash2`, bf16 KV, 2 interleaved visits per arm, stop at the end token): 276.7 / 113.4 / 254.0 tok/s on code / prose / math against 183.9 / 118.0 / 183.9 for MTP k=3 + tail (+51% / -4% / +38%), +34% on 8 chat prompts, +7% on 12 pooled chat tasks, **-31% on copy-heavy agent turns** (230 against 334 tok/s); cold prefill +1.3%, `cached_tokens` identical; engine-direct 276 / 112 / 261, level with HyperQwen's DFlash2 in an earlier session (254 / 103 / 226); greedy only | interleaved visits, same session | [5](#5-dflash2-block-drafter-experimental) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
 ## 1. Memory: how much context fits
@@ -224,7 +224,7 @@ Caveats, all of which matter:
 
 ## 5. DFlash2 block drafter (experimental)
 
-`engine/dflash.py` runs the 7-token block drafter of `incoai/Qwen3.8-27B-DFlash2` (W4A16, 1.19 GiB) inside the engine ([Architecture](ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)). Greedy, `Engine(tmax=8)`, bf16 KV, not wired into the server. Everything below was measured on 2026-11-06 on this card at 350 W with no desktop load beyond the usual 0.6 GiB, 385 new tokens per prompt (256 for the sets of 8 and 48), decode tokens/s after the first token. The server and HyperQwen arms are HTTP; the engine arms call the engine directly (a host sync every 8 cycles), so they carry no HTTP, tokenisation or scheduling cost.
+`engine/dflash.py` runs the 7-token block drafter of `incoai/Qwen3.8-27B-DFlash2` (W4A16, 1.19 GiB) inside the engine ([Architecture](ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)), and since this release the server can serve with it (`--drafter dflash2`, [In the server](#in-the-server---drafter-dflash2) below). Greedy, `Engine(tmax=8)`. The engine-direct measurements and the HyperQwen comparison below were made on 2026-11-06 on this card at 350 W with no desktop load beyond the usual 0.6 GiB, 385 new tokens per prompt (256 for the sets of 8 and 48), decode tokens/s after the first token. The server and HyperQwen arms are HTTP; the engine arms call the engine directly (a host sync every 8 cycles), so they carry no HTTP, tokenisation or scheduling cost.
 
 **Same-session comparison** (the tree before the kernel work below; arms round-robin on an idle card; mean of rounds, round-to-round spread at most 1.3%; HyperQwen image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1`, revision `bd6c5e2f`, 2026-10-04, default `GPU_UTIL`; the n of rounds is 4 for HyperQwen and the engine arms, 3 for the server):
 
@@ -254,7 +254,35 @@ The scaled row assumes the server overhead is the same fraction for DFlash2 as f
 
 Read this as +1% to +2.5%, not more. A first version of the benchmark kept decoding to 256 tokens after the end token and reported 1.049x on the benchmark set: one prompt (`translate`, which ends at token 55) degenerated into a repeating loop that an n-gram lookup copied for 2.0x on that prompt. With the loop excluded the lookup gains nothing, so it is off by default (`SMK_DF_LOOKUP=1`); the lookup rows of the campaign are not evidence of speed. What did not work: a draft-vocabulary head (68,864 rows: prose loses 5% to 12% of its tokens per cycle), L2 prefetch of the next GEMV across the cycle (1.4% slower), fusing the residual add and norm into the GEMV tail (11% slower), and a persistent kernel (1.5% to 4%, [earlier measurement](IDEAS.md)).
 
-**Not measured**: sampling (greedy only), the server path, DFlash2 beyond 31k tokens of context (the drafter KV cache is indexed by absolute position, 20 KiB per token, and the device lm_head table needs 2.5 GiB: at 31k context on bf16 KV 0.15 GiB stay free), the long-context presets of HyperQwen, and any prompt that quotes its input at length (where HyperQwen's lookup drafter reports 381 tok/s).
+### In the server (`--drafter dflash2`)
+
+Same session, `serve.py --host-tables --max-model-len 16384` with `--drafter mtp` (MTP k=3 + prompt-lookup tail, the default) and `--drafter dflash2` (everything else identical), the HTTP client of the 2026-11-01 comparison (SSE on `/v1/completions` with token ids, greedy, `return_token_ids`) with ONE change: **the stream stops at the end token** (`ignore_eos` off), so a prompt that ends early is measured over the tokens it produced. Decode tok/s = tokens after the first chunk / (last - first chunk time). Visits in the order mtp, dflash2, dflash2, mtp (a fresh server each); per visit the median of 3 requests (README prompts, 385 tokens) or 2 (the 8 chat prompts of `bench_common`, 256 tokens); the two visits of an arm differ by at most 0.1%. Same RTX 3090, about 0.4 GiB in use before the server started; the card's clock and power were not pinned (SM clock 1,725 MHz at the start of every visit).
+
+| Prompt (bf16 KV) | MTP + tail | DFlash2 | DFlash2 / MTP | tokens |
+|---|---|---|---|---|
+| README code | 183.9 | **276.7** | 1.51x | 385 |
+| README prose | 118.0 | 113.4 | **0.96x** | 385 |
+| README math | 183.9 | 254.0 | 1.38x | 385 |
+| chat: qa-explain | 161.8 | 184.5 | 1.14x | 256 |
+| chat: reasoning | 194.2 | 252.8 | 1.30x | 256 |
+| chat: code-from-spec | 189.5 | 319.1 | 1.68x | 256 |
+| chat: writing | 162.4 | 195.2 | 1.20x | 107 (EOS) |
+| chat: advice | 133.2 | 141.5 | 1.06x | 256 |
+| chat: summary-short | 130.6 | 152.2 | 1.17x | 256 |
+| chat: sql | 192.9 | 273.2 | 1.42x | 127 (EOS) |
+| chat: translate | 89.5 | 165.3 | 1.85x | 56 (EOS) |
+| **mean of the 8 chat prompts** | 156.8 | **210.5** | **1.34x** | |
+| 12 chat tasks of the 48-task set (median of per-task tok/s) | 138.7 | 148.5 | 1.07x | |
+
+With 4-bit KV (`--kv-cache-dtype int4_per_token_head --host-tables`, same procedure, two visits per arm): code 180.9 -> 271.9 (1.50x), prose 112.2 -> 123.6 (1.10x), math 180.9 -> 257.1 (1.42x), mean of the 8 chat prompts 155.2 -> 209.4 (1.35x), 12 tasks 136.8 -> 151.8 (1.11x). DFlash2 runs on the fp8 and 4-bit caches unchanged (the verify is the same T = 8 step the prompt-lookup tail uses); its prose speed depends on the cache format (113 against 124 tok/s) for a reason that was not investigated. Codebooks in pinned host memory (`--dflash-codebooks host`, the default) against on the GPU: 276.4 / 113.3 / 254.1 against 276.7 / 113.4 / 254.0 tok/s, identical ids, 244 MiB less VRAM.
+
+**Where it is not faster.** README prose (-4% with bf16 KV: 2.4 tokens per cycle against 2.3, and a DFlash2 cycle (21 ms) is longer than an MTP cycle), and answers that **copy a long stretch of the prompt**: the MTP route's prompt-lookup tail accepts 6.6 tokens per cycle on a "rewrite this snippet" prompt where DFlash2 accepts 4.2 (327 against 193 tok/s, test prompt of 3,733 tokens, runner level), and on the synthetic agent trace of the benchmark (a system prompt, then tool-result turns; 28 generated tokens per turn, mostly a tool call that quotes the previous result) DFlash2 decodes 230 tok/s against 334 for the tail (4.95 against 6.75 tokens per cycle; bf16; 4-bit KV 228 against 330). Coding-agent traffic that quotes files is the case where `--drafter dflash2` is **slower** than the default; chat, code generation and math from a short prompt are where it wins. The drafter's own n-gram lookup (`SMK_DF_LOOKUP=1`, the prompt uploaded to its history; runner level, one process per arm) recovers part of it on one prompt (193 -> 262 tok/s against 327), is slower on another (193 -> 175 against 265) and moves 2 of 6 agent turns by about +17%: it stays off. An adaptive route (decide per request or per conversation) is not built.
+
+**Prefill and cached turns** (`--host-tables`, a 12k-token chat prompt, `/reset_prefix_cache` before each, TTFT = request sent to first token chunk, 3 requests per visit, 2 visits per arm): cold 6.85 s (MTP) against 6.94 s with the drafter's window captured during the prefill (+1.3%; 4-bit KV 6.88 s against 6.97 s, +1.3%); a follow-up turn that adds 150 tokens to the cached 12k: 0.181 s against 0.184 s (+3 ms; 4-bit KV 0.184 against 0.187 s). **`cached_tokens` is identical in the two arms** on every request: the 12k follow-up turns (12,136 / 12,138 / 12,131 of 12,305 / 12,307 / 12,300 prompt tokens) and a six-turn agent-shaped chat (system prompt, tool call and tool result per turn: prompt / cached tokens 945/0, 1,690/920, 2,735/1,685, 4,079/2,730, 5,724/4,074, 7,669/5,719). Every turn after the first resumed from the device snapshot and decoded with the block drafter (window covered).
+
+**Exactness.** The two routes are exact for their own verify (the DFlash2 cycle verifies 8 rows, the MTP cycle 4 to 8) and deterministic (two visits give identical ids), but a near-tie in bf16 can resolve differently between the two batch shapes: over the 11 prompts above the ids are identical for 8 (bf16) or 7 (4-bit KV) and diverge between token 58 and 241 for the others (prose, one chat prompt, ...). `tests/test_dflash_server.py` compares each route with its own host-driven reference.
+
+**Not measured**: sampling (greedy only: sampled requests and requests with logit processors use the MTP path), DFlash2 beyond the lengths in [Usage](USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental) (the drafter KV cache is indexed by absolute position, 20 KiB per token; `--profile long` does not fit and the ring buffer that would cap it is not built), the device lm_head table of `DflashEngine` (the server keeps it on the host), the long-context presets of HyperQwen, and any quoting prompt other than the two above (where HyperQwen's lookup drafter reports 381 tok/s).
 
 ## 6. Reproducing
 
@@ -262,6 +290,7 @@ Read this as +1% to +2.5%, not more. A first version of the benchmark kept decod
 |---|---|---|
 | Every test in the Makefile list: KV-cache perplexity guard, host tables, logit processors, tool-call and sampler checks, the server end to end, start-up configurations | `make test` (needs the checkpoint and the GPU) | long: it starts the server several times; no total is given here |
 | DFlash2 acceptance and exactness | `python tests/test_dflash.py` (needs the W4A16 drafter, `$DFLASH_W4`) | minutes |
+| DFlash2 in the server: tap capture, router, drafter window across turns and the host tier | `python tests/test_dflash_server.py` (drafter + GPU, about 3 minutes) | minutes |
 | The part that needs no GPU | `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py`, `uv run tests/test_prefill_plan.py` | seconds |
 | The tables in sections 2 to 4 | not regenerated by anything here: the long-context sweeps were done with throwaway harnesses against this engine and the HyperQwen container, which are not part of this repository | n/a |
 
