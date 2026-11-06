@@ -165,6 +165,8 @@ class DflashEngine(SpecEngine):
         super().__init__(**kw)
         assert self.tmax == 8, "DFlash2 verifies 8 rows per cycle (Engine(tmax=8))"
         setup_df_api(self.lib)
+        torch.cuda.empty_cache()
+        free0 = torch.cuda.mem_get_info()[0]
         t0 = time.time()
         self.P = load_dflash(dflash_path, codebooks_host=codebooks_host, verbose=kw.get("verbose", True))
         self.dfw = make_dfw(self.P, mask_id, rescore_r)
@@ -172,6 +174,8 @@ class DflashEngine(SpecEngine):
         if not self.df:
             raise RuntimeError("smk_dflash_create failed (out of device memory, or the engine has no int4 head / tmax != 8)")
         self.df_load_s = time.time() - t0
+        torch.cuda.empty_cache()
+        self.df_mib = (free0 - torch.cuda.mem_get_info()[0]) / 2**20  # device memory of the drafter: weights, K/V cache, ring, scratch (not the graphs of the first cycles)
         self.ctxd = self.lib.smk_dflash_ctxd(self.df)
         self._dss = (C.c_int * SS_N)()
         self._dring = (C.c_int * RING)()
@@ -244,3 +248,62 @@ class DflashEngine(SpecEngine):
         torch.cuda.synchronize()
         smk.check(self.lib.smk_dflash_read(self.df, what, C.c_void_p(out.data_ptr()), out.numel() * out.element_size()), "dflash_read")
         return out
+
+    def df_start(self):
+        """Append the tap of the last prompt row (dbg row 0 of the head=1 step / folded head) as drafter context and draft d1..d7: the DFlash2 counterpart of smk_spec_start."""
+        smk.check(self.lib.smk_dflash_start(self.df, self.st), "dflash_start")
+
+    def df_append(self, T, pos0):
+        """Append dbg rows 0..T-1 (T <= 8: taps of prompt rows pos0 .. pos0 + T - 1) as drafter context (no drafting)."""
+        smk.check(self.lib.smk_dflash_prefill_chunk(self.df, T, pos0, self.st), "dflash_prefill_chunk")
+
+    def df_state(self):
+        """The drafter's device state ints (ss[12] = tokens emitted, ss[13] = cycles, ss[16 + m] = cycles with m accepted drafts); counters run on across requests that resume a cached lineage."""
+        return [int(x) for x in self.df_read(0, SS_N, torch.int32)]
+
+
+TAP_SLOTS = tuple(6 + 14 * s for s in range(5))  # engine dbg slots (= target layer index + 1) of the drafter's taps: the residual stream after layers 5, 19, 33, 47, 61
+
+
+class TapCapture:
+    """Drafter context of prompt rows that the fast prefill computes: stages the residual rows entering target layers 6/20/34/48/62 of the window [lo, hi) while FastPrefill runs
+    (FastPrefill.tap = this object, it only READS the residual), then `flush` appends them to the drafter's K/V cache in 8-row chunks through the engine's debug taps
+    (smk_dflash_prefill_chunk, the same kernel path as DflashEngine.df_prefill).  Layer-major prefill produces all rows of one layer before the next layer, so the rows of a group wait
+    here (5 x rows x 10 KiB) until its last layer is done.  `last` holds the last prompt row of a folded head segment (it has no head step that fills dbg row 0)."""
+
+    def __init__(self, eng, rows):
+        from prefill import _view, setup_prefill_api
+
+        setup_prefill_api(eng.lib)  # smkp_engine_ptr: argtypes / restype (FastPrefill sets them too, but not before this constructor)
+
+        self.e, self.rows = eng, rows
+        self.buf = torch.empty(5, rows, H, dtype=torch.bfloat16, device="cuda")
+        self.last = torch.empty(5, H, dtype=torch.bfloat16, device="cuda")
+        self.dbg = _view(eng.lib.smkp_engine_ptr(eng.h, 7), 66 * 8 * H * 2, torch.bfloat16).view(66, 8, H)[TAP_SLOTS[0] : TAP_SLOTS[-1] + 1 : 14]  # [5][8][H] strided view of the 5 slots
+        self.lo = self.hi = 0
+        self.nbytes = (self.buf.numel() + self.last.numel()) * 2
+
+    def begin(self, lo, hi):
+        """Stage prompt rows [lo, hi) (absolute positions, hi - lo <= rows)."""
+        assert 0 <= hi - lo <= self.rows
+        self.lo, self.hi = lo, hi
+
+    def take(self, k, h, pos0):
+        """h = residual rows [T][H] of a segment at positions pos0.., entering the k-th tap layer."""
+        a, b = max(self.lo, pos0), min(self.hi, pos0 + h.shape[0])
+        if a < b:
+            self.buf[k, a - self.lo : b - self.lo].copy_(h[a - pos0 : b - pos0])
+
+    def take_last(self, k, row):
+        self.last[k].copy_(row)
+
+    def flush(self, a, b):
+        """Append the staged rows [a, b) as drafter context (8 rows per chunk)."""
+        for c in range(a, b, 8):
+            T = min(8, b - c)
+            self.dbg[:, :T].copy_(self.buf[:, c - self.lo : c - self.lo + T])
+            self.e.df_append(T, c)
+
+    def put_last(self):
+        """The staged last prompt row -> dbg row 0 of the 5 taps (what the T = 1 head step would have written), ready for df_start / df_append(1, n - 1)."""
+        self.dbg[:, 0].copy_(self.last)
