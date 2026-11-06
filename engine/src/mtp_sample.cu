@@ -73,6 +73,7 @@ __global__ void __launch_bounds__(256) k_topk0(const float* __restrict__ logits,
 // Stage 1: each block extracts, by iterated block-argmax, the elements of its chunk that can be in the row's top-K: those >= thr = the K-th largest chunk maximum
 // (K distinct elements are >= thr, so everything below it is outside the top-K).  Written descending, zero padded to K, to ws.
 __global__ void __launch_bounds__(256) k_topk1(const float* __restrict__ logits, size_t stride, int N, const SampP* __restrict__ sp, int sel, uint64_t* __restrict__ ws, int nch) {
+  if (sp->greedy) return;  // batched decode: a greedy sequence's sampling kernels are no-ops
   const int K = sel ? sp->d_top_k : sp->top_k;
   const int r = blockIdx.y, c = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   const float* row = logits + (size_t)r * stride;
@@ -120,6 +121,7 @@ __global__ void __launch_bounds__(256) k_topk1(const float* __restrict__ logits,
 constexpr int SK2_THREADS = 128;
 __global__ void __launch_bounds__(SK2_THREADS) k_topk2(const SampP* __restrict__ sp, int sel, const uint64_t* __restrict__ ws, int nch, const int* __restrict__ idmap, Dist* __restrict__ out) {
   extern __shared__ uint64_t lists[];
+  if (sp->greedy) return;
   const int K = sel ? sp->d_top_k : sp->top_k;
   const float inv_t = sel ? sp->d_inv_t : sp->inv_t, top_p = sel ? sp->d_top_p : sp->top_p;
   const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -262,6 +264,7 @@ __device__ __forceinline__ int sample_dist(const Dist* dd, const SampP* sp, uint
 
 // ---------------------------------------------------------------------------------------------- graph kernels (one warp)
 __global__ void k_accept_s(int* ds, int* ss, int* ring, int k, const Dist* pd, const Dist* qd, const SampP* sp) {
+  if (sp->greedy) return;
   __shared__ int y[8];
   const int lane = threadIdx.x;
   const int a = accept_core(pd, qd, ds + DS_TOK, k, sp, (uint32_t)ss[SS_NCYC], lane, y);
@@ -275,6 +278,7 @@ __global__ void k_accept_s(int* ds, int* ss, int* ring, int k, const Dist* pd, c
 }
 
 __global__ void k_draft_pick(const Dist* qd, const SampP* sp, const int* ss, int j, int* dst) {
+  if (sp->greedy) return;
   const int tok = sample_dist(qd, sp, (uint32_t)ss[SS_NCYC], ST_DRAFT + j, threadIdx.x);
   if (threadIdx.x == 0) *dst = tok;
 }

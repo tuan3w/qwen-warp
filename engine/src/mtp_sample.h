@@ -36,6 +36,7 @@ struct SampP {
   float min_p;  // min_p > 0: target rows keep the tokens with p >= min_p * p_max (before top-p)
   unsigned long long seed;
   ProcP* pr;  // request logit processors (proc.h); null in the host-fed test hooks
+  int greedy; // batched decode (batch.cu): this sequence decodes greedily, so its sampling kernels (top-k stages 1-2, accept, draft pick) return at once; 0 everywhere else
 };
 
 // rng streams (philox counter word 1): the counter word 0 is the cycle counter ss[SS_NCYC]
