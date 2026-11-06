@@ -98,7 +98,7 @@ One CUDA graph per cycle, no host work between cycles: the host launches n graph
 
 Weights: the W4A16 compressed-tensors checkpoint (pack-quantized, group 128; fp16 scales are rounded to bf16 because the engine kernels take bf16) is repacked with `pack.repack_w4`; every GEMM is `smk_w4r_gemv`.
 Device memory: 1.19 GiB of W4 weights + 0.25 GiB selector codebooks (device; pinned host memory works too: `codebooks_host=True`) + 20 KiB per context position of drafter KV (`ctx_max` 2048: 42 MiB).
-Limits: needs `tmax = 8` and the int4 head; greedy only (no sampling, no logit processors); the drafter KV is indexed by absolute position, so long contexts pay 20 KiB/token although the window is 2048 (a ring would cap it at 42 MiB); prefill appends the drafter context in 8-row engine steps (the layer-major fast prefill does not feed it yet); not wired into the server.
+Limits: needs `tmax = 8` and the int4 head; greedy only (no sampling, no logit processors); `DflashEngine` keeps the bf16 lm_head table on the device when the free VRAM covers the rest of the engine (2.5 GiB, about 0.15 GiB spare at a 31k context on bf16 KV; it falls back to the pinned host table, and `Engine` keeps that default for the server); an optional device n-gram lookup over the token history (`SMK_DF_LOOKUP=1`) is off by default; the drafter KV is indexed by absolute position, so long contexts pay 20 KiB/token although the window is 2048 (a ring would cap it at 42 MiB); prefill appends the drafter context in 8-row engine steps (the layer-major fast prefill does not feed it yet); not wired into the server.
 `tests/test_dflash.py` checks the ids against the T = 8 greedy decode.
 
 ## The 4-bit KV cache

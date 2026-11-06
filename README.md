@@ -3,7 +3,7 @@
 **Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s.**
 
 I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
-At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than this engine (about 1.5x on code); I did not measure DFlash2 at long context.
+At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than the MTP engine (about 1.5x on code); version 0.6.0 adds an experimental in-engine DFlash2 drafter (greedy, not in the server) that is level with it in a same-session comparison ([Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)); neither was measured at long context.
 I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), one request at a time, text only.
 
 ## Numbers
@@ -32,7 +32,7 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
 | *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
 | **speedup**, qwen-warp 4-bit KV vs `mtp-long` | **1.27x** | **1.22x** | **1.21x** |
-| *reference:* HyperQwen DFlash2 (earlier session, 2026-11-01, same card and 350 W) | 254 | 103 | 225 |
+| *reference:* HyperQwen DFlash2 (earlier session, 2026-11-01, same card and 350 W; 254 / 103 / 226 again in the 2026-11-06 session) | 254 | 103 | 225 |
 | qwen-warp 4-bit KV vs DFlash2 (different days) | 0.67x | 1.05x | 0.72x |
 
 | | |

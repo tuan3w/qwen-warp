@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-06
 
 ### Added
 
-- Experimental DFlash2 block drafter inside the engine (`engine/dflash.py`, `engine/src/dflash.cu`, `include/dflash.h`, [Architecture](docs/ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)): a 5-layer W4A16 drafter proposes 7 tokens per cycle, the target verifies 8 rows, and the whole cycle (verify, accept, drafter, selector) is one CUDA graph. Greedy only, not wired into the server. Measured on one RTX 3090 against MTP k = 3 in the same process (256 greedy tokens, 11 prompts, 3 interleaved repetitions): 213 against 155 tok/s on average (x1.37), code 263 against 179, math 252 against 173, prose 175 against 138; 4.48 against 3.0 tokens per cycle; the cycle takes 21.0 ms against 19.1 ms, of which the drafter is 2.5 ms.
+- Experimental DFlash2 block drafter inside the engine (`engine/dflash.py`, `engine/src/dflash.cu`, `include/dflash.h`, [Architecture](docs/ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only)): a 5-layer W4A16 drafter proposes 7 tokens per cycle, the target verifies 8 rows, and the whole cycle (verify, accept, drafter, selector) is one CUDA graph. Greedy only, not wired into the server. Engine-direct on the README prompts: 276 / 112 / 261 tok/s (code / prose / math) against 185 / 119 / 184 for MTP k=3 with the prompt-lookup tail in the same engine, and level with HyperQwen's DFlash2 preset measured in the same session (254 / 103 / 226); [Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental).
 - Engine API `smk_engine_verify`, `smk_engine_commit`, `smk_engine_tap_gather` (an external draft verified over T <= 8 rows with the host accepting, tap readout) and `smk_bf16_gemv_f32_cfg` (mma configuration of the bf16 GEMV).
+- Optional device n-gram lookup over the token history that overrides the drafts on a long exact match (`SMK_DF_LOOKUP=1`, off by default: it measured no gain once the benchmark stops at the end token).
+
+### Changed
+
+- Kernel work from an autonomous optimisation campaign (bit-identical output): the bf16 lm_head table stays on the device for `DflashEngine` when it fits (`Engine(lm_head_host=False)`; the default and the server keep it in pinned host memory), the bf16 attention split loop issues the next K/V tiles early (31k context: `attn_split` 222 -> 198 us per call), the drafter attention is split across query rows (106 -> 64 us per call), a few drafter kernels are fused, and the DeltaNet kernel's tail loads earlier (21.9 -> 20.7 us per call). Measured against the previous tree, same session, 2 interleaved rounds: +1.1% on short prompts and +2.6% on a 31k-token prompt on the benchmark set, +1.2% and +2.3% on a held-out set.
 
 ## 0.5.0 - 2026-11-05
 

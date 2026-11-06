@@ -56,10 +56,9 @@ A different weight format means kernel work, and a different model means re-chec
 
 ## A block drafter (DFlash2-style)
 
-On short prompts HyperQwen's DFlash2 preset beat this engine (254 against 166 tok/s on code, 225 against 166 on math, equal on prose; [comparison](PERFORMANCE.md#4-hyperqwen-as-a-reference-point)). The measured cause is tokens per step: 5.8 (code) and 5.2 (math) against 3.5, at 23.0 against 21.1 ms per step, so the step cost is about the same and the acceptance is what differs.
-Its drafter proposes 7 tokens in one non-autoregressive pass (a 1.9B-parameter, 5-layer block drafter fed with target hidden states, quantised to 1.19 GB) and a lookup drafter extends the verify block; this engine drafts 3 tokens with the checkpoint's own MTP head plus a prompt-lookup tail of up to 4.
-**What is not known:** whether a block drafter fits in the VRAM that is left at long context (the 4-bit cache and host tables leave little), what it would do at 100k tokens (DFlash2 was never run at long context here), and whether the Swift checkpoint's hidden states work with a drafter trained on the base model.
-**To settle it.** Measure HyperQwen's DFlash2 at long context on this card first (its `dflash2-long` preset did not start here; try a lower `GPU_UTIL`), then decide whether a drafter is worth porting. The verify path already takes up to 8 rows per cycle (`engine/include/mtp.h`).
+Done as an experiment in 0.6.0 ([Architecture](ARCHITECTURE.md#dflash2-block-drafter-experimental-greedy-only), [Performance, section 5](PERFORMANCE.md#5-dflash2-block-drafter-experimental)): the drafter runs inside the cycle graph, 4.5 tokens per cycle against 3.0 for MTP, level with HyperQwen's DFlash2 in the same session.
+**What is not known:** DFlash2 at long context (it needs a ring buffer for its KV cache, 20 KiB per token today, and 1.2 to 3.7 GiB of VRAM that the 4-bit cache and host tables leave little of at 190k tokens), sampling (the drafts are greedy), and wiring it into the server (prefix cache, snapshots and the processors would all have to carry the drafter state).
+**Where the next gain is:** tokens per cycle (4.5 on average, 0.87 acceptance at the first draft position down to 0.26 at the seventh). The drafter's top candidate is right 80% of the time and the true token is among its top 16 in 96%: verifying a second candidate needs per-branch DeltaNet state.
 
 ## Faster long prefill
 
