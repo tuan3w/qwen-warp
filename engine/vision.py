@@ -15,8 +15,10 @@ Everything is batched over all patches of a request; the only per-image work is 
 MRoPE (text config: mrope_section [11, 11, 10], interleaved): rotary frequency l (0..31) of the 64 rotary dims takes its position from axis T if l % 3 == 0, H if l % 3 == 1 (l < 33),
 W if l % 3 == 2 (l < 30) -- the kernels' `mrope_axis` (engine/src/prefill.cu).  Text rows have t = h = w; after the last image every row is at (KV position + delta).
 """
+import hashlib
 import json
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -56,14 +58,44 @@ def n_tokens(grid, merge=2):
     return t * (h // merge) * (w // merge)
 
 
+@dataclass(eq=False)  # identity comparison: the pixels are a tensor
+class ImageInput:
+    """One image of a prompt: its placeholder tokens are [offset, offset + n), n = t * (h / 2) * (w / 2); key = the image's content hash (vLLM's mm hash);
+    pixels = the processor's pixel_values of this image ([t * h * w][1536], host)."""
+    offset: int
+    grid: tuple
+    key: str
+    pixels: torch.Tensor | None = None
+
+    @property
+    def n(self):
+        return n_tokens(self.grid)
+
+
+def cache_key(ids, images):
+    """The ids the prefix cache matches a prompt on (int32 array): the token ids, with every placeholder row of an image replaced by -1 - (31 bits of a hash of its mm hash).
+    Two prompts that differ only in an image then diverge at that image's first placeholder row (no KV or state past it is shared), and the same image at the same place matches."""
+    key = np.array(ids, dtype=np.int32)
+    for im in images:
+        h = int.from_bytes(hashlib.blake2b(str(im.key).encode(), digest_size=4).digest(), "little") & 0x7FFFFFFF
+        key[im.offset : im.offset + im.n] = -1 - h
+    return key
+
+
 class Vision:
     """The vision tower on the GPU.  `mib` = device memory of its weights.  dtype=torch.float32, attn="sdpa": an fp32 copy for checking the implementation against an fp32 reference.
+
+    weights="device": all 879 MiB of bf16 weights on the GPU.  weights="host": the 27 blocks' GEMM weights (790 MiB) stay in pinned host memory and are streamed block by block into two
+    device buffers on a side stream (block i + 1 is copied while block i computes); the rest (patch embed, position table, merger, norms) stays on the device: 151 MiB in all.
+    Encode is then PCIe-bound for small images (a block's 29 MiB take ~1.3 ms over PCIe 4.0 x16 against ~0.6 ms of compute at 448 x 448) and as fast as "device" for large ones.
 
     Precision: bf16 weights and GEMMs (fp32 accumulate), FlashAttention-2 in bf16, but the residual stream and the LayerNorms in fp32 (transformers keeps the residual in bf16).  27 bf16
     blocks amplify rounding on a few tokens: against an fp32 forward, transformers' bf16 model has tokens at a cosine of 0.96-0.99; the fp32 residual costs ~5% of the encode time
     (1920x1080: 219 vs 210 ms) and lifts, at 1920x1080, the mean cosine from 0.99969 to 0.99983 and the worst token from 0.970 to 0.982 (tests/test_vision.py)."""
 
-    def __init__(self, model=MODEL, device="cuda", dtype=torch.bfloat16, attn="fa2"):
+    GEMM = ("attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight", "attn.proj.bias", "mlp.linear_fc1.weight", "mlp.linear_fc1.bias", "mlp.linear_fc2.weight", "mlp.linear_fc2.bias")
+
+    def __init__(self, model=MODEL, device="cuda", dtype=torch.bfloat16, attn="fa2", weights="device"):
         from safetensors import safe_open
 
         cfg = json.load(open(Path(model) / "config.json"))["vision_config"]
@@ -82,15 +114,39 @@ class Vision:
             with safe_open(str(Path(model) / shard), framework="pt", device="cpu") as f:
                 for k in names:
                     if idx[k] == shard:
-                        W[k[len(PREFIX):]] = f.get_tensor(k).to(device=device, dtype=dtype)
+                        W[k[len(PREFIX):]] = f.get_tensor(k).to(dtype=dtype)
         W["patch_embed.proj.weight"] = W["patch_embed.proj.weight"].reshape(self.hid, -1).contiguous()  # Conv3d(kernel == stride) == one GEMM over the flattened patch
+        assert weights in ("device", "host"), weights
+        self.weights = weights
+        streamed = {f"blocks.{i}.{n}" for i in range(self.depth) for n in self.GEMM} if weights == "host" else set()
+        for k in W:
+            if k not in streamed:
+                W[k] = W[k].to(device)
         self.W = W
-        self.blocks = [{n: W[f"blocks.{i}.{n}"] for n in ("norm1.weight", "norm1.bias", "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight", "attn.proj.bias", "norm2.weight", "norm2.bias",
-                                                          "mlp.linear_fc1.weight", "mlp.linear_fc1.bias", "mlp.linear_fc2.weight", "mlp.linear_fc2.bias")} for i in range(self.depth)]
-        self.mib = sum(t.numel() * t.element_size() for t in W.values()) / 2**20
+        self.blocks = [{n: W[f"blocks.{i}.{n}"] for n in self.GEMM} for i in range(self.depth)]
         f32 = lambda n: W[n].float()  # noqa: E731
         self.n32 = [tuple(f32(f"blocks.{i}.{n}") for n in ("norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias")) for i in range(self.depth)]
         self.m32 = (f32("merger.norm.weight"), f32("merger.norm.bias"))
+        self._host = None
+        if weights == "host":  # one pinned flat buffer per block, two device buffers with a view per tensor
+            sizes = [W[f"blocks.0.{n}"].numel() for n in self.GEMM]
+            offs = np.concatenate([[0], np.cumsum(sizes)]).tolist()
+            self._host = []
+            for b in self.blocks:
+                flat = torch.empty(offs[-1], dtype=dtype, pin_memory=True)
+                for n, o, s in zip(self.GEMM, offs, sizes):
+                    flat[o : o + s].copy_(b[n].reshape(-1))
+                self._host.append(flat)
+            self._dev = [torch.empty(offs[-1], dtype=dtype, device=device) for _ in range(2)]
+            self._views = [{n: d[o : o + s].view(self.blocks[0][n].shape) for n, o, s in zip(self.GEMM, offs, sizes)} for d in self._dev]
+            self._cs = torch.cuda.Stream(device)
+            self._done = [None, None]  # per device buffer: event after the last block that read it (on the compute stream)
+            self._ready = [None, None]  # per device buffer: event after its copy (on the side stream)
+            self.blocks = None
+            for k in streamed:
+                W[k] = None
+        self.mib = (sum(t.numel() * t.element_size() for t in W.values() if t is not None and t.is_cuda) + sum(t.numel() * t.element_size() for t in self.n32[0]) * self.depth
+                    + (sum(d.numel() * d.element_size() for d in self._dev) if self._host else 0)) / 2**20
         sd = self.hd // 2  # axial rope: hd / 4 frequencies per axis
         self.inv_freq = (1.0 / (10000.0 ** (torch.arange(0, sd, 2, dtype=torch.float32) / sd))).to(device)
         self.device, self.dtype, self.attn = device, dtype, attn
@@ -138,6 +194,25 @@ class Vision:
         return (torch.from_numpy(np.concatenate(co)).to(d, non_blocking=True), torch.from_numpy(np.concatenate(ta)).to(d, non_blocking=True),
                 torch.from_numpy(np.concatenate(wt)).to(d, non_blocking=True))
 
+    # ------------------------------------------------------------------------------------------------ weights="host": block streaming
+    def _fetch(self, i):
+        """Copy block i's GEMM weights into device buffer i % 2 on the side stream, after the block that used that buffer last (i - 2) has run."""
+        k = i % 2
+        with torch.cuda.stream(self._cs):
+            if self._done[k] is not None:
+                self._cs.wait_event(self._done[k])
+            self._dev[k].copy_(self._host[i], non_blocking=True)
+            self._ready[k] = self._cs.record_event()
+
+    def _block(self, i):
+        """Block i's GEMM weights (device tensors); weights="host": wait for its copy and start the next block's."""
+        if self._host is None:
+            return self.blocks[i]
+        torch.cuda.current_stream().wait_event(self._ready[i % 2])
+        if i + 1 < self.depth:
+            self._fetch(i + 1)
+        return self._views[i % 2]
+
     # ------------------------------------------------------------------------------------------------ forward
     @torch.inference_mode()
     def encode(self, pixel_values, grid_thw):
@@ -157,9 +232,11 @@ class Vision:
         seq = [h * w for t, h, w in grids for _ in range(t)]  # one attention sequence per frame
         cu = torch.tensor(np.concatenate([[0], np.cumsum(seq)]), dtype=torch.int32).to(self.device, non_blocking=True)
         mx = max(seq)
+        if self._host is not None:  # prefetch the first block's weights (after the previous call's block that used its buffer: _done carries over)
+            self._fetch(0)
         nh, hd = self.nh, self.hd
-        N32 = self.n32
-        for B, B32 in zip(self.blocks, N32):
+        for i, B32 in enumerate(self.n32):
+            B = self._block(i)
             y = F.layer_norm(x, (self.hid,), B32[0], B32[1], 1e-6).to(bf)
             qkv = F.linear(y, B["attn.qkv.weight"], B["attn.qkv.bias"]).view(N, 3, nh, hd)
             q, k, v = qkv.unbind(1)
@@ -169,6 +246,8 @@ class Vision:
             y = F.layer_norm(x, (self.hid,), B32[2], B32[3], 1e-6).to(bf)
             y = F.gelu(F.linear(y, B["mlp.linear_fc1.weight"], B["mlp.linear_fc1.bias"]), approximate="tanh")
             x += F.linear(y, B["mlp.linear_fc2.weight"], B["mlp.linear_fc2.bias"])
+            if self._host is not None:
+                self._done[i % 2] = torch.cuda.current_stream().record_event()  # buffer i % 2 may be overwritten (by block i + 2) after this block's kernels
         y = F.layer_norm(x, (self.hid,), self.m32[0], self.m32[1], 1e-6).to(bf).view(-1, self.hid * self.merge**2)
         y = F.gelu(F.linear(y, W["merger.linear_fc1.weight"], W["merger.linear_fc1.bias"]))
         return F.linear(y, W["merger.linear_fc2.weight"], W["merger.linear_fc2.bias"])
