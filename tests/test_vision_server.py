@@ -13,7 +13,8 @@ Checks (synthetic PIL images sent as base64 data URLs through the chat API, gree
   solid colours, shapes, large printed words and digits at 448x448, 1024x768, 1920x1080 and non-square sizes: the answer names the colour / shape / text |
   same text, two different images: different answers, and the second request resumes nowhere past the image (cached_tokens <= the image's first placeholder row) |
   multi-turn chat about one image: turn 2 reports cached_tokens > 0 and still answers about the image |
-  two images in one prompt | the same image request twice -> the same ids | video -> 400 | --vision off (a second server): an image request -> 400, text ids unchanged.
+  two images in one prompt | the same image request twice -> the same ids | video -> 400 | an image request refused for its length (400), then the same image in a short request ->
+  answered | --vision off (a second server): an image request -> 400, text ids unchanged.
 --bench N: decode tok/s of the README short prompts (385 tokens, ignore_eos, median of N runs per prompt) on both servers, image-request time to first token at three sizes, decode
 tok/s after an image vs the same request without it.
 """
@@ -179,7 +180,7 @@ def bench_text(cl, reps):
 
 
 # ------------------------------------------------------------------------------------------------ image checks
-def image_checks(t, cl, base):
+def image_checks(t, cl, base, max_model_len):
     import httpx
 
     def ask(ims, q, max_tokens=24):
@@ -240,6 +241,14 @@ def image_checks(t, cl, base):
         {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}, {"type": "text", "text": "What happens?"}]}]), timeout=60)
     t.check("video input -> 400", r.status_code == 400 and "video" in r.text.lower(), f"{r.status_code} {r.text[:200]}")
 
+    # an image request that the frontend refuses only after processing the image (its text fits --max-model-len, text + image does not), then the same image in a short request: the
+    # refused image must not count as sent (vLLM's lru sender cache would send it as data=None, which failed every later request with that image)
+    img = solid((20, 160, 40), 1920, 1080)
+    r = httpx.post(base + "/v1/chat/completions", json=dict(model="swift", max_tokens=8, messages=[user([img], "word " * (max_model_len - 1200) + colour_q)]), timeout=120)
+    out, a = ask([img], colour_q)
+    t.check("an image request refused for its length after the image was processed (400), then the same image in a short request -> answered", r.status_code == 400
+            and "context length" in r.text and "green" in a.lower(), f"{r.status_code} {r.text[:120]} / {a!r}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -281,7 +290,7 @@ def main():
             for n in PROMPTS:
                 fd = next((i for i, (x, y) in enumerate(zip(mine[n], ref[n])) if x != y), None)
                 t.check(f"text-only greedy ids == reference release [{n}]", mine[n] == ref[n], f"{len(mine[n])}/{len(ref[n])} ids, first difference at {fd}")
-        image_checks(t, cl, base)
+        image_checks(t, cl, base, a.max_model_len)
         again = text_ids(cl)
         t.check("text-only greedy ids after the image requests == before (no state left behind)", again == mine)
         if a.bench:

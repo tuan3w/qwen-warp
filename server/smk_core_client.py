@@ -18,7 +18,6 @@ import torch
 
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.core_client import EngineCoreClient
@@ -356,7 +355,6 @@ class SwiftCoreClient(EngineCoreClient):
         logger.info("swift-mk image input %s", f"on: ViT weights on the {cfg.vision} ({self.runner.vit.mib:.0f} MiB on the GPU), images up to {cfg.max_patches * 256:,} pixels "
                     f"({cfg.max_patches // 4} placeholder tokens), {cfg.vis_mib:.0f} MiB counted" if cfg.vision else f"off: {cfg.vision_off}")
         self.max_patches = cfg.max_patches
-        self.mm_cache = MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(vllm_config) if cfg.vision else None  # vLLM's frontend sends data=None for an item its processor cache already sent once
         self.thread = threading.Thread(target=self._batch_worker if S > 1 else self._worker, name="swift-mk-engine", daemon=True)
         self.thread.start()
 
@@ -475,11 +473,11 @@ class SwiftCoreClient(EngineCoreClient):
         return Task(rid, list(req.prompt_token_ids), to_gen_params(req.sampling_params), emit, done, cancelled=lambda: rid in self.aborted, images=images or None)
 
     def _images(self, request):
-        """vision.ImageInput list of a request's multimodal features (validated); [] for a text prompt.  The receiver cache is updated first, whatever is rejected afterwards: the
-        frontend's sender cache already counts the items as sent, so a later request with the same image arrives without its data."""
+        """vision.ImageInput list of a request's multimodal features (validated); [] for a text prompt.  Every feature carries its data: the frontend's processor-only cache (install)
+        never sends an image as already sent."""
         if not request.mm_features:
             return []
-        feats = self.mm_cache.get_and_update_features(request.mm_features) if self.mm_cache is not None else request.mm_features
+        feats = request.mm_features
         if self.runner.vit is None:  # (the frontend refuses such a request before it streams: install(); this is the engine's own check)
             raise VLLMValidationError(IMAGE_OFF or "image input is off on this server", parameter="messages")
         bad = sorted({f.modality for f in feats} - {"image"})
@@ -488,7 +486,7 @@ class SwiftCoreClient(EngineCoreClient):
         images = []
         for f in feats:
             if f.data is None:
-                raise RuntimeError(f"multimodal item {f.identifier} arrived without its data (frontend processor cache out of step with the engine's)")
+                raise RuntimeError(f"multimodal item {f.identifier} arrived without its data (the frontend's processor cache is not the processor-only one: install())")
             grid = tuple(int(x) for x in f.data["image_grid_thw"].data.tolist())
             if grid[1] * grid[2] > self.max_patches:
                 raise VLLMValidationError(f"image of {grid[1] * 16} x {grid[2] * 16} pixels after resizing is larger than --max-image-pixels {self.max_patches * 256:,}", parameter="mm_processor_kwargs")
@@ -520,8 +518,7 @@ class SwiftCoreClient(EngineCoreClient):
         return ("generate",)
 
     async def reset_mm_cache_async(self) -> None:
-        if self.mm_cache is not None:
-            self.mm_cache.clear_cache()
+        return None  # the frontend owns the only multimodal cache (processor-only, install()) and resets it itself
 
     async def reset_encoder_cache_async(self) -> None:
         return None
@@ -571,6 +568,19 @@ def install(**options):
 
         validate_num_items.swift_mk = True
         BaseProcessingInfo.validate_num_items = validate_num_items
+    # The engine runs in the frontend's process, so the processed images need no second cache: vLLM's "lru" pair (the frontend keeps metadata and sends data=None for an item it already
+    # sent; the engine keeps the data) drifts when the frontend refuses a request AFTER processing its image (a prompt over --max-model-len): the image counts as sent, never reaches the
+    # engine, and every later request with it failed (HTTP 500).  The processor-only cache keeps the processed items in the frontend and always sends the data.
+    from vllm.multimodal.registry import MultiModalRegistry
+
+    cache_type = MultiModalRegistry._get_cache_type
+    if not getattr(cache_type, "swift_mk", False):
+        def _get_cache_type(self, vllm_config):
+            t = cache_type(self, vllm_config)
+            return "processor_only" if t == "lru" else t
+
+        _get_cache_type.swift_mk = True
+        MultiModalRegistry._get_cache_type = _get_cache_type
     # vLLM refuses min_p and logit_bias whenever a speculative config is set (SamplingParams._validate_spec_decode): a limit of ITS rejection sampler, which applies neither to the verify rows
     # (v1/sample/rejection_sampler.py apply_logits_processors).  This engine's cycle applies every supported processor to every verify row, exactly (engine/src/proc.h), so the check goes.
     SamplingParams._validate_spec_decode = lambda self, speculative_config: None

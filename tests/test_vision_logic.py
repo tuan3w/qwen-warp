@@ -8,7 +8,7 @@ Tier: 0
 1. vision.cache_key: text rows keep their ids; the placeholder rows of an image carry (negative) values from its hash, so two prompts that differ only in the image diverge exactly at its
    first placeholder row, the same image at the same place gives the same key, and a lineage / host-store match (prefix_store.common_prefix) stops there.
 2. SwiftCoreClient._images on fake vLLM features: an image becomes ImageInput(offset, grid, mm hash, pixels); video, --vision off, an image above --max-image-pixels, a placeholder that does
-   not match its grid and a feature without data are refused (400 / error); the receiver cache is updated before any refusal.
+   not match its grid and a feature without data are refused (400 / error); install() makes the frontend's multimodal cache the processor-only one (no engine receiver cache).
 3. engine_cfg: --vision auto never changes what a text request gets (the tail decision and the length check are those of --vision off), puts the ViT weights on the GPU when 256 MiB stay
    free, else in host memory, else turns image input off; --vision device / host that do not fit are refused with a message naming image input.
 4. image input turned off by --vision auto (one sequence and --max-num-seqs > 1): the reason names settings that fit, and each named setting does turn image input on (the largest such
@@ -60,15 +60,8 @@ def test_parse():
     from smk_core_client import SwiftCoreClient
     from vllm.exceptions import VLLMValidationError
 
-    seen = []
-
-    class Cache:
-        def get_and_update_features(self, feats):
-            seen.append(len(feats))
-            return feats
-
     c = object.__new__(SwiftCoreClient)
-    c.runner, c.mm_cache, c.max_patches = SimpleNamespace(vit=object()), Cache(), 1024
+    c.runner, c.max_patches = SimpleNamespace(vit=object()), 1024
 
     def outcome(feats, vit=True):
         c.runner.vit = object() if vit else None
@@ -92,11 +85,21 @@ def test_parse():
     r = outcome([feature(length=10)])
     check("placeholder length != grid tokens -> 400", r[0] == "400" and "placeholder" in r[1], r[1])
     r = outcome([feature(data=False)])
-    check("feature without data (processor cache out of step) -> error", r[0] == "error", r[1])
-    n = len(seen)
-    outcome([feature("video")])
-    outcome([feature()], vit=False)
-    check("the receiver cache sees every request, refused ones included", len(seen) == n + 2)
+    check("feature without data (a frontend cache that is not processor-only) -> error", r[0] == "error", r[1])
+    # install(): the frontend's multimodal cache is the processor-only one (an "lru" sender / receiver pair drifts when the frontend refuses a processed image request)
+    import smk_core_client as sc
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    sc.install()
+    vc = SimpleNamespace(model_config=SimpleNamespace(get_multimodal_config=lambda: SimpleNamespace(mm_processor_cache_gb=4, mm_processor_cache_type="lru")),
+                         parallel_config=SimpleNamespace(_api_process_count=1, data_parallel_size=1, data_parallel_external_lb=False))
+    real = MULTIMODAL_REGISTRY.supports_multimodal_inputs
+    MULTIMODAL_REGISTRY.supports_multimodal_inputs = lambda mc: True
+    try:
+        kinds = MULTIMODAL_REGISTRY._get_cache_type(vc), MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(vc)
+    finally:
+        MULTIMODAL_REGISTRY.supports_multimodal_inputs = real
+    check("install(): an lru processor cache becomes processor-only, no engine receiver cache", kinds == ("processor_only", None), str(kinds))
 
 
 def cfg(free, L=20480, mode="auto", pl="auto", kv="auto", ht=False, mp=2097152, S=1):
