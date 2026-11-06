@@ -4,8 +4,7 @@
   r = make_engine(ctx_max=8192, vision="device")     # smk_runner.Runner; keyword arguments override DEFAULTS
   r = make_engine(max_num_seqs=4)                    # smk_batch.BatchRunner (continuous batching over 4 sequence slots)
 
-SMK_RESIDENT=1: the packed weights come from the resident holder (research/projects/qwmu-camp/devlab/resident.py, CUDA IPC, ~1 s instead of a 20-30 s load; $QWRES_DIR overrides
-its directory).  Run such tests WITHOUT /tmp/qw/gpu.sh (the holder owns the GPU lock).  The bf16 tables are host memory there already, so host_tables defaults to False.
+SMK_RESIDENT=1 (with $QWRES_DIR = the directory of the holder's resident.py): the packed weights come from the resident holder (CUDA IPC, ~1 s instead of a 20-30 s load).  Run such tests WITHOUT /tmp/qw/gpu.sh (the holder owns the GPU lock).  The bf16 tables are host memory there already, so host_tables defaults to False.
 """
 import os
 import sys
@@ -21,7 +20,7 @@ DEFAULTS = dict(ctx_max=8192 + 32, k=3, group=2, max_snaps=16, pld=True, prefix_
 def attach():
     """Use the resident weights when $SMK_RESIDENT=1 (no-op otherwise); call before any engine is built."""
     if os.environ.get("SMK_RESIDENT") == "1":
-        sys.path.insert(0, os.environ.get("QWRES_DIR", "/media/fatman/data/workspace/research/projects/qwmu-camp/devlab"))
+        sys.path.insert(0, os.environ["QWRES_DIR"])  # the directory of resident.py
         import resident
 
         resident.attach()
