@@ -13,7 +13,7 @@
 #include "proc.h"
 
 namespace smk {
-constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX;
+constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX, TR = SMK_RMAX;
 constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_PEND = 19, DS_RDELTA = 20, DS_N = 21;  // DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | delta-buffer parity << 8 (deltanet.h);
 // DS_RDELTA: MRoPE rope offset of the sequence (rope position = KV position + delta; set per request by the host, 0 for text-only prompts; include/attn.h)
 constexpr int DBG_SLOTS = NLAYER + 2;  // 0 embed, 1..64 layer outputs, 65 final norm out

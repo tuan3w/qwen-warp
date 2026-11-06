@@ -152,21 +152,22 @@ smk_engine* smk_engine_create_slot(const smk_model_w* w, int ctx_max, int kv_fp8
     e->y6 = share->y6; e->mix = share->mix; e->act = share->act; e->dn = share->dn; e->dbg = share->dbg; e->logits = share->logits;
     e->ws_dn = share->ws_dn; e->ws_attn = share->ws_attn; e->ws_am = share->ws_am; e->ws_hq = share->ws_hq;
   } else {
-    e->h = (uint16_t*)B((size_t)TM * H * 2);
-    e->xn = (uint16_t*)B((size_t)TM * H * 2);
-    e->qkv = (uint16_t*)B((size_t)TM * 10240 * 2);
-    e->z = (uint16_t*)B((size_t)TM * 6144 * 2);
-    e->qb = (uint16_t*)B((size_t)TM * 12288 * 2);
-    e->kb = (uint16_t*)B((size_t)TM * 1024 * 2);
-    e->vb = (uint16_t*)B((size_t)TM * 1024 * 2);
-    e->ba = (uint16_t*)B((size_t)TM * 48 * 2);
-    e->bb = (uint16_t*)B((size_t)TM * 48 * 2);
-    e->y6 = (uint16_t*)B((size_t)TM * 6144 * 2);
-    e->mix = (uint16_t*)B((size_t)TM * H * 2);
-    e->act = (uint16_t*)B((size_t)TM * I * 2);
-    e->dn = (uint16_t*)B((size_t)TM * H * 2);
+    // TR (16) rows: a batched cycle (batch.cu) runs up to 16 rows through these; a single-sequence step uses T <= TM of them.  The taps keep TM rows per slot (engine.h).
+    e->h = (uint16_t*)B((size_t)TR * H * 2);
+    e->xn = (uint16_t*)B((size_t)TR * H * 2);
+    e->qkv = (uint16_t*)B((size_t)TR * 10240 * 2);
+    e->z = (uint16_t*)B((size_t)TR * 6144 * 2);
+    e->qb = (uint16_t*)B((size_t)TR * 12288 * 2);
+    e->kb = (uint16_t*)B((size_t)TR * 1024 * 2);
+    e->vb = (uint16_t*)B((size_t)TR * 1024 * 2);
+    e->ba = (uint16_t*)B((size_t)TR * 48 * 2);
+    e->bb = (uint16_t*)B((size_t)TR * 48 * 2);
+    e->y6 = (uint16_t*)B((size_t)TR * 6144 * 2);
+    e->mix = (uint16_t*)B((size_t)TR * H * 2);
+    e->act = (uint16_t*)B((size_t)TR * I * 2);
+    e->dn = (uint16_t*)B((size_t)TR * H * 2);
     e->dbg = (uint16_t*)dalloc(e, (size_t)DBG_SLOTS * TM * H * 2, true);
-    e->logits = (float*)B((size_t)TM * VOC * 4);
+    e->logits = (float*)B((size_t)TR * VOC * 4);
     e->ws_dn = dalloc(e, swiftmk_deltanet_ws_bytes(), true);
     e->ws_attn = dalloc(e, swiftmk_attn_ws_bytes(), true);
     e->ws_am = dalloc(e, smk_argmax_ws_bytes(), true);

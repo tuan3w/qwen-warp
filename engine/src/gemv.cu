@@ -16,9 +16,9 @@ namespace smk {
 // ---------------------------------------------------------------------------------------------- epilogues
 __device__ __forceinline__ float silu_f(float x) { return x / (1.f + expf(-x)); }
 
-// acc[0..3] = (row g, tok 2t), (row g, tok 2t+1), (row g+8, tok 2t), (row g+8, tok 2t+1) of the 16-row tile starting at `row`
-__device__ __forceinline__ void epilogue(const float (&acc)[4], int row, int g, int t, int T, int N, const smk_epi& e) {
-  const int tk0 = 2 * t, tk1 = tk0 + 1;
+// acc[0..3] = (row g, tok tb+2t), (row g, tok tb+2t+1), (row g+8, tok tb+2t), (row g+8, tok tb+2t+1) of the 16-row tile starting at `row` (tb: first token of the n8 tile)
+__device__ __forceinline__ void epilogue(const float (&acc)[4], int row, int g, int t, int T, int N, const smk_epi& e, int tb = 0) {
+  const int tk0 = tb + 2 * t, tk1 = tk0 + 1;
   if (e.kind == SMK_EPI_SILU) {
     uint16_t* o = (uint16_t*)e.out[0];
     const int ch = (row >> 1) + g, W = N >> 1;
@@ -44,21 +44,25 @@ __device__ __forceinline__ void epilogue(const float (&acc)[4], int row, int g, 
 // Persistent: CTA b owns tiles b, b+grid, ...; the (tile, group) stream is flat per warp so weight prefetch crosses tile boundaries.
 // Addressing is pointer-increment (no per-group row arithmetic) and the activation fragments are loaded just in time from L1 (K5, GEMV_LOG.md #7).
 // Lanes g >= T read activation row T-1 instead of being predicated off: column n of the mma result depends only on B column n and those columns are never stored.
+// NT = n8 token tiles per weight fragment (T <= 8 NT): tile n holds tokens 8n..8n+7 and runs the same instructions on its own B fragment and accumulators as the single tile of an
+// NT = 1 launch, so a token row gets the same bits whichever tile (and launch row count) it lands in: row-count invariant up to 16 rows.
 // RP = 0: checkpoint-natural weight layout (engine.h).  RP = 1: repacked layout (smk_w4r_gemv, pack.py repack_w4): per (16-row tile, 128-k group) one 1 KB unit
 // [lane 0..31: row g, chunk t][32 + lane: row g+8, chunk t], units contiguous per tile; nibble j / j+4 of a word = columns 2j / 2j+1 (the activations need no permutation);
 // scales as one u32 (bf16 row g | bf16 row g+8 << 16) per (tile, group, g).  Same bytes, same numerics up to the order of k inside an mma.
-template <int NW, int KS, int U, int MINB, int RP>
+template <int NW, int KS, int U, int MINB, int RP, int NT = 1>
 __global__ void __launch_bounds__(NW * 32, MINB)
     k_w4(const uint4* __restrict__ W, const void* __restrict__ S, const uint4* __restrict__ X, const smk_epi epi, int N, int K, int T) {
   constexpr int TPC = NW / KS;
-  __shared__ float red[KS > 1 ? NW : 1][32][4];
+  __shared__ float red[KS > 1 ? NW : 1][32][4 * NT];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
   const int tin = warp / KS, ks = warp % KS;
   const int nkg = K >> 7, per = nkg / KS, rowu = K >> 5;
   const int groups = (N >> 4) / TPC;
   const int cnt = (groups - (int)blockIdx.x + (int)gridDim.x - 1) / (int)gridDim.x;
   const int total = cnt * per;
-  const uint4* xbase = X + (size_t)(g < T ? g : T - 1) * (K >> 3) + ks * 16 + t * 4;
+  const uint4* xbase[NT];
+#pragma unroll
+  for (int n = 0; n < NT; n++) xbase[n] = X + (size_t)(n * 8 + g < T ? n * 8 + g : T - 1) * (K >> 3) + ks * 16 + t * 4;
   const unsigned gridsz = gridDim.x * TPC;  // tiles between two consecutive tiles of this CTA's flat stream
 
   // Flat (tile, group) stream as 32-bit element offsets: `step` inside a tile, `wrap` from the last group of a tile to the first group of the CTA's next tile (branch-free).
@@ -98,7 +102,9 @@ __global__ void __launch_bounds__(NW * 32, MINB)
 #pragma unroll
   for (int j = 0; j < U; j++)
     if (j < total) issue(j);
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  float acc[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; n++) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f;
   int ct = 0, cm = 0;
   for (int f = 0; f < total; f += U) {
 #pragma unroll
@@ -107,22 +113,32 @@ __global__ void __launch_bounds__(NW * 32, MINB)
         const uint4 ca = wa[j], cb = wb[j];
         const uint32_t sv = ss[j];
         if (f + j + U < total) issue(j);
-        uint4 xb[4];
+        uint4 xb[NT][4];
 #pragma unroll
-        for (int u = 0; u < 4; u++) xb[u] = RP ? ldx(xbase + ct * (KS * 16) + u) : perm_b(ldx(xbase + ct * (KS * 16) + u));
-        float part[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int n = 0; n < NT; n++)
+#pragma unroll
+          for (int u = 0; u < 4; u++) xb[n][u] = RP ? ldx(xbase[n] + ct * (KS * 16) + u) : perm_b(ldx(xbase[n] + ct * (KS * 16) + u));
+        float part[NT][4];
+#pragma unroll
+        for (int n = 0; n < NT; n++) part[n][0] = part[n][1] = part[n][2] = part[n][3] = 0.f;
         const uint32_t wra[4] = {ca.x, ca.y, ca.z, ca.w}, wrb[4] = {cb.x, cb.y, cb.z, cb.w};
 #pragma unroll
         for (int u = 0; u < 4; u++) {
           uint32_t pa[4], pb[4];
           dq_word(wra[u], pa);
           dq_word(wrb[u], pb);
-          mma16816(part, pa[0], pb[0], pa[1], pb[1], xb[u].x, xb[u].y);
-          mma16816(part, pa[2], pb[2], pa[3], pb[3], xb[u].z, xb[u].w);
+#pragma unroll
+          for (int n = 0; n < NT; n++) {
+            mma16816(part[n], pa[0], pb[0], pa[1], pb[1], xb[n][u].x, xb[n][u].y);
+            mma16816(part[n], pa[2], pb[2], pa[3], pb[3], xb[n][u].z, xb[n][u].w);
+          }
         }
         const float fsa = bflo(sv), fsb = bfhi(sv);
-        acc[0] = fmaf(fsa, part[0], acc[0]); acc[1] = fmaf(fsa, part[1], acc[1]);
-        acc[2] = fmaf(fsb, part[2], acc[2]); acc[3] = fmaf(fsb, part[3], acc[3]);
+#pragma unroll
+        for (int n = 0; n < NT; n++) {
+          acc[n][0] = fmaf(fsa, part[n][0], acc[n][0]); acc[n][1] = fmaf(fsa, part[n][1], acc[n][1]);
+          acc[n][2] = fmaf(fsb, part[n][2], acc[n][2]); acc[n][3] = fmaf(fsb, part[n][3], acc[n][3]);
+        }
         if (++ct == per) {  // tile finished
           ct = 0;
           const int row = (int)(tile0 + (unsigned)cm * gridsz) << 4;
@@ -130,21 +146,28 @@ __global__ void __launch_bounds__(NW * 32, MINB)
           if (KS > 1) {
             if (ks > 0) {
 #pragma unroll
-              for (int c = 0; c < 4; c++) red[warp][lane][c] = acc[c];
+              for (int n = 0; n < NT; n++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) red[warp][lane][n * 4 + c] = acc[n][c];
             }
             __syncthreads();
             if (ks == 0) {
 #pragma unroll
-              for (int q = 1; q < KS; q++)
+              for (int n = 0; n < NT; n++) {
 #pragma unroll
-                for (int c = 0; c < 4; c++) acc[c] += red[warp + q][lane][c];
-              epilogue(acc, row, g, t, T, N, epi);
+                for (int q = 1; q < KS; q++)
+#pragma unroll
+                  for (int c = 0; c < 4; c++) acc[n][c] += red[warp + q][lane][n * 4 + c];
+                epilogue(acc[n], row, g, t, T, N, epi, n * 8);
+              }
             }
             __syncthreads();
           } else {
-            epilogue(acc, row, g, t, T, N, epi);
+#pragma unroll
+            for (int n = 0; n < NT; n++) epilogue(acc[n], row, g, t, T, N, epi, n * 8);
           }
-          acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+#pragma unroll
+          for (int n = 0; n < NT; n++) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f;
         }
       }
     }
@@ -356,11 +379,17 @@ static int grid_for(Kn kern, int threads, int groups) {
 template <int NW, int KS, int U, int MINB, int RP>
 static cudaError_t run_w4(const void* w, const void* s, const void* x, int N, int K, int T, const smk_epi* epi, cudaStream_t st) {
   constexpr int TPC = NW / KS;
-  if (((K >> 7) % KS) || ((N >> 4) % TPC) || (K & 127) || (N & 15) || T < 1 || T > 8) return cudaErrorInvalidValue;
-  static int grid_cache_n = -1, grid_cache_g = 0;  // single-config cache keyed by N (K/T do not change the group count)
+  if (((K >> 7) % KS) || ((N >> 4) % TPC) || (K & 127) || (N & 15) || T < 1 || T > 16) return cudaErrorInvalidValue;
   const int groups = (N >> 4) / TPC;
-  if (grid_cache_n != N) { grid_cache_g = grid_for(k_w4<NW, KS, U, MINB, RP>, NW * 32, groups); grid_cache_n = N; }
-  k_w4<NW, KS, U, MINB, RP><<<grid_cache_g, NW * 32, 0, st>>>((const uint4*)w, s, (const uint4*)x, *epi, N, K, T);
+  if (T <= 8) {
+    static int grid_cache_n = -1, grid_cache_g = 0;  // single-config cache keyed by N (K/T do not change the group count)
+    if (grid_cache_n != N) { grid_cache_g = grid_for(k_w4<NW, KS, U, MINB, RP, 1>, NW * 32, groups); grid_cache_n = N; }
+    k_w4<NW, KS, U, MINB, RP, 1><<<grid_cache_g, NW * 32, 0, st>>>((const uint4*)w, s, (const uint4*)x, *epi, N, K, T);
+  } else {  // 9..16 rows: two n8 token tiles per weight fragment (same per-row bits as a T <= 8 launch)
+    static int grid_cache_n = -1, grid_cache_g = 0;
+    if (grid_cache_n != N) { grid_cache_g = grid_for(k_w4<NW, KS, U, MINB, RP, 2>, NW * 32, groups); grid_cache_n = N; }
+    k_w4<NW, KS, U, MINB, RP, 2><<<grid_cache_g, NW * 32, 0, st>>>((const uint4*)w, s, (const uint4*)x, *epi, N, K, T);
+  }
   return cudaGetLastError();
 }
 template <int NW, int KS, int U, int MINB>
@@ -457,8 +486,11 @@ cudaError_t smk_bf16_gemv_f32_cfg(const void* w, const void* x, int N, int K, in
 }
 
 cudaError_t smk_bf16_gemv_small(const void* w, const void* x, int N, int na, int K, int T, void* out_a, void* out_b, cudaStream_t st) {
-  if (T < 1 || T > 8 || (K & 7)) return cudaErrorInvalidValue;
-  k_bf16_small<<<N, 128, 0, st>>>((const uint4*)w, (const uint4*)x, N, na, K, T, (uint16_t*)out_a, (uint16_t*)out_b);
+  if (T < 1 || T > 16 || (K & 7)) return cudaErrorInvalidValue;
+  for (int t0 = 0; t0 < T; t0 += 8) {  // rows 8..15 as a second launch: every row's sum is the same whatever the launch's row count
+    const int tn = T - t0 < 8 ? T - t0 : 8;
+    k_bf16_small<<<N, 128, 0, st>>>((const uint4*)w, (const uint4*)x + (size_t)t0 * (K >> 3), N, na, K, tn, (uint16_t*)out_a + (size_t)t0 * na, (uint16_t*)out_b + (size_t)t0 * (N - na));
+  }
   return cudaGetLastError();
 }
 

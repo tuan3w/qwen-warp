@@ -12,6 +12,8 @@ extern "C" {
 #ifndef SMK_TMAX
 #define SMK_TMAX 8
 #endif
+// Rows of one batched weight pass (include/batch.h: B sequences x (drafts + 1)): the owner engine's activation buffers hold this many rows; a single-sequence step keeps T <= SMK_TMAX.
+#define SMK_RMAX 16
 #define SMK_HIDDEN 5120
 #define SMK_INTER 17408
 #define SMK_VOCAB 248320

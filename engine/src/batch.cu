@@ -127,10 +127,11 @@ struct smk_batch {
   Dist* pd_b = nullptr;    // [BMAX][TM]
   SeqPtrs* ptr_b = nullptr;
   uint16_t* hr_b = nullptr;  // [KMAX][BMAX][H]: post-norm MTP hidden that drafts j + 1 (plane j)
-  uint16_t* cat = nullptr;   // [TM][2H]
+  uint16_t* cat = nullptr;   // [TR][2H]
+  uint16_t* fin = nullptr;   // [TR][H]: final-norm output of a cycle of more than TM rows (the engine's tap slots hold TM rows)
   float* lg_b = nullptr;     // [BMAX][head_nv]
   int* idx_b = nullptr;      // [BMAX]
-  int* bout = nullptr;       // [TM]
+  int* bout = nullptr;       // [TR]
   SlotDesc* desc_d = nullptr;
   SlotDesc* desc_h = nullptr;  // pinned
   int *pin_ss = nullptr, *pin_ring = nullptr;
@@ -150,11 +151,15 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
   smk_engine* e = s->e;
   const int T = kv + 1, R = B * T;
   auto dbgp = [&](int slot) { return (void*)(e->dbg + (size_t)slot * TM * H); };
+  // up to TM rows: the engine's debug taps and its final-norm tap slot, as a single-sequence step; more rows: no taps, the final norm into the batch's own buffer (same bits)
+  const bool wide = R > TM;
+  auto tap = [&](int slot) { return wide ? nullptr : dbgp(slot); };
+  void* fin = wide ? (void*)b->fin : dbgp(NLAYER + 1);
   // ---- verify: the 64-layer step over all rows
   for (int bi = 0; bi < B; bi++) CKB(smk_embed(e->w.embed, b->ds_b + bi * DS_N + DS_TOK, e->h + (size_t)bi * T * H, T, H, st));
   for (int l = 0; l < NLAYER; l++) {
     const smk_layer_w& L = e->w.layers[l];
-    CKB(smk_rmsnorm(e->h, l == 0 ? nullptr : e->dn, L.ln1, e->xn, dbgp(l), R, H, 1e-6f, st));
+    CKB(smk_rmsnorm(e->h, l == 0 ? nullptr : e->dn, L.ln1, e->xn, tap(l), R, H, 1e-6f, st));
     if (L.kind == 0) {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 10240; ep.end[1] = 16384; ep.end[2] = 16384; ep.out[0] = e->qkv; ep.out[1] = e->z;
@@ -205,11 +210,11 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
     }
   }
   // ---- head: final norm, quantised lm_head + exact rescoring over all rows (the sequences' processors on their own rows, with their drafts as history)
-  CKB(smk_rmsnorm(e->h, e->dn, e->w.final_norm, dbgp(NLAYER + 1), dbgp(NLAYER), R, H, 1e-6f, st));
-  CKB(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, dbgp(NLAYER + 1), VOC, H, R, e->logits, st));
+  CKB(smk_rmsnorm(e->h, e->dn, e->w.final_norm, fin, tap(NLAYER), R, H, 1e-6f, st));
+  CKB(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, fin, VOC, H, R, e->logits, st));
   if (rs)
     for (int bi = 0; bi < B; bi++) CKB(proc_logits(b->pb_b + bi, e->logits + (size_t)bi * T * VOC, b->ds_b + bi * DS_N + DS_TOK + 1, T, st));
-  CKB(smk_headq_select_rescore(e->logits, e->w.lm_head, dbgp(NLAYER + 1), VOC, H, R, rs ? HEAD_R_SAMPLING : HEAD_R_GREEDY, b->bout, nullptr, e->ws_hq, st));
+  CKB(smk_headq_select_rescore(e->logits, e->w.lm_head, fin, VOC, H, R, rs ? HEAD_R_SAMPLING : HEAD_R_GREEDY, b->bout, nullptr, e->ws_hq, st));
   if (rs)
     for (int bi = 0; bi < B; bi++)
       CKB(proc_cand(b->pb_b + bi, smk_headq_ws_cand(e->ws_hq) + (size_t)bi * T * SMK_HEADQ_RMAX, (float*)smk_headq_ws_exact(e->ws_hq) + (size_t)bi * T * SMK_HEADQ_RMAX, SMK_HEADQ_RMAX,
@@ -227,7 +232,7 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
   // ---- MTP: catch-up of every sequence's T rows (pairs (hidden of row t, token y[t])), then kd chained drafts
   const smk_mtp_w& W = s->w;
   const smk_layer_w& M = W.layer;
-  k_prep_cu<<<dim3(R, 2), NH8, 0, st>>>((const uint4*)e->w.embed, b->ss_b, T, (const uint4*)dbgp(NLAYER + 1), (const uint4*)W.pre_e, (const uint4*)W.pre_h, (uint4*)b->cat);
+  k_prep_cu<<<dim3(R, 2), NH8, 0, st>>>((const uint4*)e->w.embed, b->ss_b, T, (const uint4*)fin, (const uint4*)W.pre_e, (const uint4*)W.pre_h, (uint4*)b->cat);
   CKB(cudaGetLastError());
   for (int j = 0; j <= kd; j++) {
     const int rows = j == 0 ? R : B, Tq = j == 0 ? T : 1;
@@ -289,7 +294,7 @@ cudaError_t launch(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_t st,
 }
 
 bool shape_ok(smk_batch* b, int B, int kv, int kd) {
-  return B >= 1 && B <= BMAX && kv >= 0 && kv <= KMAX && kd >= 0 && kd <= KMAX && B * (kv + 1) <= b->s->e->tmax;
+  return B >= 1 && B <= BMAX && kv >= 0 && kv <= KMAX && kd >= 0 && kd <= KMAX && B * (kv + 1) <= TR;
 }
 }  // namespace
 
@@ -310,10 +315,11 @@ smk_batch* smk_batch_create(smk_spec* owner) {
   b->pd_b = (Dist*)dalloc(e, sizeof(Dist) * BMAX * TM, true);
   b->ptr_b = (SeqPtrs*)dalloc(e, sizeof(SeqPtrs) * BMAX, true);
   b->hr_b = (uint16_t*)dalloc(e, (size_t)KMAX * BMAX * H * 2, true);
-  b->cat = (uint16_t*)dalloc(e, (size_t)TM * 2 * H * 2, true);
+  b->cat = (uint16_t*)dalloc(e, (size_t)TR * 2 * H * 2, true);
+  b->fin = (uint16_t*)dalloc(e, (size_t)TR * H * 2, true);
   b->lg_b = (float*)dalloc(e, (size_t)BMAX * owner->w.head_nv * 4, true);
   b->idx_b = (int*)dalloc(e, BMAX * 4, true);
-  b->bout = (int*)dalloc(e, TM * 4, true);
+  b->bout = (int*)dalloc(e, TR * 4, true);
   b->desc_d = (SlotDesc*)dalloc(e, sizeof(SlotDesc) * BMAX, true);
   b->bytes = e->bytes - b0;
   cudaMallocHost((void**)&b->desc_h, sizeof(SlotDesc) * BMAX);

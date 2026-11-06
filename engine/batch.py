@@ -8,7 +8,7 @@
 
 A slot is a SpecEngine view (copy.copy of slot 0 with its own C engine + spec object): everything that is per sequence (device scalars, DeltaNet state / conv ring / delta
 buffer, KV caches, processors, sampling config, output ring) is its own; prefill, snapshots, sampling setup, single-sequence cycles and the prompt-lookup tail work on it unchanged.
-Rows per cycle: B x (kv + 1) <= 8.  The first cycle of a call verifies kv0 drafts, which must not exceed what every sequence's previous cycle drafted (`drafted`).
+Rows per cycle: B x (kv + 1) <= ROWS (16: the W4 GEMVs take two n8 token tiles per weight fragment, row-count invariant).  The first cycle of a call verifies kv0 drafts, which must not exceed what every sequence's previous cycle drafted (`drafted`).
 Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import copy
@@ -20,6 +20,7 @@ from spec import RING, SS_N, SpecEngine, smk
 
 BMAX = 8
 KMAX = 3
+ROWS = 16  # rows of one batched weight pass (SMK_RMAX, include/engine.h)
 
 
 def setup_batch_api(lib):
@@ -78,6 +79,7 @@ class BatchDecoder:
         self._ss = (C.c_int * (BMAX * SS_N))()
         self._ring = (C.c_int * (BMAX * RING))()
         self.st = main.st
+        self.rows = ROWS  # the scheduler sizes the drafts per sequence from this (server/smk_batch.py)
 
     def slot_bytes(self, i):
         """Device bytes the C objects of slot i allocated (slot 0 includes the shared activations and the batch buffers)."""

@@ -12,7 +12,8 @@ Scheduling (one thread owns the GPU; smk_core_client._batch_worker drives it):
   * prefills run one at a time (they share the fast prefill's scratch); after every PREFILL_STALL_ROWS x 64 row-layers of a prefill the running requests decode one sync group (the
     FastPrefill layer hook), so a long prompt delays the running streams by the time of a ~512-token prefill (about 0.3 s), not by its whole prefill.
   * decode: B = 1 running request uses the single-sequence path of its slot (MTP k = 3 + the prompt-lookup tail: the speed of --max-num-seqs 1); B >= 2 run batched cycles
-    (engine/batch.py) with K_BY_B[B] drafts per sequence (B x (k + 1) <= 8 rows per weight pass).  Every request keeps its own sampling parameters, seed, processors and stops.
+    (engine/batch.py) with K_BY_B[B] drafts per sequence (B x (k + 1) <= ROWS = 16 rows per weight pass).  Every request keeps its own sampling parameters, seed, processors and
+    stops.
 """
 import os
 import time
@@ -21,12 +22,14 @@ from typing import Callable
 
 import numpy as np
 
+from batch import ROWS
 from smk_runner import GenParams, Runner, Seq, Stats, cache_key
 
-# drafts per sequence by the number of running requests: the most that fits the 8 rows of a weight pass (B x (k + 1) <= 8); measured best for every B (docs/PERFORMANCE.md, B x k table)
-K_BY_B = {1: 3, 2: 3, 3: 1, 4: 1, 5: 0, 6: 0, 7: 0, 8: 0}
+# drafts per sequence by the number of running requests: the most that fit the ROWS = 16 rows of a weight pass (B x (k + 1) <= 16), measured best for every B (docs/PERFORMANCE.md,
+# section 7)
+K_BY_B = {1: 3, 2: 3, 3: 3, 4: 3, 5: 2, 6: 1, 7: 1, 8: 1}
 PREFILL_STALL_ROWS = 512  # a prefill pauses for one decode group of the running requests every 512 x 64 row-layers (the work of a 512-token prefill)
-# Exact mode (tests): SMK_BATCH_K=k decodes EVERY request with batched cycles of k drafts, whatever the batch size (needs max_num_seqs x (k + 1) <= 8).  A request's tokens are then a
+# Exact mode (tests): SMK_BATCH_K=k decodes EVERY request with batched cycles of k drafts, whatever the batch size (needs max_num_seqs x (k + 1) <= ROWS).  A request's tokens are then a
 # function of the request alone (every cycle runs the same per-sequence kernels, and the row-wise kernels are row-count invariant: tests/test_batch_engine.py part A), so a request
 # decoded next to others equals the same request decoded alone, token for token, greedy and seeded sampling.  Default (unset): the fastest schedule (K_BY_B, the native path at B = 1).
 EXACT_K = int(os.environ["SMK_BATCH_K"]) if os.environ.get("SMK_BATCH_K", "") != "" else None
@@ -60,7 +63,7 @@ class BatchRunner(Runner):
         self._rows = 0
         self.batched_cycles = self.single_cycles = 0
         self.exact_k = EXACT_K
-        assert self.exact_k is None or (0 <= self.exact_k <= 3 and max_num_seqs * (self.exact_k + 1) <= 8), f"SMK_BATCH_K={self.exact_k}: needs max_num_seqs x (k + 1) <= 8"
+        assert self.exact_k is None or (0 <= self.exact_k <= 3 and max_num_seqs * (self.exact_k + 1) <= ROWS), f"SMK_BATCH_K={self.exact_k}: needs max_num_seqs x (k + 1) <= {ROWS}"
         super().__init__(*a, max_num_seqs=max_num_seqs, **kw)
 
     def step(self, waiting, refuse):

@@ -10,7 +10,7 @@
 //   accept : per sequence, greedy (leading argmax matches) or exact speculative sampling with the sequence's own parameters and processors (both kernels are in the graph, the
 //            sequence's flag selects which one acts);
 //   mtp    : catch-up of the accepted rows of every sequence (B x (kv+1) rows) and kd chained drafts, each draft step one B-row pass through the MTP layer and draft head.
-// Rows per cycle: B x (kv + 1) <= the engine's tmax (8), kv, kd <= SMK_SPEC_KMAX.  kd = 0: plain batched decode (the catch-up still writes the MTP KV, so drafting can resume).
+// Rows per cycle: B x (kv + 1) <= SMK_RMAX (16; the W4 GEMVs, norms and the quantised head + rescoring take up to 16 rows, row-count invariant), kv, kd <= SMK_SPEC_KMAX.  kd = 0: plain batched decode (the catch-up still writes the MTP KV, so drafting can resume).
 // The first cycle of a call verifies kv0 drafts (<= what the previous cycle of each sequence drafted), the others kd.
 #pragma once
 #include "mtp.h"

@@ -7,8 +7,9 @@ cycles with (verified drafts, drafts, cycles), single-sequence MTP / prompt-look
 norms, W4 GEMVs, quantised head + rescoring, MTP layer) gives a row the same bits whatever the other rows of the launch are (checked first, part A), and every stateful kernel
 (DeltaNet, attention, accept, sampling) runs per sequence with the same rows as alone.  Seeded sampling and logit processors are covered: the philox counter of a sequence is
 its own cycle counter.  A resumed prefill (device snapshot / host prefix store) is compared against the cold one at the same time.
-  A. row-count invariance of the row-wise kernels (T = 1..8 rows against the same rows inside T = 8)
-  B. every batch size B = 1..8 x every draft depth k with B (k + 1) <= 8, greedy / seeded sampling / logit_bias + penalties mixed, against solo replays
+  A. row-count invariance of the row-wise kernels (T = 1..16 rows against the same rows inside T = 16: the one-tile launches of up to 8 rows and the two-tile launches of 9..16)
+  B. every batch size B = 1..8 x every draft depth k with B (k + 1) <= 16 (9 of these shapes are cycles of 9..16 rows), greedy / seeded sampling / logit_bias + penalties mixed,
+     against solo replays
   C. continuous-batching fuzz (fixed seed): ~48 requests with random arrivals, follow-up turns (prefix-cache hits), max_tokens, aborts, through BatchRunner.step, against solo replays
   D. SMK_DEBUG=1 memory guard: no canary after any device buffer of any slot was overwritten
 Solo references are cached under ~/.cache/qwen-warp/batch_solo keyed by (engine + runner sources, prompt, parameters, calls).  SMK_RESIDENT=1: resident weights (tests/_engine.py).
@@ -76,57 +77,58 @@ def part_a(r):
     shapes = [("dn qkvz", L.qkvz, smk.SMK_EPI_SEGS), ("attn qkv", A.qkvz, smk.SMK_EPI_SEGS), ("o", L.o, smk.SMK_EPI_SEGS), ("gate|up", L.gu, smk.SMK_EPI_SILU),
               ("down", L.down, smk.SMK_EPI_SEGS), ("mtp fc", M.fc, smk.SMK_EPI_SEGS), ("mtp head", M.head_r, smk.SMK_EPI_F32)]
     bad = []
+    NR = SB.ROWS  # 16
     for name, w4, kind in shapes:
         N, K = w4.s.shape[0], w4.s.shape[1] * 128
-        x = (torch.randn(8, K, device="cuda", generator=g) * 0.5).bfloat16()
+        x = (torch.randn(NR, K, device="cuda", generator=g) * 0.5).bfloat16()
         outs = {}
-        for T in range(1, 9):
+        for T in range(1, NR + 1):
             if kind == smk.SMK_EPI_F32:
-                o = torch.empty(8, N, device="cuda", dtype=torch.float32)
+                o = torch.empty(NR, N, device="cuda", dtype=torch.float32)
                 ep = smk.epi_simple(kind, o)
             elif kind == smk.SMK_EPI_SILU:
-                o = torch.empty(8, N // 2, device="cuda", dtype=torch.bfloat16)
+                o = torch.empty(NR, N // 2, device="cuda", dtype=torch.bfloat16)
                 ep = smk.epi_simple(kind, o)
             else:
-                o = torch.empty(8, N, device="cuda", dtype=torch.bfloat16)
+                o = torch.empty(NR, N, device="cuda", dtype=torch.bfloat16)
                 ep = smk.epi_segs(N, [o])
             smk.check(lib.smk_w4r_gemv(w4.w.data_ptr(), w4.s.data_ptr(), x.data_ptr(), N, K, T, C.byref(ep), st), name)
             outs[T] = o[:T].clone()
-        for T in range(1, 8):
-            if not torch.equal(outs[T].view(torch.int16) if outs[T].dtype == torch.bfloat16 else outs[T].view(torch.int32), (outs[8][:T].view(torch.int16) if outs[8].dtype == torch.bfloat16 else outs[8][:T].view(torch.int32))):
+        for T in range(1, NR):
+            if not torch.equal(outs[T].view(torch.int16) if outs[T].dtype == torch.bfloat16 else outs[T].view(torch.int32), (outs[NR][:T].view(torch.int16) if outs[NR].dtype == torch.bfloat16 else outs[NR][:T].view(torch.int32))):
                 bad.append(f"{name} T={T}")
     # quantised head + exact rescoring (R = 16 and 64): logits, argmax, candidate ids
     G = e.G
     H = 5120
     ws = torch.zeros(int(lib.smk_headq_ws_bytes()), dtype=torch.uint8, device="cuda")
-    x = (torch.randn(8, H, device="cuda", generator=g) * 0.5).bfloat16()
+    x = (torch.randn(NR, H, device="cuda", generator=g) * 0.5).bfloat16()
     for R_ in (16, 64):
         res = {}
-        for T in range(1, 9):
-            lg = torch.empty(8, 248320, device="cuda", dtype=torch.float32)
-            out = torch.zeros(8, dtype=torch.int32, device="cuda")
+        for T in range(1, NR + 1):
+            lg = torch.empty(NR, 248320, device="cuda", dtype=torch.float32)
+            out = torch.zeros(NR, dtype=torch.int32, device="cuda")
             smk.check(lib.smk_headq_gemv(e.hq_kind, G.hq.w.data_ptr(), G.hq.s.data_ptr(), x.data_ptr(), 248320, H, T, lg.data_ptr(), st), "headq")
             smk.check(lib.smk_headq_select_rescore(lg.data_ptr(), G.lm_head.data_ptr(), x.data_ptr(), 248320, H, T, R_, out.data_ptr(), None, ws.data_ptr(), st), "rescore")
             res[T] = (lg[:T].clone(), out[:T].clone())
-        for T in range(1, 8):
-            if not (torch.equal(res[T][0].view(torch.int32), res[8][0][:T].view(torch.int32)) and torch.equal(res[T][1], res[8][1][:T])):
+        for T in range(1, NR):
+            if not (torch.equal(res[T][0].view(torch.int32), res[NR][0][:T].view(torch.int32)) and torch.equal(res[T][1], res[NR][1][:T])):
                 bad.append(f"head R={R_} T={T}")
     # norms and the in_proj_a|b GEMV
-    h = (torch.randn(8, H, device="cuda", generator=g)).bfloat16()
-    y = (torch.randn(8, H, device="cuda", generator=g)).bfloat16()
+    h = (torch.randn(NR, H, device="cuda", generator=g)).bfloat16()
+    y = (torch.randn(NR, H, device="cuda", generator=g)).bfloat16()
     nres = {}
-    for T in range(1, 9):
-        hh, xn = h.clone(), torch.empty(8, H, device="cuda", dtype=torch.bfloat16)
+    for T in range(1, NR + 1):
+        hh, xn = h.clone(), torch.empty(NR, H, device="cuda", dtype=torch.bfloat16)
         smk.check(lib.smk_rmsnorm(hh.data_ptr(), y.data_ptr(), L.ln1.data_ptr(), xn.data_ptr(), None, T, H, 1e-6, st), "rmsnorm")
-        a_, b_ = torch.empty(8, 48, device="cuda", dtype=torch.bfloat16), torch.empty(8, 48, device="cuda", dtype=torch.bfloat16)
+        a_, b_ = torch.empty(NR, 48, device="cuda", dtype=torch.bfloat16), torch.empty(NR, 48, device="cuda", dtype=torch.bfloat16)
         smk.check(lib.smk_bf16_gemv_small(L.ab.data_ptr(), xn.data_ptr(), 96, 48, H, T, a_.data_ptr(), b_.data_ptr(), st), "ab")
         nres[T] = [t[:T].clone() for t in (hh, xn, a_, b_)]
-    for T in range(1, 8):
-        if not all(torch.equal(u.view(torch.int16), v[:T].view(torch.int16)) for u, v in zip(nres[T], nres[8])):
+    for T in range(1, NR):
+        if not all(torch.equal(u.view(torch.int16), v[:T].view(torch.int16)) for u, v in zip(nres[T], nres[NR])):
             bad.append(f"rmsnorm/ab T={T}")
     torch.cuda.synchronize()
     assert not bad, f"row-count invariance broken: {bad}"
-    print(f"A: row-count invariance: {len(shapes)} W4 GEMV shapes, the quantised head + rescoring (R 16 / 64), rmsnorm, in_proj_a|b: bit-identical for T = 1..8", flush=True)
+    print(f"A: row-count invariance: {len(shapes)} W4 GEMV shapes, the quantised head + rescoring (R 16 / 64), rmsnorm, in_proj_a|b: bit-identical for T = 1..{NR}", flush=True)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- solo replay
@@ -195,10 +197,10 @@ def part_b(r, prompts):
     """prompts: (ids, images | None) entries; consecutive slots of a batch take consecutive entries (a pool that alternates image and text prompts mixes every batch)."""
     rng = random.Random(1)
     S = len(r.seqs)
-    n_cmp = n_img = 0
+    n_cmp = n_img = n_wide = 0
     for B in range(1, S + 1):
         for k in range(0, 4):
-            if B * (k + 1) > 8:
+            if B * (k + 1) > SB.ROWS:
                 continue
             slots = r.seqs[:B]
             rec = []
@@ -227,7 +229,8 @@ def part_b(r, prompts):
                 assert x["toks"] == ref[: len(x["toks"])] and len(ref) >= len(x["toks"]), f"B={B} k={k}: batched != solo (first difference at {first_diff(x['toks'], ref)}, {x['p']}, images {bool(x['ims'])})"
                 n_cmp += 1
                 n_img += bool(x["ims"])
-    print(f"B: {n_cmp} sequences ({n_img} with images) in batches B = 1..{S} x every depth: identical to their solo replays", flush=True)
+                n_wide += B * (k + 1) > 8
+    print(f"B: {n_cmp} sequences ({n_img} with images, {n_wide} in cycles of 9..{SB.ROWS} rows) in batches B = 1..{S} x every depth: identical to their solo replays", flush=True)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- C

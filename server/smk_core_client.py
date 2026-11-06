@@ -154,7 +154,7 @@ def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB, df=Fals
 VRAM_BATCH_FIXED_MIB = {False: 19920, True: 15080}
 VRAM_BATCH_SLOT_MIB = 368
 VRAM_BATCH_KIB_PER_SLOT_TOKEN = (68.0, 36.0, 20.5)
-MAX_NUM_SEQS = 8  # rows of a weight pass (SMK_TMAX): at most one row per sequence
+MAX_NUM_SEQS = 8  # sequence slots of a batched cycle (SMK_BATCH_MAX, include/batch.h)
 
 
 def vram_need_batch_mib(ctx, dt, ht, S, vis=0.0):
@@ -265,7 +265,7 @@ def engine_cfg(vllm_config, free_mib):
         if df:
             raise ValueError("swift-mk: --drafter dflash2 serves one sequence at a time: use --max-num-seqs 1 with it (or --drafter mtp, the batched decoder's drafter)")
         if S > MAX_NUM_SEQS:
-            raise ValueError(f"swift-mk: --max-num-seqs {S}: at most {MAX_NUM_SEQS} sequences (one row each in a weight pass of {MAX_NUM_SEQS} rows)")
+            raise ValueError(f"swift-mk: --max-num-seqs {S}: at most {MAX_NUM_SEQS} sequences (the batched cycle's sequence slots)")
         pld = k == 3 and pl is not False
         if mode == "auto":
             wts = auto_vision(L, dt, ht, S, pld, df, cbh, mp, free_mib)

@@ -7,7 +7,7 @@ The fake engine's next token is a function of the hash of everything its sequenc
 by the real snapshot / restore code), its KV and MTP-KV caches hold the token ids (spilled to / restored from the host store by the real code).  So a wrong resume point, a wrong
 KV or snapshot restore, a token delivered to the wrong request or a decode call on the wrong slot changes the stream.  Asserted for every request: the delivered tokens are exactly
 the expected stream cut at its own stop / max_tokens (a prefix of it when aborted, and nothing after the abort), each request is admitted in arrival order and finishes, every
-slot is released, the decode calls respect the engine's limits (rows <= 8, verified drafts <= drafted), the running requests decode while a long prompt prefills (stall bound),
+slot is released, the decode calls respect the engine's limits (rows <= 16, verified drafts <= drafted), the running requests decode while a long prompt prefills (stall bound),
 the prompt-lookup proposer gets the true context, and the snapshot buffers and host-store bytes add up (no leak).
   python tests/test_batch_sched.py [--seeds N]
 """
@@ -219,7 +219,7 @@ class FakeBD:
     def cycles(self, seqs, kv0, kd, n):
         B = len(seqs)
         assert len(set(id(s) for s in seqs)) == B and 1 <= B <= 8
-        assert B * (kv0 + 1) <= 8 and B * (kd + 1) <= 8 and 0 <= kv0 <= 3 and 0 <= kd <= 3
+        assert B * (kv0 + 1) <= SB.ROWS and B * (kd + 1) <= SB.ROWS and 0 <= kv0 <= 3 and 0 <= kd <= 3
         for s in seqs:
             assert kv0 <= s.drafted, f"slot {s.idx}: batched cycle verifies {kv0} drafts, it drafted {s.drafted}"
             s.pld_ctx = None  # the proposer no longer follows the sequence

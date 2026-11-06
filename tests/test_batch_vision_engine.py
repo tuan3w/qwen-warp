@@ -4,7 +4,7 @@ Tier: 1
 
 Same oracle as tests/test_batch_engine.py (no tolerance: a request decoded in a batch == the same request decoded alone from a cold prefill with the same decode calls), here
 with sequences whose decode ropes at KV position + a nonzero MRoPE delta (ds[DS_RDELTA], per slot, gathered into the batch) next to text sequences (delta 0):
-  B. every batch size B = 1..4 x every draft depth with B (k + 1) <= 8, each batch mixing image prompts (one to two images, 70..300 placeholder rows) and text prompts,
+  B. every batch size B = 1..4 x every draft depth with B (k + 1) <= 16 (up to 16 rows per cycle), each batch mixing image prompts (one to two images, 70..300 placeholder rows) and text prompts,
      greedy / seeded sampling / min_p / logit_bias + penalties
   H. a batch of an image follow-up turn resumed from the HOST prefix store past its image (its slot was overwritten by a text request in between), an image follow-up turn
      resumed from the slot's device snapshot, and a cold text prompt; batched cycles of every verified-draft count
