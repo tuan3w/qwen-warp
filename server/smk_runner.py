@@ -24,6 +24,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -93,15 +94,43 @@ class Stats:
     hist: list = field(default_factory=list)  # dflash2: cycles by number of accepted drafts (0..7)
 
 
+class Seq:
+    """One sequence slot of the Runner: its engine (a SpecEngine, or a batched-decode slot view of one, engine/batch.py), its fast prefill, the lineage its device caches hold and the
+    host snapshots of that lineage.  A Runner with max_num_seqs = 1 has one (the engine and caches of every earlier release)."""
+
+    def __init__(self, idx, e, fp):
+        self.idx, self.e, self.fp = idx, e, fp
+        self.lineage = None  # np.int32 array: tokens whose main KV is valid in the device caches (see module docstring)
+        self.snaps: list[Snap] = []
+        self.procs_on = False  # the engine's request processors are on (switched off once by the next request without any)
+        self.used = 0.0  # time.time() of the last release (LRU choice of the slot a new conversation overwrites)
+        self.busy = False  # a request is prefilling or decoding on this slot
+
+
+def _seq_attr(name):
+    return property(lambda self: getattr(self.seq, name), lambda self, v: setattr(self.seq, name, v))
+
+
 class Runner:
+    # the attributes of the CURRENT sequence slot (self.seq); one slot unless max_num_seqs > 1 (server/smk_batch.py selects the slot of the request it works on)
+    e = property(lambda self: self.seq.e)
+    fp = property(lambda self: self.seq.fp)
+    lineage = _seq_attr("lineage")
+    snaps = _seq_attr("snaps")
+    _procs_on = _seq_attr("procs_on")
+
     def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True,
-                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False):
+                 drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False, max_num_seqs=1):
         """pld: K11 hybrid draft (MTP chain + prompt-lookup tail, verify T <= 8; needs k = 3; +0.56 GiB for the 9-slot DeltaNet ring): False / True / a spec.make_pld(...) options object.
         drafter: "mtp" (default) or "dflash2": greedy requests without logit processors are decoded by the in-engine DFlash2 block drafter (engine/dflash.py: 7 drafts per cycle, verify T = 8) when
-        its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there."""
+        its context window is on the device (see `_df_covered`), everything else by the MTP path.  dflash2 needs the engine's 9-slot ring (tmax = 8, as the prompt-lookup tail), so the tail is free there.
+        max_num_seqs > 1: that many sequence slots on one set of weights (engine/batch.py: one DeltaNet state per slot, tmax 8); server/smk_batch.py decodes them together (needs drafter mtp)."""
         assert 0 <= k <= 3 and group >= 1
         assert not pld or k == 3, "the prompt-lookup tail extends the full k = 3 MTP chain"
         assert drafter in ("mtp", "dflash2"), drafter
+        assert max_num_seqs == 1 or drafter == "mtp", "--drafter dflash2 serves one sequence at a time (--max-num-seqs 1)"
+        self.max_num_seqs = max_num_seqs
+        self.bd = None  # engine/batch.py BatchDecoder (max_num_seqs > 1)
         self.k, self.group, self.max_snaps, self.log = k, group, max_snaps, log
         self.pld = (make_pld() if pld is True else pld) or None
         self.drafter = drafter
@@ -117,18 +146,23 @@ class Runner:
 
                 if self.df_lookup:
                     os.environ["SMK_DF_LOOKUP"] = "1"  # read once by smk_dflash_create
-                self.e = DflashEngine(dflash_path=dflash_path or DF_PATH, codebooks_host=dflash_codebooks_host, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables, lm_head_host=True)
-                self.tap = TapCapture(self.e, self.DF_WINDOW)
-                self.df_mib = self.e.df_mib + self.tap.nbytes / 2**20  # drafter weights + K/V cache + scratch + the tap staging buffers
+                e = DflashEngine(dflash_path=dflash_path or DF_PATH, codebooks_host=dflash_codebooks_host, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables, lm_head_host=True)
+                self.tap = TapCapture(e, self.DF_WINDOW)
+                self.df_mib = e.df_mib + self.tap.nbytes / 2**20  # drafter weights + K/V cache + scratch + the tap staging buffers
+                engines = [e]
+            elif max_num_seqs > 1:
+                from batch import BatchDecoder
+
+                self.bd = BatchDecoder(slots=max_num_seqs, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables)
+                engines = self.bd.slots
             else:
-                self.e = SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)
+                engines = [SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)]
         except AttributeError as ex:  # ctypes: symbol missing in an old libswiftmk.so
             raise RuntimeError(f"libswiftmk.so is older than the sources ({ex}): run `make -C engine` (or point SMK_BUILD at a current build dir)") from ex
-        self.fp = FastPrefill(self.e, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))
+        self.seqs = [Seq(i, x, FastPrefill(x, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))) for i, x in enumerate(engines)]
+        self.seq = self.seqs[0]
         self.ctx_max = ctx_max
         self.load_s = time.time() - t0
-        self.lineage = None  # np.int32 array: tokens whose main KV is valid in the device caches (see module docstring)
-        self.snaps: list[Snap] = []
         self.pool: list[Snap] = []
         self._made = 0  # snapshot buffers allocated so far (device snapshots + pool + stored entries'), at most max_snaps
         for _ in range(min(max_snaps, 4)):  # the first ones up front (cudaHostAlloc of 151 MB costs ~20 ms); the rest are made on demand
@@ -138,7 +172,6 @@ class Runner:
         self.group_prefill = group_prefill  # run consecutive prefill segments layer by layer (one weight dequant per layer for the group); False = one segment at a time
         self.min_spill = min_spill  # lineages whose last snapshot is below this are not worth a spill (a cold prefill of them is shorter than a restore)
         self.last = Stats()
-        self._procs_on = False
         if warmup:
             t0 = time.time()
             self._warmup()
@@ -174,7 +207,7 @@ class Runner:
         cur = self._cur()
         s.pos = i
         s.sticky = sticky
-        s.dn.copy_(self.fp.dn_state[:, cur])
+        s.dn.copy_(self.fp.dn_state[:, cur % self.fp.nss])
         s.conv.copy_(self.fp.dn_conv[:, cur])
         if s.aux is not None:
             self.e.kv_aux_save(s.aux)
@@ -183,7 +216,7 @@ class Runner:
     def _restore(self, s):
         fp, e = self.fp, self.e
         cur = self._cur()
-        fp.dn_state[:, cur].copy_(s.dn)
+        fp.dn_state[:, cur % fp.nss].copy_(s.dn)
         fp.dn_conv[:, cur].copy_(s.conv)
         if s.aux is not None:
             e.kv_aux_restore(s.aux)
@@ -193,8 +226,12 @@ class Runner:
         torch.cuda.synchronize()
 
     def drop_cache(self):
-        self.lineage = None
-        self._free_snaps([])
+        cur = self.seq
+        for q in self.seqs:
+            self.seq = q
+            self.lineage = None
+            self._free_snaps([])
+        self.seq = cur
         self.df_lo = self.df_hi = 0
         if self.store is not None:
             self.pool += self.store.clear()
@@ -244,9 +281,11 @@ class Runner:
             if rel is None:
                 break
             self.pool += rel
-        if not self.pool:
-            old = min(self.snaps, key=lambda x: (x.sticky, x.pos))
-            self._free_snaps([x for x in self.snaps if x is not old])
+        if not self.pool:  # the current slot's lowest snapshot, else (several sequence slots) the lowest one of the least recently used other slot that has any
+            owner = self.seq if self.snaps else min((q for q in self.seqs if q.snaps), key=lambda q: q.used)
+            old = min(owner.snaps, key=lambda x: (x.sticky, x.pos))
+            self.pool.append(old)
+            owner.snaps = [x for x in owner.snaps if x is not old]
 
     def _spill_device(self, keep=None):
         """Move the device lineage (KV rows up to its last snapshot + its snapshots) into the host store before the device caches are overwritten.  Without a store, or for a lineage
@@ -463,9 +502,9 @@ class Runner:
         return True
 
     # ------------------------------------------------------------------------------------------------ generation
-    def run(self, ids, p: GenParams, cancelled=lambda: False, route=None):
-        """Generator of (new_tokens, finish_reason | None, stop_reason); tokens are cut exactly at the stop / length.  Nothing is yielded after a cancel.
-        route: None = the router's choice; "mtp" forces the MTP path (a dflash2 Runner otherwise decodes greedy requests without logit processors with the block drafter when its window is covered)."""
+    def _begin(self, ids, p: GenParams, route=None):
+        """The part of a request before its prefill, on the current sequence slot: the length budget, the prefill plan, the sampling configuration and processors of the slot's
+        engine, and the resume point (device snapshot, host prefix cache entry, or a cold start after spilling the slot's lineage).  Returns a namespace for _prefill / the decode loop."""
         e, k = self.e, self.k
         ids = [int(t) for t in ids]
         st = self.last = Stats(prompt=len(ids))
@@ -517,7 +556,14 @@ class Runner:
         st.route = "dflash2" if use_df else "mtp"
         if use_df and self.df_lookup:
             e.df_set_hist(ids)
-        if not self._prefill(ids, q, ends, folded, cancelled, use_df):
+        return SimpleNamespace(ids=ids, st=st, n_new=n_new, t0=t0, ends=ends, folded=folded, q=q, use_df=use_df)
+
+    def run(self, ids, p: GenParams, cancelled=lambda: False, route=None):
+        """Generator of (new_tokens, finish_reason | None, stop_reason); tokens are cut exactly at the stop / length.  Nothing is yielded after a cancel.
+        route: None = the router's choice; "mtp" forces the MTP path (a dflash2 Runner otherwise decodes greedy requests without logit processors with the block drafter when its window is covered)."""
+        b = self._begin(ids, p, route)
+        e, k, ids, st, n_new, t0, use_df = self.e, self.k, b.ids, b.st, b.n_new, b.t0, b.use_df
+        if not self._prefill(ids, b.q, b.ends, b.folded, cancelled, use_df):
             return
         if use_df:
             ss0 = e.df_state()  # the counters run on across requests that resume a cached lineage: this request's share is the difference
