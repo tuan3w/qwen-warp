@@ -19,6 +19,7 @@ Design (numbers: docs/PERFORMANCE.md):
 Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import ctypes as C
+import os
 import time
 
 import torch
@@ -95,6 +96,15 @@ class FastPrefill:
         for i, L in enumerate(eng.Ls):
             (self.dn_idx if L.kind == "linear" else self.at_idx)[i] = len(self.dn_idx if L.kind == "linear" else self.at_idx)
         self.prof = None  # dict name -> ms when profiling is on
+        self.xhook = None  # sparsity research (kl_eval): xhook(w4, x [T][K] bf16) -> x' (the activation fed to a W4 GEMM, e.g. with dropped channels zeroed); None = off
+        self.attn_hook = None  # sparsity research: attn_hook(li, q [T][24][256], kall, vall, Ltot, pos0, T, out [T][24][256]) replaces the flash-attention call (writes out)
+        self.mlp_hook = None  # sparsity research: mlp_hook(L, x [n][5120], act_out [n][17408], fp) must write the SiLU(gate)*up activation (small path only)
+        self._li = -1
+        self.trace = None  # sparsity research: read-only activation / attention capture (engine/smktrace.py, SMK_TRACE=1); hooks only copy out of the scratch buffers
+        if os.environ.get("SMK_TRACE"):
+            from smktrace import Tracer
+
+            self.trace = Tracer.from_env()
 
     # ------------------------------------------------------------------------------------------------ scratch
     def _scratch(self, S):
@@ -189,6 +199,8 @@ class FastPrefill:
         N = Nt - row0 if nrows is None else nrows
         wp, sp = w4.w.data_ptr() + row0 * (K // 2), w4.s.data_ptr() + row0 * (K // 64)
         T = x.shape[0]
+        if self.xhook is not None:
+            x = self.xhook(w4, x)
         with self._t("w4mm"):
             r = 0
             for n in self._w4_plan(T):
@@ -246,8 +258,13 @@ class FastPrefill:
             ao = a["tmpA"][T * 6144 : T * 12288]
             smk.check(lib.smkp_attn_prep(T, pos0, q0, 14336, q0 + 12288 * 2, 14336, q0 + 13312 * 2, 14336, L.q_norm.data_ptr(), L.k_norm.data_ptr(), kvp, self.ctx_max,
                                          self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), st), "attn_prep")
-            flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
-                                   causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
+            if self.trace is not None:
+                self.trace.attn(qatt.view(T, 24, 256), kall, vall, Ltot, pos0, T)
+            if self.attn_hook is not None:
+                self.attn_hook(self._li, qatt.view(T, 24, 256), kall, vall, Ltot, pos0, T, ao.view(T, 24, 256))
+            else:
+                flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
+                                       causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
         self._w4mm(a["y6"][:T], L.o, a["W2"], a["mix"][:T])
 
@@ -257,7 +274,12 @@ class FastPrefill:
         if self._small:
             for r0 in range(0, T, self.rows):
                 r1 = min(T, r0 + self.rows)
-                self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                if self.mlp_hook is not None:
+                    self.mlp_hook(L, xn[r0:r1], act[: r1 - r0], self)
+                else:
+                    self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                if self.trace is not None:
+                    self.trace.x("down", act[: r1 - r0], r0)
                 self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
             return
         Wg = self._deq(L.gu, a["W1"])
@@ -268,6 +290,8 @@ class FastPrefill:
             self._mm(xn[r0:r1], Wg, gu[:n])
             with self._t("silu"):
                 smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
+            if self.trace is not None:
+                self.trace.x("down", act[:n], r0)
             self._mm(act[:n], Wd, dn[r0:r1])
 
     def _tap(self, slot, row):
@@ -294,6 +318,8 @@ class FastPrefill:
             smk.check(self.lib.smk_embed(e.G.embed.data_ptr(), a["tok"].data_ptr(), a["h"].data_ptr(), T, H, st), "embed")
         if head and self.taps:
             self._tap(0, a["h"][T - 1])
+        if self.trace is not None:
+            self.trace.begin(pos0, T)
         for li, L in enumerate(e.Ls):
             self._norm(a["h"], None if li == 0 else a["dn"], L.ln1, a["xn"], T)
             if self.tap is not None and li in TAP_LI:
@@ -302,11 +328,19 @@ class FastPrefill:
                     self.tap.take_last(TAP_LI[li], a["h"][T - 1])
             if head and self.taps and li:
                 self._tap(li, a["h"][T - 1])
+            self._li = li
+            if self.trace is not None:
+                self.trace.layer(li)
+                self.trace.x("qkv", a["xn"][:T])
             if L.kind == "linear":
                 self._deltanet(li, L, a, T, cur)
             else:
                 self._attention(li, L, a, T, pos0)
+            if self.trace is not None:
+                self.trace.x("o", a["y6"][:T])
             self._norm(a["h"], a["mix"], L.ln2, a["xn"], T)
+            if self.trace is not None:
+                self.trace.x("gu", a["xn"][:T])
             self._mlp(L, a, T)
         if head:  # the engine's head tail takes the pre-norm (residual, last down_proj output) of the last row from its own buffers
             _view(self.lib.smkp_engine_ptr(e.h, 5), H * 2, torch.bfloat16).copy_(a["h"][T - 1])
@@ -424,8 +458,13 @@ class FastPrefill:
             ao = a["tmpA"][T * 6144 : T * 12288]
             smk.check(lib.smkp_attn_prep(T, pos0, q0, 14336, q0 + 12288 * 2, 14336, q0 + 13312 * 2, 14336, L.q_norm.data_ptr(), L.k_norm.data_ptr(), kvp, self.ctx_max,
                                          self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), st), "attn_prep")
-            flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
-                                   causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
+            if self.trace is not None:
+                self.trace.attn(qatt.view(T, 24, 256), kall, vall, Ltot, pos0, T)
+            if self.attn_hook is not None:
+                self.attn_hook(self._li, qatt.view(T, 24, 256), kall, vall, Ltot, pos0, T, ao.view(T, 24, 256))
+            else:
+                flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
+                                       causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
 
     def _mlp_seg(self, L, a, T, Wg, Wd):
@@ -435,7 +474,10 @@ class FastPrefill:
         if T <= self.w4_max:
             for r0 in range(0, T, self.rows):
                 r1 = min(T, r0 + self.rows)
-                self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                if self.mlp_hook is not None:
+                    self.mlp_hook(L, xn[r0:r1], act[: r1 - r0], self)
+                else:
+                    self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
                 self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
             return
         for r0 in range(0, T, self.rows):
