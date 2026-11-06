@@ -152,11 +152,13 @@ __device__ __forceinline__ void prep_row_load(float (&x)[8], int h, int t, int p
   }
 }
 
+// rdelta (nullable): the sequence's MRoPE offset (engine_impl.h DS_RDELTA): row t is KV position *pos0p + t, its rope angle uses position *pos0p + t + *rdelta
+// (after the last image of a prompt the three MRoPE axes are equal, so this is plain 1-D rope at the shifted position; 0 for text-only prompts).
 template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, const __nv_bfloat16* __restrict__ kk,
                                                         const __nv_bfloat16* __restrict__ vv, const __nv_bfloat16* __restrict__ q_norm,
                                                         const __nv_bfloat16* __restrict__ k_norm, void* kv, int ctx_max, float k_scale,
-                                                        float v_scale, const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf, KvInd ki) {
+                                                        float v_scale, const int* __restrict__ pos0p, const int* __restrict__ rdelta, uint16_t* __restrict__ qbuf, KvInd ki) {
   kv = kv_res(kv, ki);
   const int lane = threadIdx.x & 31;
   const int gw = blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -164,7 +166,7 @@ __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat
   if (t >= T) return;
   const int pos = *pos0p + t;
   float x[8];
-  prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+  prep_row_load(x, h, t, pos + (rdelta ? *rdelta : 0), lane, q_proj, kk, vv, q_norm, k_norm);
   if constexpr (I4) kvrot::wht256(x, lane);  // rotated int4 format (kvrot.cuh): q, k, v rows all live in the rotated basis, scores are unchanged
   if (h < NH) {
     uint16_t* dst = qbuf + ((size_t)t * NH + h) * HD;
@@ -199,17 +201,18 @@ __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat
 // and warp i stores code row i.  Grid: T * 11 blocks of 256 threads; per token blocks 0..2 = q heads 8 b + w (one warp each), blocks 3..10 = the 8 (K | V, kv head) rows.
 __global__ void __launch_bounds__(256) attn_prep_i4_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, const __nv_bfloat16* __restrict__ kk, const __nv_bfloat16* __restrict__ vv,
                                                            const __nv_bfloat16* __restrict__ q_norm, const __nv_bfloat16* __restrict__ k_norm, void* kv, int ctx_max,
-                                                           const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf, KvInd ki) {
+                                                           const int* __restrict__ pos0p, const int* __restrict__ rdelta, uint16_t* __restrict__ qbuf, KvInd ki) {
   kv = kv_res(kv, ki);
   static_assert(kvrot::NCAND == 8, "one scale candidate per warp");
   __shared__ float s_err[2][2][kvrot::NCAND];  // [chunk c][half h][candidate k]: squared error of the 16-lane group (2 c + h)
   const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int t = blockIdx.x / 11, b = blockIdx.x % 11;
   const int pos = *pos0p + t;
+  const int rpos = pos + (rdelta ? *rdelta : 0);  // rope position (see attn_prep_kernel)
   float x[8];
   if (b < 3) {
     const int h = b * 8 + w;
-    prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+    prep_row_load(x, h, t, rpos, lane, q_proj, kk, vv, q_norm, k_norm);
     kvrot::wht256(x, lane);
     uint16_t* dst = qbuf + ((size_t)t * NH + h) * HD;
 #pragma unroll
@@ -219,7 +222,7 @@ __global__ void __launch_bounds__(256) attn_prep_i4_kernel(int T, const __nv_bfl
   const int h = NH + (b - 3);
   const int isv = h >= NH + NKV;
   const int kvh = isv ? h - NH - NKV : h - NH;
-  prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+  prep_row_load(x, h, t, rpos, lane, q_proj, kk, vv, q_norm, k_norm);
   kvrot::wht256(x, lane);
   uint8_t* kvb = reinterpret_cast<uint8_t*>(kv);
   if (w == 1) kvrot::sink_store(x, lane, reinterpret_cast<uint16_t*>(kvb + kvrot::ring_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::RING_R + (pos & (kvrot::RING_R - 1))) * HD);
@@ -1315,18 +1318,18 @@ cudaError_t launch_multi(int T, const void* kv, int ctx_max, float k_scale, floa
 
 template <bool FP8, bool I4>
 cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, int ctx_max,
-                float k_scale, float v_scale, const int* pos0, void* out, void* ws, KvInd ki, cudaStream_t st) {
+                float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws, KvInd ki, cudaStream_t st) {
   char* w = reinterpret_cast<char*>(ws);
   uint16_t* qbuf = reinterpret_cast<uint16_t*>(w + WS_Q);
   float2* ml = reinterpret_cast<float2*>(w + WS_ML);
   float* part = reinterpret_cast<float*>(w + WS_PART);
   if constexpr (I4) {
     attn_prep_i4_kernel<<<T * 11, 256, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, (const __nv_bfloat16*)q_norm,
-                                                (const __nv_bfloat16*)k_norm, kv, ctx_max, pos0, qbuf, ki);
+                                                (const __nv_bfloat16*)k_norm, kv, ctx_max, pos0, rdelta, qbuf, ki);
   } else {
     attn_prep_kernel<FP8, I4><<<T * 8, 128, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
                                                      (const __nv_bfloat16*)q_norm, (const __nv_bfloat16*)k_norm, kv, ctx_max, k_scale, v_scale,
-                                                     pos0, qbuf, ki);
+                                                     pos0, rdelta, qbuf, ki);
   }
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return e;
@@ -1398,18 +1401,18 @@ cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype
 }
 
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
-                              int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, void* out, void* ws,
+                              int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws,
                               cudaStream_t stream) {
-  return swiftmk_attn_step_ind(T, q_proj, k, v, q_norm, k_norm, kv, nullptr, 0, ctx_max, kv_dtype, k_scale, v_scale, pos0, out, ws, stream);
+  return swiftmk_attn_step_ind(T, q_proj, k, v, q_norm, k_norm, kv, nullptr, 0, ctx_max, kv_dtype, k_scale, v_scale, pos0, rdelta, out, ws, stream);
 }
 
 cudaError_t swiftmk_attn_step_ind(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, void* const* kv_pp,
-                                  size_t kv_off, int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, void* out, void* ws, cudaStream_t stream) {
+                                  size_t kv_off, int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws, cudaStream_t stream) {
   if (T < 1 || T > TMAX) return cudaErrorInvalidValue;
   const KvInd ki = {kv_pp, kv_off};
-  if (kv_dtype == 1) return run<true, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, ki, stream);
-  if (kv_dtype == 2) return run<false, true>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, ki, stream);
-  return run<false, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, ki, stream);
+  if (kv_dtype == 1) return run<true, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
+  if (kv_dtype == 2) return run<false, true>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
+  return run<false, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
 }
 
 }  // extern "C"

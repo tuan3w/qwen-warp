@@ -6,7 +6,9 @@ default ~/models/swift-1.5-int4); starts and stops its own servers, one after th
 
 For each configuration: start serve.py, wait for /health, send a short chat request, then a /v1/completions request with a prompt of (--max-model-len - 64) tokens and 64 generated tokens,
 and report the time to ready and the GPU memory in use afterwards.  --max-model-len defaults come from serve.py, so a default that no longer fits fails here.
-  no flags | --prompt-lookup 0 | --kv-cache-dtype fp8 | --profile long | --profile long --max-model-len 262144 --prompt-lookup 0 | bf16 KV at the longest length a 24 GB card takes
+  no flags | --prompt-lookup 0 | --kv-cache-dtype fp8 | --profile long | --profile long --max-model-len 262144 --prompt-lookup 0 | bf16 KV at the longest length a 24 GB card takes |
+  --vision host | --vision device --max-model-len 16384 | --vision off (the placement the start chose is checked; every start whose image input is on also serves a 1920x1080 image,
+  the ViT's activation peak, next to its full-length cache; the default --vision auto must leave every text configuration as it was)
   --drafter dflash2 --host-tables (default length, and the longest length that fits) when the drafter checkpoint is present; --drafter dflash2 without --host-tables, with --profile long and at 98,304 tokens must be refused
 Beyond the memory there must be a fast, actionable refusal: two configurations that need more than the card has must exit non-zero within 60 s (not hang, not die with a raw CUDA OOM
 after loading the weights) and the message must give the free memory and the largest --max-model-len per cache layout.
@@ -66,7 +68,8 @@ def launch(flags, port, log):
     return subprocess.Popen([sys.executable, str(SERVE), "--port", str(port)] + flags, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
 
 
-def serves(t, name, flags, limit, prompt_len, port):
+def serves(t, name, flags, limit, prompt_len, port, vision=None):
+    """vision: the image-input placement the start must choose ("device" | "host" | "off"), None = report it only."""
     import httpx
     import numpy as np
 
@@ -92,6 +95,23 @@ def serves(t, name, flags, limit, prompt_len, port):
                                                                           chat_template_kwargs=dict(enable_thinking=False)))
         ok = r.status_code == 200 and r.json()["choices"][0]["message"]["content"].strip() != ""
         t.check(f"{name}: short chat request", ok, f"HTTP {r.status_code}" + ("" if ok else r.text[:150]))
+        line = next((x for x in Path(log).read_text().splitlines() if "swift-mk image input" in x), "")
+        place = "device" if "on the device" in line else "host" if "on the host" in line else "off"
+        if vision is not None:
+            t.check(f"{name}: image input placement {vision}", place == vision, line[line.find("image input"):][:160])
+        if place != "off":  # the largest admitted image (1920x1080 -> 2,040 tokens, the ViT's activation peak) must serve next to the full-length KV cache
+            import base64
+            import io
+
+            from PIL import Image
+
+            b = io.BytesIO()
+            Image.new("RGB", (1920, 1080), (20, 40, 220)).save(b, format="PNG")
+            img = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()}}
+            r = httpx.post(base + "/v1/chat/completions", timeout=120, json=dict(model="swift", max_tokens=8, temperature=0, chat_template_kwargs=dict(enable_thinking=False),
+                                                                              messages=[{"role": "user", "content": [img, {"type": "text", "text": "What colour is this image? One word."}]}]))
+            a = r.json()["choices"][0]["message"]["content"] if r.status_code == 200 else r.text[:150]
+            t.check(f"{name}: 1920x1080 image request (ViT weights on the {place})", r.status_code == 200 and "blue" in a.lower(), f"{a!r}")
         ids = np.random.default_rng(1).integers(1000, 100000, size=prompt_len).tolist()
         t1 = time.time()
         r = httpx.post(base + "/v1/completions", timeout=900, json=dict(model="swift", prompt=ids, max_tokens=64, temperature=0, ignore_eos=True))
@@ -142,6 +162,10 @@ def main():
     serves(t, "--profile long", ["--profile", "long"], serve.LONG_MAX_MODEL_LEN, cap(serve.LONG_MAX_MODEL_LEN - 64), a.port)
     serves(t, "--profile long --max-model-len 262144 --prompt-lookup 0", ["--profile", "long", "--max-model-len", "262144", "--prompt-lookup", "0"], 262144, cap(262144 - 64), a.port)
     serves(t, f"bf16 --max-model-len {EDGE_BF16:,} --prompt-lookup 0", ["--max-model-len", str(EDGE_BF16), "--prompt-lookup", "0"], EDGE_BF16, EDGE_BF16 - 64, a.port)
+    # image input: --vision auto must not cost a text configuration anything (the starts above use it); demanded placements that fit start and serve the largest image
+    serves(t, "--vision host", ["--vision", "host"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port, vision="host")
+    serves(t, "--vision device --max-model-len 16384", ["--vision", "device", "--max-model-len", "16384"], 16384, 16384 - 64, a.port, vision="device")
+    serves(t, "--vision off", ["--vision", "off"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port, vision="off")
     # --drafter dflash2 (experimental; needs the drafter checkpoint $DFLASH_W4): the drafter's K/V cache is 20 KiB per token on top of the engine, so it practically needs --host-tables
     if Path(os.environ.get("DFLASH_W4", os.path.expanduser("~/llm-lab/models/dflash2-w4a16"))).is_dir():
         serves(t, "--drafter dflash2 --host-tables", ["--drafter", "dflash2", "--host-tables"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port)

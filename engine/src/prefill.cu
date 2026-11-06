@@ -139,11 +139,16 @@ __global__ void __launch_bounds__(128) k_gnorm(const uint16_t* __restrict__ o, c
 // q_proj layout (ldq); k, v rows have strides ldk, ldv.  Row t is absolute position pos0 + t.
 //   qout [T][24][256] bf16 (normed + roped q);  k_all/v_all (nullable) bf16 token-major [pos][4][256] at index pos;
 //   kv = engine KV cache of this layer ([2][4][ctx_max][256], bf16 or fp8 e4m3 = x / scale) written at pos.
+//   pos3 (nullable): int32 [T][3] MRoPE positions (T, H, W axes) of the rows: rotary frequency l takes its angle from axis mrope_axis(l) (mrope_section [11, 11, 10],
+//   interleaved, as vLLM's apply_interleaved_rope); NULL = every axis at pos0 + t (text).  The cache row is pos0 + t either way.  Row-major per row, so the first T' < T rows
+//   of a segment's table serve a launch over T' rows (the MTP pairs of a folded segment).
+__device__ __forceinline__ int mrope_axis(int l) { return (l % 3 == 1 && l < 33) ? 1 : (l % 3 == 2 && l < 30) ? 2 : 0; }
+
 template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16_t* __restrict__ q, int ldq, const uint16_t* __restrict__ kk, int ldk,
                                                    const uint16_t* __restrict__ vv, int ldv, const uint16_t* __restrict__ q_norm, const uint16_t* __restrict__ k_norm,
                                                    void* kv, int ctx_max, float k_scale, float v_scale, uint16_t* __restrict__ qout,
-                                                   uint16_t* __restrict__ k_all, uint16_t* __restrict__ v_all) {
+                                                   uint16_t* __restrict__ k_all, uint16_t* __restrict__ v_all, const int* __restrict__ pos3) {
   const int lane = threadIdx.x & 31;
   const int gw = blockIdx.x * 4 + (threadIdx.x >> 5);
   const int t = gw >> 5, h = gw & 31;
@@ -168,7 +173,7 @@ __global__ void __launch_bounds__(128) k_attn_prep(int T, int pos0, const uint16
     for (int i = 0; i < 8; i++) x[i] = x[i] * inv * (1.f + bf2f(nw[lane + 32 * i]));
   }
   if (h < NHQ + NKV) {  // rope on dims 0..63: x[0] = d lane, x[1] = d lane+32 (rotate_half pair)
-    const double ang = (double)pos * c_inv_freq[lane];
+    const double ang = (double)(pos3 ? pos3[t * 3 + mrope_axis(lane)] : pos) * c_inv_freq[lane];
     const double kq = rint(ang * 0.15915494309189535);
     const double rr = fma(-kq, 2.4492935982947064e-16, fma(-kq, 6.283185307179586, ang));
     float sn, cs;
@@ -452,13 +457,16 @@ cudaError_t smkp_gnorm(const void* o, const void* z, int ldz, const void* norm_w
   return cudaGetLastError();
 }
 
-// q may be NULL (MTP K/V only).  k_all / v_all may be NULL.
+// Number of device scalars of a sequence (engine_impl.h DS_N; DS_RDELTA = DS_N - 1): the Python driver sizes its view of ds with it, and an older library without this symbol is refused.
+int smkp_ds_n(void) { return DS_N; }
+
+// q may be NULL (MTP K/V only).  k_all / v_all may be NULL.  pos3 (device int32 [T][3]) may be NULL: see k_attn_prep.
 cudaError_t smkp_attn_prep(int T, int pos0, const void* q, int ldq, const void* k, int ldk, const void* v, int ldv, const void* q_norm, const void* k_norm, void* kv,
-                           int ctx_max, int kv_dtype, float k_scale, float v_scale, void* qout, void* k_all, void* v_all, cudaStream_t st) {  // kv_dtype 0 bf16, 1 fp8, 2 int4
+                           int ctx_max, int kv_dtype, float k_scale, float v_scale, void* qout, void* k_all, void* v_all, const int* pos3, cudaStream_t st) {  // kv_dtype 0 bf16, 1 fp8, 2 int4
   if (T < 1) return cudaErrorInvalidValue;
   const unsigned grid = cdiv((long long)T * 32, 4);
 #define SMKP_PREP_ARGS (T, pos0, (const uint16_t*)q, ldq, (const uint16_t*)k, ldk, (const uint16_t*)v, ldv, (const uint16_t*)q_norm, (const uint16_t*)k_norm, kv, \
-                        ctx_max, k_scale, v_scale, (uint16_t*)qout, (uint16_t*)k_all, (uint16_t*)v_all)
+                        ctx_max, k_scale, v_scale, (uint16_t*)qout, (uint16_t*)k_all, (uint16_t*)v_all, pos3)
   if (kv_dtype == 1) k_attn_prep<true, false><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;
   else if (kv_dtype == 2) k_attn_prep<false, true><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;
   else k_attn_prep<false, false><<<grid, 128, 0, st>>> SMKP_PREP_ARGS;

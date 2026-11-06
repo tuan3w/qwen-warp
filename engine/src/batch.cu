@@ -186,7 +186,7 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
       for (int bi = 0; bi < B; bi++) {
         const size_t r0 = (size_t)bi * T;
         CKB(swiftmk_attn_step_ind(T, e->qb + r0 * 12288, e->kb + r0 * 1024, e->vb + r0 * 1024, L.q_norm, L.k_norm, nullptr, &b->ptr_b[bi].kv, koff, e->ctx_max, e->kv_dtype,
-                                  L.k_scale, L.v_scale, b->ds_b + bi * DS_N + DS_POS, e->y6 + r0 * 6144, e->ws_attn, st));
+                                  L.k_scale, L.v_scale, b->ds_b + bi * DS_N + DS_POS, b->ds_b + bi * DS_N + DS_RDELTA, e->y6 + r0 * 6144, e->ws_attn, st));
       }
     }
     {
@@ -258,7 +258,7 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
     for (int bi = 0; bi < B; bi++) {
       const size_t r0 = (size_t)bi * Tq;
       CKB(swiftmk_attn_step_ind(Tq, e->qb + r0 * 12288, e->kb + r0 * 1024, e->vb + r0 * 1024, M.q_norm, M.k_norm, nullptr, &b->ptr_b[bi].mtp_kv, 0, e->ctx_max, 0, 1.f, 1.f,
-                                b->ss_b + bi * SS_N + SS_DPOS + j, e->y6 + r0 * 6144, e->ws_attn, st));
+                                b->ss_b + bi * SS_N + SS_DPOS + j, b->ds_b + bi * DS_N + DS_RDELTA, e->y6 + r0 * 6144, e->ws_attn, st));
     }
     if (kd == 0) break;  // catch-up only: the MTP KV of the accepted rows is what later drafting needs
     smk_epi eo = {};

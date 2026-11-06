@@ -1,7 +1,7 @@
 # Performance and quality: what was measured, and how far to trust it
 
-Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) | [6. Concurrent requests](#6-concurrent-requests---max-num-seqs) |
-[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Reproducing](#7-reproducing) | [Back to README](../README.md)
+Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) |
+[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Image input](#6-image-input) | [7. Concurrent requests](#7-concurrent-requests---max-num-seqs) | [8. Reproducing](#8-reproducing) | [Back to README](../README.md)
 
 Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
 the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
@@ -284,7 +284,26 @@ With 4-bit KV (`--kv-cache-dtype int4_per_token_head --host-tables`, same proced
 
 **Not measured**: sampling (greedy only: sampled requests and requests with logit processors use the MTP path), DFlash2 beyond the lengths in [Usage](USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental) (the drafter KV cache is indexed by absolute position, 20 KiB per token; `--profile long` does not fit and the ring buffer that would cap it is not built), the device lm_head table of `DflashEngine` (the server keeps it on the host), the long-context presets of HyperQwen, and any quoting prompt other than the two above (where HyperQwen's lookup drafter reports 381 tok/s).
 
-## 6. Concurrent requests (`--max-num-seqs`)
+## 6. Image input
+
+RTX 3090, 2026-11-06. ViT encode (`tests/test_vision.py --time`, median of 10 after 3 warmup calls, bf16, FlashAttention-2, fp32 residual):
+
+| image (patches -> tokens) | 448x448 (784 -> 196) | 1024x768 (3,072 -> 768) | 1920x1080 (8,160 -> 2,040) |
+|---|---|---|---|
+| weights on the GPU (`--vision device`) | 16.4 ms | 65.1 ms | 220.5 ms |
+| weights streamed from pinned host memory (`--vision host`) | 67.9 ms | 74.2 ms | 222.8 ms |
+| activation peak | 32 MiB | 125 MiB | 333 MiB |
+
+Through the server (`tests/test_vision_server.py --bench 3`, `--max-model-len 16384`, `--vision auto`, streamed chat, thinking off, a fresh image per run so nothing is cached; median of 3):
+time to first token 218 ms / 617 ms / 1,468 ms at 448x448 / 1024x768 / 1920x1080 (the prefill of 223 / 795 / 2,067 prompt tokens included).
+Decode after a 1024x768 image: 108.6 tok/s against 123.4 for a text prompt asking for the same kind of story (385 tokens, n = 3). The step is not slower: 19.27 against 19.20 ms per
+cycle (server log: 2.09 against 2.37 tokens per cycle, 184 against 162 cycles), so the gap is the draft acceptance of the two different texts.
+Text requests are unchanged: README short prompts (385 tokens, greedy, ignore_eos, median of 3, same session) 184.3 / 118.2 / 184.1 tok/s against 0.7.0's 184.9 / 118.4 / 184.5 (ratio
+0.997 to 0.998, within noise), with greedy ids identical to 0.7.0.
+GPU memory (`memfit_vision.py` in the research notes, difference of the free memory after warmup + a largest-image request + a full-length request, 8,192 tokens, tail on): +888 MiB
+with the ViT weights on the GPU, +154 MiB streamed, at 8,100 patches. Not measured: quality of descriptions on real photographs, more than two images per prompt at speed, other sizes.
+
+## 7. Concurrent requests (`--max-num-seqs`)
 
 Measured 2026-11-06 on one RTX 3090 (23.7 GB free), one session, through the server with `experiments/2026-11-06-qwen-warp-concurrent-vision/bench_conc.py` (research repository):
 C closed-loop clients, each sending 3 greedy chat requests back to back (thinking off, `max_tokens` 512, stop at the end token; the 8 short code / prose / math prompts of that script,
@@ -320,7 +339,7 @@ A cycle of 8 rows costs 23.7 ms against 17.3 ms for 1 row: besides the GEMVs, ev
 Outputs: with the default schedule a request's draft depth changes with the number of running requests, and in these runs 4 of 9 (`--max-num-seqs 4`) and 6 of 9 (`--profile long`, 8 slots)
 requests at C = 8 diverged from the same prompt at C = 1 (at token 83 or 155 of 512); with the depth fixed (`SMK_BATCH_K`, the tests) every request equals its solo run exactly.
 
-## 7. Reproducing
+## 8. Reproducing
 
 | What | How | Takes |
 |---|---|---|

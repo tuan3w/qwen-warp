@@ -69,7 +69,8 @@ class FakeFP:
     def __init__(self, e):
         self.e = e
         self.seg, self.w4_max, self.fold, self.min_fast, self.nss = 64, 16, True, 2, 1
-        self.ds = torch.zeros(20, dtype=torch.int32)
+        self.ds = torch.zeros(21, dtype=torch.int32)  # engine_impl.h DS_N (DS_RDELTA = 20)
+        self.mm = None
         self.dn_state = torch.zeros(48, 1, 2, dtype=torch.int64)  # [0, 0] = (hash, tokens) of the sequence state
         self.dn_conv = torch.zeros(48, 9, 2, dtype=torch.int64)
         self.layer_hook = None
@@ -254,7 +255,7 @@ class FakeRunner(SB.BatchRunner):
         self.tasks, self.prefilling, self._rows, self.batched_cycles, self.single_cycles = [], None, 0, 0, 0
         self.k, self.group, self.max_snaps, self.log = 3, 2, max_snaps, print
         self.pld, self.drafter, self.df, self.df_lo, self.df_hi, self.tap, self.df_lookup, self.df_mib = True, "mtp", False, 0, 0, None, False, 0.0
-        self.max_num_seqs, self.bd, self.exact_k = S, FakeBD(world), exact_k
+        self.max_num_seqs, self.bd, self.exact_k, self.vit = S, FakeBD(world), exact_k, None
         self.seqs = [R.Seq(i, e, e.fp) for i, e in enumerate(FakeEngine(i, world, ctx_max) for i in range(S))]
         self.seq = self.seqs[0]
         self.ctx_max, self.load_s, self.pool, self._made = ctx_max, 0.0, [], 0
@@ -272,9 +273,9 @@ class FakeRunner(SB.BatchRunner):
     def _ss(self):
         return [0] * 40
 
-    def _begin(self, ids, p, route=None):
+    def _begin(self, ids, p, route=None, images=None):
         self.e.prompt = [int(t) for t in ids]
-        return super()._begin(ids, p, route)
+        return super()._begin(ids, p, route, images)
 
 
 def expected(prompt, p, n_new):

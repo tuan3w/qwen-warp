@@ -41,6 +41,28 @@ def _view(ptr, nbytes, dtype):
     return torch.as_tensor(_Buf(ptr, nbytes), device="cuda").view(dtype)
 
 
+def _ptr(t):
+    return None if t is None else t.data_ptr()
+
+
+class MMRows:
+    """Image inputs of ONE prompt for the fast prefill (FastPrefill.mm):
+      pos3  int32 [n][3] device tensor, the MRoPE (T, H, W) positions of every prompt row (engine/vision.py mrope_positions, transposed);
+      spans [(start, end, emb)]: placeholder rows start..end-1 of an image take the rows of emb ([end - start][5120] bf16, contiguous, the ViT output) instead of the token embedding;
+            emb may be None for an image that lies entirely before the resume position (its rows are never prefilled)."""
+
+    def __init__(self, pos3, spans):
+        self.pos3, self.spans = pos3, spans
+        self.end = max((t_end for _, t_end, _ in spans), default=0)  # rows before this may be image rows or text between images (their rope is not KV position + the final delta)
+        self._ar = None
+
+    def arange(self, n):
+        """Device pointer of int32 [0, 1, .., n - 1] (row indices into an emb block for smkp_mtp_cat)."""
+        if self._ar is None or self._ar.numel() < n:
+            self._ar = torch.arange(max(n, 4096), dtype=torch.int32, device="cuda")
+        return self._ar.data_ptr()
+
+
 def setup_prefill_api(lib):
     vp, ci, cf = C.c_void_p, C.c_int, C.c_float
     sig = {
@@ -48,7 +70,7 @@ def setup_prefill_api(lib):
         "smkp_conv": [vp, ci, vp, vp, vp, vp, vp, vp, ci, vp],
         "smkp_gates": [vp, vp, vp, vp, vp, ci, vp],
         "smkp_gnorm": [vp, vp, ci, vp, vp, ci, vp],
-        "smkp_attn_prep": [ci, ci, vp, ci, vp, ci, vp, ci, vp, vp, vp, ci, ci, cf, cf, vp, vp, vp, vp],
+        "smkp_attn_prep": [ci, ci, vp, ci, vp, ci, vp, ci, vp, vp, vp, ci, ci, cf, cf, vp, vp, vp, vp, vp],
         "smkp_gather_kv": [vp, ci, ci, ci, cf, cf, vp, vp, vp],
         "smkp_attn_gate": [vp, vp, ci, vp, ci, vp],
         "smkp_silu_mul": [vp, vp, ci, vp],
@@ -57,6 +79,7 @@ def setup_prefill_api(lib):
         "smkp_dn_row": [vp, ci, vp, vp, vp, vp, vp, vp, vp, vp],
         "smkp_head_finish": [vp, ci, vp],
         "smkp_materialize": [vp, vp],
+        "smkp_ds_n": [],
         "smk_engine_head_tail": [vp, ci, vp],
     }
     for n, a in sig.items():
@@ -69,6 +92,8 @@ def setup_prefill_api(lib):
 
 
 class FastPrefill:
+    DS_RDELTA = 20  # engine_impl.h: the sequence's MRoPE rope offset (decode ropes at KV position + ds[DS_RDELTA]); the Runner sets it per request
+
     def __init__(self, eng, seg=4096, rows=2048, min_fast=2, w4_max=240, fold=True):
         self.e, self.lib = eng, eng.lib
         setup_prefill_api(self.lib)
@@ -81,9 +106,12 @@ class FastPrefill:
         self.taps = False  # test hook: write the last row's per-layer residual into the engine debug taps (a folded head has no step that does)
         self.tap = None  # DFlash2 drafter context capture (dflash.TapCapture): reads the residual entering the tap layers of every segment / group; never writes the prefill's own buffers
         self.layer_hook = None  # called with the segment's (group's) row count after every layer of a fast segment: the batched server decodes the other sequences there (a long prefill does not freeze them)
+        self.mm = None  # image inputs of the prompt being prefilled (MMRows): MRoPE positions + ViT rows of the placeholder tokens; None = text (the v0.7.0 path, unchanged)
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
-        self.ds = _view(lib.smkp_engine_ptr(e, 0), 20 * 4, torch.int32)  # engine_impl.h DS_N = 20 (DS_PEND = 19: pending lazy DeltaNet rows)
+        n_ds = lib.smkp_ds_n()  # engine_impl.h DS_N (a library older than the sources lacks the symbol: AttributeError); DS_PEND = 19 pending lazy DeltaNet rows
+        assert n_ds == self.DS_RDELTA + 1, n_ds
+        self.ds = _view(lib.smkp_engine_ptr(e, 0), n_ds * 4, torch.int32)
         nsl = lib.smk_engine_sslots(e)  # physical DeltaNet state slots (tmax + 1, or 1 for a batched-decode sequence slot: ring slot cur lives in state slot cur % nsl)
         self.nss = nsl
         self.dn_state = _view(lib.smkp_engine_ptr(e, 1), 48 * nsl * 48 * 128 * 128 * 4, torch.float32).view(48, nsl, 48, 128, 128)
@@ -249,7 +277,7 @@ class FastPrefill:
             qatt = a["tmpA"][: T * 6144]
             ao = a["tmpA"][T * 6144 : T * 12288]
             smk.check(lib.smkp_attn_prep(T, pos0, q0, 14336, q0 + 12288 * 2, 14336, q0 + 13312 * 2, 14336, L.q_norm.data_ptr(), L.k_norm.data_ptr(), kvp, self.ctx_max,
-                                         self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), st), "attn_prep")
+                                         self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), _ptr(a["pos3"]), st), "attn_prep")
             flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
                                    causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
@@ -278,6 +306,18 @@ class FastPrefill:
         """Test hook (taps=True): store the last row's residual into the engine's debug tap `slot` row 0 (what a T=1 head step would have written)."""
         _view(self.lib.smkp_engine_ptr(self.e.h, 7) + slot * 8 * H * 2, H * 2, torch.bfloat16).copy_(row)
 
+    def _mm_rows(self, a, pos0, T):
+        """Image inputs of the rows pos0 .. pos0 + T - 1 (after their token embedding): the segment's MRoPE table a['pos3'] (None for a text prompt) and the ViT rows of placeholder tokens."""
+        mm = self.mm
+        if mm is None:
+            a["pos3"] = None
+            return
+        a["pos3"] = mm.pos3[pos0 : pos0 + T]
+        for s, t_end, emb in mm.spans:
+            r0, r1 = max(s, pos0), min(t_end, pos0 + T)
+            if r0 < r1:
+                a["h"][r0 - pos0 : r1 - pos0].copy_(emb[r0 - s : r1 - s])
+
     # ------------------------------------------------------------------------------------------------ segment / prompt
     def _segment(self, ids_seg, pos0, cur, nxt=None, head=False):
         """Run tokens ids_seg (list) at positions pos0.. through the 64 layers (state carried through the engine buffers).
@@ -296,6 +336,7 @@ class FastPrefill:
         a["cuk"] = torch.tensor([0, pos0 + T], dtype=torch.int32, device="cuda")
         with self._t("embed"):
             smk.check(self.lib.smk_embed(e.G.embed.data_ptr(), a["tok"].data_ptr(), a["h"].data_ptr(), T, H, st), "embed")
+        self._mm_rows(a, pos0, T)
         if head and self.taps:
             self._tap(0, a["h"][T - 1])
         for li, L in enumerate(e.Ls):
@@ -352,9 +393,10 @@ class FastPrefill:
         poss = [x[1] for x in segs]
         big = any(T > self.w4_max for T in Ts)
         self._fold = False
-        for av, T in zip(views, Ts):
+        for av, T, pos0 in zip(views, Ts, poss):
             with self._t("embed"):
                 smk.check(self.lib.smk_embed(e.G.embed.data_ptr(), av["tok"].data_ptr(), av["h"].data_ptr(), T, H, st), "embed")
+            self._mm_rows(av, pos0, T)
         for li, L in enumerate(e.Ls):
             for av, T in zip(views, Ts):
                 self._norm(av["h"], None if li == 0 else av["dn"], L.ln1, av["xn"], T)
@@ -431,7 +473,7 @@ class FastPrefill:
             qatt = a["tmpA"][: T * 6144]
             ao = a["tmpA"][T * 6144 : T * 12288]
             smk.check(lib.smkp_attn_prep(T, pos0, q0, 14336, q0 + 12288 * 2, 14336, q0 + 13312 * 2, 14336, L.q_norm.data_ptr(), L.k_norm.data_ptr(), kvp, self.ctx_max,
-                                         self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), st), "attn_prep")
+                                         self.fp8, L.k_scale, L.v_scale, qatt.data_ptr(), kall.data_ptr(), vall.data_ptr(), _ptr(a["pos3"]), st), "attn_prep")
             flash_attn_varlen_func(qatt.view(T, 24, 256), kall[:Ltot], vall[:Ltot], max_seqlen_q=T, cu_seqlens_q=a["cuq"], max_seqlen_k=Ltot, cu_seqlens_k=a["cuk"],
                                    causal=True, softmax_scale=1.0 / 16, fa_version=2, out=ao.view(T, 24, 256))
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
@@ -462,6 +504,13 @@ class FastPrefill:
         cat = a["tmpA"][: T * 2 * H].view(T, 2 * H)
         with self._t("mtp"):
             smk.check(lib.smkp_mtp_cat(e.G.embed.data_ptr(), a["tok"].data_ptr(), a["xn"].data_ptr(), M.pre_e.data_ptr(), M.pre_h.data_ptr(), cat.data_ptr(), T, st), "mtp_cat")
+            if self.mm is not None:  # pairs whose next token is an image placeholder take its ViT row as the MTP input embedding (vLLM's MTP proposer feeds the merged mm embeddings)
+                for s, t_end, emb in self.mm.spans:
+                    t0, t1 = max(s - 1 - pos0, 0), min(t_end - 1 - pos0, T)
+                    if t0 < t1:
+                        j0 = pos0 + t0 + 1 - s
+                        smk.check(lib.smkp_mtp_cat(emb.data_ptr() + j0 * H * 2, self.mm.arange(t1 - t0), a["xn"].data_ptr() + t0 * H * 2, M.pre_e.data_ptr(), M.pre_h.data_ptr(),
+                                                   cat.data_ptr() + t0 * 2 * H * 2, t1 - t0, st), "mtp_cat_mm")
         fcout = a["mix"][:T]
         self._w4mm(cat, M.fc, a["W1"], fcout)
         self._norm(fcout, None, M.ln1, a["xn"], T)
@@ -472,7 +521,7 @@ class FastPrefill:
             self._mm(a["xn"][:T], self._deq(M.qkv, a["W2"], 12288, 2048), kv)
         with self._t("mtp"):
             smk.check(lib.smkp_attn_prep(T, pos0, None, 0, kv.data_ptr(), 2048, kv.data_ptr() + 1024 * 2, 2048, None, M.k_norm.data_ptr(), self.mtp_kv, self.ctx_max, 0, 1.0, 1.0,
-                                         None, None, None, st), "mtp_kv")
+                                         None, None, None, _ptr(a["pos3"]), st), "mtp_kv")
 
     def _run(self, ids, spec):
         """Fast prefill of ids[:-1] from the current engine position (rows at positions pos0..), then ids[-1] as the head=1 decode step.  Returns the first token.

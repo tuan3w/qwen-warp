@@ -88,7 +88,7 @@ static cudaError_t mtp_layer(smk_spec* s, int T, const void* hid_src, const int*
   smk_epi eq = {};
   eq.kind = SMK_EPI_SEGS; eq.end[0] = 12288; eq.end[1] = 13312; eq.end[2] = 14336; eq.out[0] = e->qb; eq.out[1] = e->kb; eq.out[2] = e->vb;
   CKS(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &eq, st));
-  CKS(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, s->kvbuf, e->ctx_max, 0, 1.f, 1.f, pos, e->y6, e->ws_attn, st));
+  CKS(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, s->kvbuf, e->ctx_max, 0, 1.f, 1.f, pos, e->ds + DS_RDELTA, e->y6, e->ws_attn, st));
   if (kv_only) return cudaSuccess;
   smk_epi eo = {};
   eo.kind = SMK_EPI_SEGS; eo.end[0] = eo.end[1] = eo.end[2] = H; eo.out[0] = e->mix;

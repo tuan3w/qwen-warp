@@ -21,7 +21,7 @@ from typing import Callable
 
 import numpy as np
 
-from smk_runner import GenParams, Runner, Seq, Stats
+from smk_runner import GenParams, Runner, Seq, Stats, cache_key
 
 # drafts per sequence by the number of running requests: the most that fits the 8 rows of a weight pass (B x (k + 1) <= 8); measured best for every B (docs/PERFORMANCE.md, B x k table)
 K_BY_B = {1: 3, 2: 3, 3: 1, 4: 1, 5: 0, 6: 0, 7: 0, 8: 0}
@@ -40,6 +40,7 @@ class Task:
     emit: Callable  # emit(task, tokens, finish_reason | None, stop_reason)
     done: Callable  # done(task): the request left its slot (finished, aborted or failed)
     cancelled: Callable = lambda: False
+    images: list = None  # vision.ImageInput of the prompt (None: text)
     seq: Seq = None
     st: Stats = None
     n_new: int = 0
@@ -87,14 +88,15 @@ class BatchRunner(Runner):
     def free(self):
         return [q for q in self.seqs if not q.busy]
 
-    def _slot_for(self, ids):
+    def _slot_for(self, ids, images=None):
         """The free slot a prompt goes to: the one whose device lineage resumes it furthest, else the least recently used (an empty one first)."""
         ends = set(self._plan(ids)[0])
+        key = cache_key(ids, sorted(images, key=lambda im: im.offset)) if images else np.asarray(ids, dtype=np.int32)  # lineages match on the image-aware key
         best, bpos = None, -1
         cur = self.seq
         for q in self.free():
             self.seq = q
-            s = self._choose(ids, ends)
+            s = self._choose(key, ends)
             if s is not None and s.pos > bpos:
                 best, bpos = q, s.pos
         self.seq = cur
@@ -104,19 +106,20 @@ class BatchRunner(Runner):
 
     def start(self, t: Task):
         """Admit t into a free slot and prefill it (the running requests decode inside the prefill); afterwards t decodes with the others.  Raises ValueError for a prompt that does not fit."""
-        q = self._slot_for([int(x) for x in t.ids])
+        q = self._slot_for([int(x) for x in t.ids], t.images)
         q.busy = True
         t.seq = q
         self.seq = q
         try:
-            b = self._begin(t.ids, t.p)
+            b = self._begin(t.ids, t.p, images=t.images)  # (encodes the prompt's images: the running requests wait for the ViT, ~0.1 s per image)
             t.ids, t.st, t.n_new = b.ids, b.st, b.n_new
             q.fp.layer_hook = self._layer_hook
             self.prefilling, self._rows = t, 0
             try:
-                ok = self._prefill(t.ids, b.q, b.ends, b.folded, t.cancelled, False)
+                ok = self._prefill(t.ids, b.q, b.ends, b.folded, t.cancelled, False, b.key)
             finally:
                 q.fp.layer_hook = None
+                q.fp.mm = None
                 self.prefilling = None
                 self.seq = q
         except BaseException:
