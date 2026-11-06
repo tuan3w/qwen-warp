@@ -14,6 +14,8 @@ Tier: 0
 4. image input turned off by --vision auto (one sequence and --max-num-seqs > 1): the reason names settings that fit, and each named setting does turn image input on (the largest such
    --max-model-len exactly); the frontend's image-count check refuses an image with that reason (a 400 before a streaming response starts), video / text / image-on are untouched;
    without --max-model-len, --max-num-seqs > 1 picks a length that keeps image input on (the previous default turned it off at a large --max-image-pixels).
+5. serve.py profiles: --profile multiuser = --max-num-seqs 5 --host-tables --vision device at a length the start-up check accepts (explicit flags win); no flags and --profile long keep
+   one sequence and --vision auto.
 """
 import sys
 from pathlib import Path
@@ -196,9 +198,35 @@ def test_vision_off():
               new_on is not None and old_on is None and a.max_model_len >= old - 3072)
 
 
+def test_profiles():
+    """serve.parse_args: --profile multiuser = --max-num-seqs 5 --host-tables --vision device with a length that the start-up check accepts; explicit flags win; no flags and
+    --profile long are what they were (one sequence, --vision auto)."""
+    import serve
+    import smk_core_client as sc
+
+    free = 23228  # a 24 GB card next to a 0.6 GiB desktop
+    real = torch.cuda.mem_get_info
+    torch.cuda.mem_get_info = lambda device=None: (free << 20, 24 << 30)
+    try:
+        mu = serve.parse_args(["--profile", "multiuser"])
+        mu2 = serve.parse_args(["--profile", "multiuser", "--max-num-seqs", "3", "--vision", "host", "--max-model-len", "8192"])
+        d, lg = serve.parse_args([]), serve.parse_args(["--profile", "long"])
+    finally:
+        torch.cuda.mem_get_info = real
+    c = cfg(free, mu.max_model_len, mode=mu.vision, ht=mu.host_tables, S=mu.max_num_seqs)
+    check(f"--profile multiuser: 5 slots, host tables, ViT on the device, bf16 KV, {mu.max_model_len:,} tokens per slot at {free:,} MiB free, accepted by the start-up check",
+          (mu.max_num_seqs, mu.host_tables, mu.vision, mu.kv_cache_dtype in (None, "auto")) == (5, True, "device", True) and mu.max_model_len >= 8192
+          and not isinstance(c, str) and c.max_num_seqs == 5 and c.vision == "device", c if isinstance(c, str) else "")
+    check("--profile multiuser: explicit --max-num-seqs / --vision / --max-model-len win", (mu2.max_num_seqs, mu2.vision, mu2.max_model_len, mu2.host_tables) == (3, "host", 8192, True))
+    check("no flags: one sequence, --vision auto, device tables, the default length (as before)", (d.max_num_seqs, d.vision, d.host_tables, d.max_model_len) == (1, "auto", False, serve.DEFAULT_MAX_MODEL_LEN_PLD))
+    check("--profile long: one sequence, --vision auto, int4 KV + host tables, 196,608 tokens (as before)",
+          (lg.max_num_seqs, lg.vision, lg.host_tables, lg.kv_cache_dtype, lg.max_model_len) == (1, "auto", True, "int4_per_token_head", serve.LONG_MAX_MODEL_LEN))
+
+
 test_key()
 test_parse()
 test_memory()
 test_vision_off()
+test_profiles()
 print(f"{sum(RES)}/{len(RES)} passed", flush=True)
 sys.exit(0 if all(RES) else 1)
