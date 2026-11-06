@@ -158,9 +158,9 @@ class Vision:
         if self.attn == "fa2":
             return self._fa(q, k, v.contiguous(), max_seqlen_q=mx, cu_seqlens_q=cu, max_seqlen_k=mx, cu_seqlens_k=cu, causal=False, softmax_scale=self.hd**-0.5, fa_version=2)
         outs, r = [], 0
-        for n in seq:  # reference path: one SDPA call per image
-            qq, kk, vv = (x[r : r + n].transpose(0, 1) for x in (q, k, v))
-            outs.append(F.scaled_dot_product_attention(qq, kk, vv, scale=self.hd**-0.5).transpose(0, 1))
+        for n in seq:  # reference path: SDPA per image, in blocks of 1024 query rows (the [heads, rows, n] fp32 scores of a 1920x1080 image whole would be 4.3 GiB)
+            kk, vv = (x[r : r + n].transpose(0, 1) for x in (k, v))
+            outs += [F.scaled_dot_product_attention(q[a : min(a + 1024, r + n)].transpose(0, 1), kk, vv, scale=self.hd**-0.5).transpose(0, 1) for a in range(r, r + n, 1024)]
             r += n
         return torch.cat(outs)
 
