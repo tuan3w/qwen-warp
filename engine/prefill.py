@@ -19,6 +19,7 @@ Design (numbers: docs/PERFORMANCE.md):
 Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import ctypes as C
+import os
 import time
 
 import torch
@@ -251,6 +252,20 @@ class FastPrefill:
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
         self._w4mm(a["y6"][:T], L.o, a["W2"], a["mix"][:T])
 
+    def _sp_ctrl(self, act):
+        """Lab control knob (off by default): SMK_SP_CTRL_PF_ZERO=f zeroes a fixed pseudo-random fraction f of the MLP activation channels of every prefill layer (positive control of
+        the `prefill` metric), SMK_SP_CTRL_PF_NOOP=1 runs the same masked fill with nothing masked (negative control)."""
+        f = float(os.environ.get("SMK_SP_CTRL_PF_ZERO", "0") or 0)
+        if f > 0 or os.environ.get("SMK_SP_CTRL_PF_NOOP"):
+            key = (act.shape[1], f)
+            m = self._sp_masks.get(key) if hasattr(self, "_sp_masks") else None
+            if m is None:
+                if not hasattr(self, "_sp_masks"):
+                    self._sp_masks = {}
+                g = torch.Generator(device="cpu").manual_seed(1234)
+                m = self._sp_masks[key] = (torch.rand(act.shape[1], generator=g) < f).to(act.device)
+            act.masked_fill_(m, 0)
+
     def _mlp(self, L, a, T):
         lib, st = self.lib, self.e.st
         xn, dn, gu, act = a["xn"], a["dn"], a["gu"], a["act"]
@@ -258,6 +273,7 @@ class FastPrefill:
             for r0 in range(0, T, self.rows):
                 r1 = min(T, r0 + self.rows)
                 self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                self._sp_ctrl(act[: r1 - r0])
                 self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
             return
         Wg = self._deq(L.gu, a["W1"])
@@ -268,6 +284,7 @@ class FastPrefill:
             self._mm(xn[r0:r1], Wg, gu[:n])
             with self._t("silu"):
                 smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
+            self._sp_ctrl(act[:n])
             self._mm(act[:n], Wd, dn[r0:r1])
 
     def _tap(self, slot, row):
@@ -436,6 +453,7 @@ class FastPrefill:
             for r0 in range(0, T, self.rows):
                 r1 = min(T, r0 + self.rows)
                 self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
+                self._sp_ctrl(act[: r1 - r0])
                 self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
             return
         for r0 in range(0, T, self.rows):
@@ -444,6 +462,7 @@ class FastPrefill:
             self._mm(xn[r0:r1], Wg, gu[:n])
             with self._t("silu"):
                 smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
+            self._sp_ctrl(act[:n])
             self._mm(act[:n], Wd, dn[r0:r1])
 
     def _mtp(self, a, T, pos0, nxt):
