@@ -16,6 +16,8 @@ struct SeqPtrs {
   void* kv;
   void* mtp_kv;
 };
+constexpr int PP_STR = (int)(sizeof(SeqPtrs) / sizeof(void*));  // pointer-table stride of the fused multi-sequence launches
+static_assert(sizeof(SeqPtrs) % sizeof(void*) == 0, "SeqPtrs: pointers only");
 // What the gather / scatter kernels copy between a sequence's own buffers and its batch position.
 struct SlotDesc {
   int* ds;
@@ -170,29 +172,22 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
       CKB(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 16384, H, R, &ep, st));
       CKB(cudaStreamWaitEvent(st, e->ev_join, 0));
       const int di = e->dn_idx[l];
-      for (int bi = 0; bi < B; bi++) {
-        swiftmk_dn_ind ind = {};
-        ind.state_pp = &b->ptr_b[bi].dn_state;
-        ind.conv_pp = &b->ptr_b[bi].dn_conv;
-        ind.dbuf_pp = &b->ptr_b[bi].dn_dbuf;
-        ind.state_off = (size_t)di * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS;
-        ind.conv_off = (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS;
-        ind.dbuf_off = (size_t)di * swiftmk_deltanet_dbuf_floats();
-        const int* ds = b->ds_b + bi * DS_N;
-        const size_t r0 = (size_t)bi * T;
-        CKB(swiftmk_deltanet_step_lazy2(T, e->qkv + r0 * 10240, e->z + r0 * 6144, e->ba + r0 * 48, e->bb + r0 * 48, L.conv_w, L.A_log, L.dt_bias, L.norm_w, nullptr, nullptr,
-                                        ds + DS_CUR, e->slots, e->sslots, e->y6 + r0 * 6144, e->ws_dn, nullptr, ds + DS_PEND, &ind, st));
-      }
+      swiftmk_dn_ind ind = {};  // sequence bi: ptr_b[bi] (PP_STR pointers per entry)
+      ind.state_pp = &b->ptr_b[0].dn_state;
+      ind.conv_pp = &b->ptr_b[0].dn_conv;
+      ind.dbuf_pp = &b->ptr_b[0].dn_dbuf;
+      ind.state_off = (size_t)di * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS;
+      ind.conv_off = (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS;
+      ind.dbuf_off = (size_t)di * swiftmk_deltanet_dbuf_floats();
+      CKB(swiftmk_deltanet_step_multi(B, T, e->qkv, e->z, e->ba, e->bb, L.conv_w, L.A_log, L.dt_bias, L.norm_w, nullptr, nullptr, b->ds_b + DS_CUR, DS_N, e->slots, e->sslots,
+                                      e->y6, e->ws_dn, nullptr, b->ds_b + DS_PEND, &ind, PP_STR, st));
     } else {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 12288; ep.end[1] = 13312; ep.end[2] = 14336; ep.out[0] = e->qb; ep.out[1] = e->kb; ep.out[2] = e->vb;
       CKB(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, R, &ep, st));
       const size_t koff = (size_t)e->at_idx[l] * e->kv_layer_bytes;
-      for (int bi = 0; bi < B; bi++) {
-        const size_t r0 = (size_t)bi * T;
-        CKB(swiftmk_attn_step_ind(T, e->qb + r0 * 12288, e->kb + r0 * 1024, e->vb + r0 * 1024, L.q_norm, L.k_norm, nullptr, &b->ptr_b[bi].kv, koff, e->ctx_max, e->kv_dtype,
-                                  L.k_scale, L.v_scale, b->ds_b + bi * DS_N + DS_POS, b->ds_b + bi * DS_N + DS_RDELTA, e->y6 + r0 * 6144, e->ws_attn, st));
-      }
+      CKB(swiftmk_attn_step_multi(B, T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, nullptr, &b->ptr_b[0].kv, koff, PP_STR, e->ctx_max, e->kv_dtype, L.k_scale, L.v_scale,
+                                  b->ds_b + DS_POS, DS_N, b->ds_b + DS_RDELTA, DS_N, e->y6, e->ws_attn, st));
     }
     {
       smk_epi ep = {};
@@ -260,11 +255,8 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
     smk_epi eq = {};
     eq.kind = SMK_EPI_SEGS; eq.end[0] = 12288; eq.end[1] = 13312; eq.end[2] = 14336; eq.out[0] = e->qb; eq.out[1] = e->kb; eq.out[2] = e->vb;
     CKB(smk_w4r_gemv(M.qkv_w, M.qkv_s, e->xn, 14336, H, rows, &eq, st));
-    for (int bi = 0; bi < B; bi++) {
-      const size_t r0 = (size_t)bi * Tq;
-      CKB(swiftmk_attn_step_ind(Tq, e->qb + r0 * 12288, e->kb + r0 * 1024, e->vb + r0 * 1024, M.q_norm, M.k_norm, nullptr, &b->ptr_b[bi].mtp_kv, 0, e->ctx_max, 0, 1.f, 1.f,
-                                b->ss_b + bi * SS_N + SS_DPOS + j, b->ds_b + bi * DS_N + DS_RDELTA, e->y6 + r0 * 6144, e->ws_attn, st));
-    }
+    CKB(swiftmk_attn_step_multi(B, Tq, e->qb, e->kb, e->vb, M.q_norm, M.k_norm, nullptr, &b->ptr_b[0].mtp_kv, 0, PP_STR, e->ctx_max, 0, 1.f, 1.f,
+                                b->ss_b + SS_DPOS + j, SS_N, b->ds_b + DS_RDELTA, DS_N, e->y6, e->ws_attn, st));
     if (kd == 0) break;  // catch-up only: the MTP KV of the accepted rows is what later drafting needs
     smk_epi eo = {};
     eo.kind = SMK_EPI_SEGS; eo.end[0] = eo.end[1] = eo.end[2] = H; eo.out[0] = e->mix;
