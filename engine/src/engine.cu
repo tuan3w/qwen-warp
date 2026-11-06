@@ -76,7 +76,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 12288; ep.end[1] = 13312; ep.end[2] = 14336; ep.out[0] = e->qb; ep.out[1] = e->kb; ep.out[2] = e->vb;
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
       CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_dtype,
-                           L.k_scale, L.v_scale, ds + DS_POS, e->y6, e->ws_attn, st));
+                           L.k_scale, L.v_scale, ds + DS_POS, ds + DS_RDELTA, e->y6, e->ws_attn, st));
     }
     {
       smk_epi ep = {};
@@ -185,7 +185,7 @@ void smk_engine_destroy(smk_engine* e) {
 cudaError_t smk_engine_reset(smk_engine* e, cudaStream_t st) {
   const int nd = 48, na = 16;
   cudaMemsetAsync(e->ds, 0, DS_SLOTS * sizeof(int), st);  // ds[DS_SLOTS] (ring size) is constant
-  cudaMemsetAsync(e->ds + DS_PEND, 0, sizeof(int), st);
+  cudaMemsetAsync(e->ds + DS_PEND, 0, 2 * sizeof(int), st);  // DS_PEND, DS_RDELTA
   cudaMemsetAsync(e->dn_state, 0, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, st);
   cudaMemsetAsync(e->dn_conv, 0, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, st);
   cudaMemsetAsync(e->kv, 0, (size_t)na * e->kv_layer_bytes, st);
