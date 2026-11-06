@@ -34,3 +34,7 @@ test:
 	uv run tests/test_vision.py
 	uv run tests/test_vision_engine.py
 	uv run tests/test_vision_server.py
+	uv run tests/test_batch_sched.py
+	uv run tests/test_batch_engine.py
+	uv run tests/test_batch_vision_engine.py
+	uv run tests/test_server_batch.py

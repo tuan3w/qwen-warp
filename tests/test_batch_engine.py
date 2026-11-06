@@ -130,9 +130,10 @@ def part_a(r):
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- solo replay
-def solo(r, ids, p, calls):
-    """The tokens of one request decoded alone on slot 0 from a COLD prefill with the given decode calls (cached on disk)."""
-    key = hashlib.sha1(json.dumps([SRC_HASH, r.ctx_max, r.e.kv_fp8, list(ids), repr(p), calls], default=str).encode()).hexdigest()
+def solo(r, ids, p, calls, images=None):
+    """The tokens of one request decoded alone on slot 0 from a COLD prefill with the given decode calls (cached on disk).  images: the prompt's vision.ImageInput list (None: text)."""
+    ims = [(im.offset, tuple(im.grid), im.key) for im in images or []]
+    key = hashlib.sha1(json.dumps([SRC_HASH, r.ctx_max, r.e.kv_fp8, list(ids), repr(p), calls] + ([ims] if ims else []), default=str).encode()).hexdigest()
     f = CACHE / f"{key}.json"
     if f.exists():
         return json.loads(f.read_text())
@@ -143,9 +144,12 @@ def solo(r, ids, p, calls):
     r._free_snaps([])
     store, r.store = r.store, None
     try:
-        b = r._begin(ids, p)
+        b = r._begin(ids, p, images=images)
         assert b.q == 0
-        assert r._prefill(b.ids, 0, b.ends, b.folded, lambda: False, False)
+        try:
+            assert r._prefill(b.ids, 0, b.ends, b.folded, lambda: False, False, b.key)
+        finally:
+            q.fp.mm = None
         e = q.e
         e._emitted = r._ss()[12]
         e.drafted = r.k
@@ -188,9 +192,10 @@ def params(rng, i, max_tokens):
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- B
 def part_b(r, prompts):
+    """prompts: (ids, images | None) entries; consecutive slots of a batch take consecutive entries (a pool that alternates image and text prompts mixes every batch)."""
     rng = random.Random(1)
     S = len(r.seqs)
-    n_cmp = 0
+    n_cmp = n_img = 0
     for B in range(1, S + 1):
         for k in range(0, 4):
             if B * (k + 1) > 8:
@@ -201,13 +206,16 @@ def part_b(r, prompts):
                 r.seq = q
                 q.lineage = None
                 r._free_snaps([])
-                ids = prompts[(B * 3 + k + i) % len(prompts)]
+                ids, ims = prompts[(B * 3 + k + i) % len(prompts)]
                 p = params(rng, B * 7 + k + i, 64)
-                b = r._begin(ids, p)
-                assert r._prefill(b.ids, b.q, b.ends, b.folded, lambda: False, False)
+                b = r._begin(ids, p, images=ims)
+                try:
+                    assert r._prefill(b.ids, b.q, b.ends, b.folded, lambda: False, False, b.key)
+                finally:
+                    q.fp.mm = None
                 q.e._emitted = r._ss()[12]
                 q.e.drafted = r.k
-                rec.append(dict(ids=b.ids, p=p, toks=[q.e.read_out_tok()], calls=[]))
+                rec.append(dict(ids=b.ids, ims=ims, p=p, toks=[q.e.read_out_tok()], calls=[]))
             es = [q.e for q in slots]
             for call in [(min(k, 3), k, 2), (k, k, 3), (k, k, 2)]:
                 news, _ = r.bd.cycles(es, *call)
@@ -215,25 +223,27 @@ def part_b(r, prompts):
                     x["toks"] += new
                     x["calls"].append(("batch",) + call)
             for x in rec:
-                ref = solo(r, x["ids"], x["p"], x["calls"])
-                assert x["toks"] == ref[: len(x["toks"])] and len(ref) >= len(x["toks"]), f"B={B} k={k}: batched != solo (first difference at {first_diff(x['toks'], ref)}, {x['p']})"
+                ref = solo(r, x["ids"], x["p"], x["calls"], x["ims"])
+                assert x["toks"] == ref[: len(x["toks"])] and len(ref) >= len(x["toks"]), f"B={B} k={k}: batched != solo (first difference at {first_diff(x['toks'], ref)}, {x['p']}, images {bool(x['ims'])})"
                 n_cmp += 1
-    print(f"B: {n_cmp} sequences in batches B = 1..{S} x every depth: identical to their solo replays", flush=True)
+                n_img += bool(x["ims"])
+    print(f"B: {n_cmp} sequences ({n_img} with images) in batches B = 1..{S} x every depth: identical to their solo replays", flush=True)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------- C
-def part_c(r, tk, prompts, n_req):
-    rng = random.Random(7)
+def part_c(r, tk, prompts, long_prompts, n_req, seed=7):
+    """prompts / long_prompts: (ids, images | None) entries.  Returns the request records (task, toks, aborted, ...)."""
+    rng = random.Random(seed)
     reqs, waiting, convs = [], deque(), []
     SB.PREFILL_STALL_ROWS = 64  # interleave the (short) prefills with decode groups often
 
     def add():
         i = len(reqs)
         if convs and rng.random() < 0.4:
-            ids, out = rng.choice(convs)
+            ids, ims, out = rng.choice(convs)
             ids = ids + out + tk.encode("<|im_end|>\n<|im_start|>user\nAnd then? Answer briefly.<|im_end|>\n<|im_start|>assistant\n")
         else:
-            ids = (long_prompts if rng.random() < 0.5 else prompts)[rng.randrange(len(prompts))]
+            ids, ims = (long_prompts if rng.random() < 0.5 else prompts)[rng.randrange(len(prompts))]
         rec = dict(ids=ids, toks=[], fin=None, aborted=False, abort_at=len(reqs) + rng.randint(1, 6) if rng.random() < 0.12 else None, done=0)
         p = params(rng, i, rng.randint(2, 48))
 
@@ -245,7 +255,7 @@ def part_c(r, tk, prompts, n_req):
         def done(t):
             rec["done"] += 1
 
-        rec["task"] = SB.Task(i, ids, p, emit, done, cancelled=lambda: rec["aborted"])
+        rec["task"] = SB.Task(i, ids, p, emit, done, cancelled=lambda: rec["aborted"], images=ims)
         reqs.append(rec)
         waiting.append(rec["task"])
 
@@ -263,7 +273,7 @@ def part_c(r, tk, prompts, n_req):
         for rec in reqs:
             if rec["fin"] is not None and not rec.get("conv") and not rec["aborted"] and len(rec["ids"]) < 1500:
                 rec["conv"] = True
-                convs.append((rec["ids"], rec["toks"]))
+                convs.append((rec["ids"], rec["task"].images, rec["toks"]))
         it += 1
         assert it < 5000
     dt = time.time() - t0
@@ -274,11 +284,14 @@ def part_c(r, tk, prompts, n_req):
         if t.st is None:
             continue
         srcs[t.st.source] = srcs.get(t.st.source, 0) + 1
-        ref = solo(r, t.ids, t.p, t.calls)
-        assert rec["toks"] == ref[: len(rec["toks"])], f"request {t.rid} ({t.st.source}, cached {t.st.cached}, calls {t.calls}): batched != solo at {first_diff(rec['toks'], ref)}"
+        ref = solo(r, t.ids, t.p, t.calls, t.images)
+        assert rec["toks"] == ref[: len(rec["toks"])], f"request {t.rid} ({t.st.source}, cached {t.st.cached}, images {bool(t.images)}, calls {t.calls}): batched != solo at {first_diff(rec['toks'], ref)}"
     assert all(not q.busy for q in r.seqs)
-    print(f"C: {len(reqs)} requests ({sum(x['aborted'] for x in reqs)} aborted, up to {maxB} running, resumed from {srcs}) in {it} scheduler steps, {dt:.1f} s: every stream identical to its solo replay", flush=True)
+    n_img = sum(bool(x["task"].images) for x in reqs)
+    print(f"C: {len(reqs)} requests ({n_img} with images, {sum(x['aborted'] for x in reqs)} aborted, up to {maxB} running, resumed from {srcs}) in {it} scheduler steps, {dt:.1f} s: "
+          "every stream identical to its solo replay", flush=True)
     assert srcs.get("device", 0) + srcs.get("host", 0) > 0, "no prefix-cache hit: the fuzz does not cover resumes"
+    return reqs
 
 
 def main():
@@ -290,13 +303,12 @@ def main():
     r = make_engine(max_num_seqs=a.slots, ctx_max=4096 + 64, host_tables=True, prefix_cache_gb=0.25, max_snaps=12, min_spill=128)
     print(f"engine ({a.slots} slots) in {time.time() - t0:.1f} s", flush=True)
     tk = tok()
-    prompts = [chat_ids(tk, [{"role": "user", "content": m}]) for m in MSGS]
-    global long_prompts
+    prompts = [(chat_ids(tk, [{"role": "user", "content": m}]), None) for m in MSGS]
     sysmsg = " ".join(f"Rule {i}: answer the user's question accurately, keep it short, and never invent facts about item {i}." for i in range(30))
-    long_prompts = [chat_ids(tk, [{"role": "system", "content": sysmsg}, {"role": "user", "content": m}]) for m in MSGS]  # > w4_max rows: plan cuts and snapshots
+    long_prompts = [(chat_ids(tk, [{"role": "system", "content": sysmsg}, {"role": "user", "content": m}]), None) for m in MSGS]  # > w4_max rows: plan cuts and snapshots
     part_a(r)
     part_b(r, prompts)
-    part_c(r, tk, prompts, a.fuzz)
+    part_c(r, tk, prompts, long_prompts, a.fuzz)
     bad = [int(r.e.lib.smk_engine_canary_check(q.e.h)) for q in r.seqs]
     assert all(b == 0 for b in bad), f"D: canaries overwritten per slot {bad} (-1 = SMK_DEBUG off)"
     print(f"D: canaries intact after every device buffer of the {len(r.seqs)} slots and the batch buffers", flush=True)
