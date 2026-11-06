@@ -107,6 +107,7 @@ class FastPrefill:
         self.tap = None  # DFlash2 drafter context capture (dflash.TapCapture): reads the residual entering the tap layers of every segment / group; never writes the prefill's own buffers
         self.layer_hook = None  # called with the segment's (group's) row count after every layer of a fast segment: the batched server decodes the other sequences there (a long prefill does not freeze them)
         self.mm = None  # image inputs of the prompt being prefilled (MMRows): MRoPE positions + ViT rows of the placeholder tokens; None = text (the v0.7.0 path, unchanged)
+        self.snap_wait = None  # per-layer CUDA events of an asynchronous snapshot copy of the DeltaNet + conv state (server/smk_runner.py _snapshot): layer l's DeltaNet waits for event l before it writes
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
         n_ds = lib.smkp_ds_n()  # engine_impl.h DS_N (a library older than the sources lacks the symbol: AttributeError); DS_PEND = 19 pending lazy DeltaNet rows
@@ -243,6 +244,8 @@ class FastPrefill:
         qkvz = a["qkvz"][: T * 16384].view(T, 16384)
         self._w4mm(xn, L.qkvz, a["W2"], qkvz)
         self._mm(xn, L.ab, a["ab"][:T])
+        if self.snap_wait is not None:
+            torch.cuda.current_stream().wait_event(self.snap_wait[di])
         with self._t("deltanet"):
             smk.check(lib.smkp_gates(a["ab"].data_ptr(), L.A_log.data_ptr(), L.dt_bias.data_ptr(), a["g"].data_ptr(), a["beta"].data_ptr(), Tn, st), "gates")
             cs = self.dn_conv[di, cur]
@@ -442,6 +445,8 @@ class FastPrefill:
         qkvz = a["qkvz"][: T * 16384].view(T, 16384)
         self._proj(xn, L.qkvz, W, qkvz)
         self._mm(xn, L.ab, a["ab"][:T])
+        if self.snap_wait is not None:
+            torch.cuda.current_stream().wait_event(self.snap_wait[di])
         with self._t("deltanet"):
             smk.check(lib.smkp_gates(a["ab"].data_ptr(), L.A_log.data_ptr(), L.dt_bias.data_ptr(), a["g"].data_ptr(), a["beta"].data_ptr(), T, st), "gates")
             cs = self.dn_conv[di, cur]

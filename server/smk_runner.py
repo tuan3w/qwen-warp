@@ -127,6 +127,8 @@ class Runner:
     lineage = _seq_attr("lineage")
     snaps = _seq_attr("snaps")
     _procs_on = _seq_attr("procs_on")
+    _snap_st = None  # side stream of the asynchronous snapshot copies (_snapshot), made at the first one
+    _snap_last = None  # event after the last queued snapshot copy not yet fenced (_snap_fence)
 
     def __init__(self, ctx_max, kv_fp8=0, k=3, group=2, max_snaps=4, seg=4096, min_fast=None, warmup=True, log=print, pld=False, host_tables=False, prefix_cache_gb=0.0, min_spill=1024, system_checkpoint=True, group_prefill=True,
                  drafter="mtp", dflash_path=None, dflash_codebooks_host=False, dflash_lookup=False, max_num_seqs=1, vision=False, vision_warmup_grid=(1, 64, 128)):
@@ -183,7 +185,7 @@ class Runner:
         self.load_s = time.time() - t0
         self.pool: list[Snap] = []
         self._made = 0  # snapshot buffers allocated so far (device snapshots + pool + stored entries'), at most max_snaps
-        for _ in range(min(max_snaps, 4)):  # the first ones up front (cudaHostAlloc of 151 MB costs ~20 ms); the rest are made on demand
+        for _ in range(max_snaps):  # all up front: a cudaHostAlloc of 151 MB costs ~40 ms, on the request path when made on demand (a busy server reaches max_snaps within its first requests)
             self.pool.append(self._new_snap())
         self.store = PrefixStore(int(prefix_cache_gb * (1 << 30))) if prefix_cache_gb > 0 and max_snaps > 0 else None  # host tier under the device lineage
         self.system_checkpoint = system_checkpoint and max_snaps >= 3  # one more snapshot per long prompt: the first chat-turn boundary after SYSTEM_MIN tokens (see _system_end)
@@ -202,7 +204,7 @@ class Runner:
         return group * (8 if pld else k + 1) + 16
 
     def _cur(self):
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()  # the engine stream only: an asynchronous snapshot copy on the side stream keeps running (see _snapshot)
         return int(self.fp.ds[1])
 
     def _ss(self):
@@ -217,21 +219,49 @@ class Runner:
         self.snaps = list(keep)
 
     def _snapshot(self, i, sticky=False):
-        """DeltaNet + conv state of the engine's current ring slot -> a host snapshot buffer for position i."""
-        self._free_snaps([x for x in self.snaps if x.pos != i])  # same position: reuse the buffer
+        """DeltaNet + conv state of the engine's current ring slot -> a host snapshot buffer for position i.
+        Asynchronous: the device -> host copies run layer by layer on a side stream (copy engine) while the prefill goes on; the next writer of layer l's state (the fast prefill's
+        DeltaNet of layer l, FastPrefill.snap_wait) waits for that layer's copy only, and _snap_fence orders everything else (decode, restore, the head step) after the whole copy."""
+        self._free_snaps([x for x in self.snaps if x.pos != i])  # same position: reuse the buffer (its previous copy, if any, is earlier on the same side stream)
         if not self.pool:
             self._grow_pool()
         s = self.pool.pop()
         cur = self._cur()
         s.pos = i
         s.sticky = sticky
-        s.dn.copy_(self.fp.dn_state[:, cur % self.fp.nss])
-        s.conv.copy_(self.fp.dn_conv[:, cur])
+        fp = self.fp
+        if not fp.dn_state.is_cuda:  # a host-side state (no GPU): plain copies
+            s.dn.copy_(fp.dn_state[:, cur % fp.nss])
+            s.conv.copy_(fp.dn_conv[:, cur])
+        else:
+            if self._snap_st is None:
+                self._snap_st = torch.cuda.Stream()
+            st = self._snap_st
+            st.wait_stream(torch.cuda.current_stream())
+            evs = []
+            with torch.cuda.stream(st):
+                for di in range(s.dn.shape[0]):  # DeltaNet layer di
+                    s.dn[di].copy_(fp.dn_state[di, cur % fp.nss], non_blocking=True)
+                    s.conv[di].copy_(fp.dn_conv[di, cur], non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record(st)
+                    evs.append(ev)
+            fp.snap_wait = evs
+            self._snap_last = evs[-1]
         if s.aux is not None:
             self.e.kv_aux_save(s.aux)
         self.snaps.append(s)
 
+    def _snap_fence(self):
+        """Order all later engine-stream work after the pending asynchronous snapshot copies (device-side wait, the host does not block)."""
+        if self._snap_last is not None:
+            torch.cuda.current_stream().wait_event(self._snap_last)
+            self._snap_last = None
+            for q in self.seqs:
+                q.fp.snap_wait = None
+
     def _restore(self, s):
+        self._snap_fence()
         fp, e = self.fp, self.e
         cur = self._cur()
         fp.dn_state[:, cur % fp.nss].copy_(s.dn)
@@ -449,6 +479,7 @@ class Runner:
             return self._prefill_rows(ids, q, ends, folded, cancelled, use_df, tap, key)
         finally:
             self.fp.tap = None
+            self._snap_fence()
 
     def _df_flush(self, tap, a, b):
         """Append the staged rows of [a, b) that are inside the capture window to the drafter's context."""
@@ -484,6 +515,7 @@ class Runner:
             else:
                 if fp.mm is not None and i < fp.mm.end:  # the decode-step path embeds tokens and ropes at KV position + delta: right only for text after the last image
                     raise RuntimeError(f"prefill segment [{i}, {j}) of fewer than {fp.min_fast} rows before the end of an image (row {fp.mm.end})")
+                self._snap_fence()  # the engine's own steps write the DeltaNet state without waiting per layer
                 for a in range(i, j, 4):
                     T = min(4, j - a)
                     e._step(ids[a : a + T], 2)
@@ -508,6 +540,7 @@ class Runner:
                 self._df_flush(tap, i, len(ids) - 1)
                 tap.put_last()  # the folded head has no step that fills dbg row 0 with the last row's taps
         else:
+            self._snap_fence()
             e._step(ids[-1:], 1)
         n = len(ids) - 1  # position of the last prompt row (its taps are in dbg row 0 now)
         if tap is not None and not use_df:  # the lineage stays resumable by a later greedy turn: its last row joins the window (smk_dflash_start does it for the dflash2 route)
