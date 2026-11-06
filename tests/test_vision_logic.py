@@ -11,6 +11,9 @@ Tier: 0
    not match its grid and a feature without data are refused (400 / error); the receiver cache is updated before any refusal.
 3. engine_cfg: --vision auto never changes what a text request gets (the tail decision and the length check are those of --vision off), puts the ViT weights on the GPU when 256 MiB stay
    free, else in host memory, else turns image input off; --vision device / host that do not fit are refused with a message naming image input.
+4. image input turned off by --vision auto (one sequence and --max-num-seqs > 1): the reason names settings that fit, and each named setting does turn image input on (the largest such
+   --max-model-len exactly); the frontend's image-count check refuses an image with that reason (a 400 before a streaming response starts), video / text / image-on are untouched;
+   without --max-model-len, --max-num-seqs > 1 picks a length that keeps image input on (the previous default turned it off at a large --max-image-pixels).
 """
 import sys
 from pathlib import Path
@@ -96,11 +99,12 @@ def test_parse():
     check("the receiver cache sees every request, refused ones included", len(seen) == n + 2)
 
 
-def cfg(free, L=20480, mode="auto", pl="auto", kv="auto", ht=False, mp=2097152):
+def cfg(free, L=20480, mode="auto", pl="auto", kv="auto", ht=False, mp=2097152, S=1):
     import smk_core_client as sc
 
     sc.OPTIONS.update(vision=mode, max_image_pixels=mp, prompt_lookup=pl, host_tables=ht, drafter="mtp")
-    vc = SimpleNamespace(model_config=SimpleNamespace(max_model_len=L), speculative_config=SimpleNamespace(num_speculative_tokens=3), cache_config=SimpleNamespace(cache_dtype=kv))
+    vc = SimpleNamespace(model_config=SimpleNamespace(max_model_len=L), speculative_config=SimpleNamespace(num_speculative_tokens=3), cache_config=SimpleNamespace(cache_dtype=kv),
+                         scheduler_config=SimpleNamespace(max_num_seqs=S))
     try:
         return sc.engine_cfg(vc, free)
     except RuntimeError as e:
@@ -123,8 +127,75 @@ def test_memory():
     check("--vision off == 0.7.0's decision at the default length (tail on at 23,228 MiB)", cfg(23228, mode="off").pld and cfg(23228, mode="off").vision is None)
 
 
+def test_vision_off():
+    import re
+
+    import smk_core_client as sc
+    from vllm.exceptions import VLLMValidationError
+
+    # --max-num-seqs 8, --profile long (int4 KV + host tables), --max-model-len 32768, and 100 MiB more free than the text needs: the ViT (156 MiB with host weights) does not fit
+    S, L, dt = 8, 32768, 2
+    free = int(sc.vram_need_batch_mib(L, dt, True, S) + sc.MIN_HEADROOM_MIB + 100)
+    c = cfg(free, L, kv="int4_per_token_head", ht=True, S=S)
+    msg = getattr(c, "vision_off", None) or ""
+    m = re.search(r"--max-model-len ([\d,]+) or less at --max-num-seqs 8", msg)
+    lf = int(m.group(1).replace(",", "")) if m else 0
+    on_lf, on_next = (getattr(cfg(free, x, kv="int4_per_token_head", ht=True, S=S), "vision", None) for x in (lf, lf + 1024))
+    ms = re.search(r"--max-num-seqs (\d+) at --max-model-len", msg)
+    on_s = ms and getattr(cfg(free, L, kv="int4_per_token_head", ht=True, S=int(ms.group(1))), "vision", None)
+    check("--max-num-seqs 8 at 32,768, ViT does not fit: image input off, the reason names the largest length that keeps it on and a slot count that does", c.vision is None and lf > 0
+          and on_lf is not None and on_next is None and bool(on_s), msg)
+    c1 = cfg(22300)
+    m = re.search(r"--max-model-len ([\d,]+) or less", c1.vision_off or "")
+    l1 = int(m.group(1).replace(",", "")) if m else 0
+    check("one sequence, ViT does not fit at 20,480: the named length turns image input on (with the tail decision at that length)", c1.vision is None and l1 > 0
+          and cfg(22300, l1).vision is not None and cfg(22300, l1 + 1024).vision is None, c1.vision_off)
+    check("--vision off: the reason is --vision off; image input on: no reason", cfg(23228, mode="off").vision_off == "image input is off on this server (--vision off)"
+          and cfg(24500).vision_off is None)
+    # the frontend's image-count check (vLLM's chat parser calls processing_info.validate_num_items for every image item while it builds the prompt, before any response starts)
+    sc.install()
+    from vllm.multimodal.processing.context import BaseProcessingInfo
+
+    class Info(BaseProcessingInfo):
+        supported_mm_limits = {"image": None, "video": None}
+        allowed_mm_limits = {"image": 4, "video": 0}
+
+    info = object.__new__(Info)
+
+    def count(modality, n):
+        try:
+            info.validate_num_items(modality, n)
+            return "ok"
+        except VLLMValidationError as e:
+            return str(e)
+
+    sc.IMAGE_OFF = msg
+    off_image, off_video = count("image", 1), count("video", 1)
+    sc.IMAGE_OFF = None
+    on_image, on_five = count("image", 1), count("image", 5)
+    check("image input off: an image item is refused with the reason (400 before streaming); video keeps vLLM's own refusal", off_image.startswith(msg) and "video" in off_video, off_image[:90])
+    check("image input on: vLLM's own count check (1 image ok, 5 refused)", on_image == "ok" and "At most 4" in on_five, on_five)
+    # without --max-model-len, --max-num-seqs > 1: the length leaves room for the ViT (8 megapixel images: 352 MiB with host weights, more than the 256 MiB the old default left)
+    import serve
+
+    mp = 8388608
+    for free in (23700, 23228):
+        real = torch.cuda.mem_get_info
+        torch.cuda.mem_get_info = lambda device=None, free=free: (free << 20, 24 << 30)
+        try:
+            a = serve.parse_args(["--max-num-seqs", "8", "--profile", "long", "--max-image-pixels", str(mp)])
+        finally:
+            torch.cuda.mem_get_info = real
+        old = sc.batch_max_len(free, dt, True, S, sc.AUTO_TAIL_HEADROOM_MIB)
+        new_on = cfg(free, a.max_model_len, kv="int4_per_token_head", ht=True, S=S, mp=mp).vision
+        old_on = cfg(free, old, kv="int4_per_token_head", ht=True, S=S, mp=mp).vision
+        check(f"default length at {free} MiB free, 8 slots, --max-image-pixels {mp:,}: {a.max_model_len:,} keeps image input on ({new_on}); the old default {old:,} turned it off",
+              new_on is not None and old_on is None and a.max_model_len >= old - 3072)
+
+
 test_key()
 test_parse()
 test_memory()
+test_vision_off()
 print(f"{sum(RES)}/{len(RES)} passed", flush=True)
 sys.exit(0 if all(RES) else 1)

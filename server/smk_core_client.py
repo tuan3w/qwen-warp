@@ -8,6 +8,7 @@ scheduler of smk_batch.BatchRunner (S requests decoded together).  vLLM's `Engin
 import asyncio
 import collections
 import math
+import os
 import queue
 import threading
 import time
@@ -189,6 +190,55 @@ def vram_limits_text(free_mib, k, df=False, cb_host=False, vis=0.0):
     return "\n".join(rows)
 
 
+def free_gpu_mib():
+    """GPU memory free now (MiB), capped by $SMK_FREE_MIB if set (tests: a start-up decision at a chosen free memory; the engine still allocates from the real GPU)."""
+    free = torch.cuda.mem_get_info()[0] >> 20
+    cap = os.environ.get("SMK_FREE_MIB", "")
+    return min(free, int(cap)) if cap else free
+
+
+def tail_on(L, dt, ht, k, pl, df, free_mib, vis=0.0):
+    """The single-sequence engine's prompt-lookup tail decision (--prompt-lookup auto: on iff it leaves AUTO_TAIL_HEADROOM_MIB free next to the length and `vis`)."""
+    if df:  # the 9-slot ring is paid by the drafter's verify anyway: the MTP route's tail is free
+        return k == 3 and pl is not False
+    return k == 3 and (vram_need_mib(L, dt, ht, True, vis=vis) <= free_mib - AUTO_TAIL_HEADROOM_MIB if pl == "auto" else bool(pl))
+
+
+def auto_vision(L, dt, ht, S, pld, df, cbh, mp, free_mib):
+    """--vision auto: "device" iff the ViT weights on the GPU leave AUTO_TAIL_HEADROOM_MIB free at this configuration, else "host" iff that fits (MIN_HEADROOM_MIB), else None (off)."""
+    for w, hr in (("device", AUTO_TAIL_HEADROOM_MIB), ("host", MIN_HEADROOM_MIB)):
+        vis = vision_mib(w, mp)
+        if (vram_need_batch_mib(L, dt, ht, S, vis) if S > 1 else vram_need_mib(L, dt, ht, pld or df, df, cbh, vis)) <= free_mib - hr:
+            return w
+    return None
+
+
+def vision_off_text(free_mib, L, dt, ht, S, k, pl, df, cbh, mp):
+    """Why --vision auto left image input off and what would turn it on (the 400 of an image request and the start-up warning say the same)."""
+    def on(L_, S_, pl_=pl):
+        pld_ = (k == 3 and pl_ is not False) if S_ > 1 else tail_on(L_, dt, ht, k, pl_, df, free_mib)
+        return auto_vision(L_, dt, ht, S_, pld_, df, cbh, mp, free_mib)
+
+    lens = range(min(L, MODEL_MAX_LEN) // 1024 * 1024, 0, -1024)
+    l_any = next((x for x in lens if on(x, S)), 0)
+    l_dev = next((x for x in lens if on(x, S) == "device"), 0)
+    opts = []
+    if l_any:
+        opts.append(f"--max-model-len {l_any:,} or less" + (f" at --max-num-seqs {S}" if S > 1 else "") + (f" ({l_dev:,} or less puts the ViT weights on the GPU, the faster encode)" if l_dev and l_dev < l_any else ""))
+    s_fit = next((s for s in range(S - 1, 1, -1) if on(L, s)), 0) if S > 1 else 0
+    if s_fit:
+        opts.append(f"--max-num-seqs {s_fit} at --max-model-len {L:,}")
+    if S == 1 and pl == "auto" and not df and on(L, 1, False):
+        opts.append("--prompt-lookup 0 at this length")
+    kv = f"{KV_NAMES[dt]} KV{' + host tables' if ht else ''}"
+    what = f"{S} sequence slots at --max-model-len {L:,} with {kv} leave" if S > 1 else f"--max-model-len {L:,} with {kv} leaves"
+    return (f"image input is off on this server: --vision auto found no GPU memory for the vision tower ({what} less than the {vision_mib('host', mp):.0f} MiB it needs with its "
+            f"weights streamed from host memory; {free_mib:,} MiB were free at start).  Image input fits with " + "; or ".join(opts + [f"a lower --max-image-pixels (now {mp:,})"]))
+
+
+IMAGE_OFF = None  # the reason image input is off on this server (None: on); set by SwiftCoreClient, read by the frontend's image-count check (install) and by _images
+
+
 def engine_cfg(vllm_config, free_mib):
     """swift-mk engine settings from the stock vLLM config: --max-model-len, --kv-cache-dtype, --speculative-config (num_speculative_tokens), --max-num-seqs.  free_mib: GPU memory free at start."""
     mc, sc = vllm_config.model_config, vllm_config.speculative_config
@@ -209,6 +259,7 @@ def engine_cfg(vllm_config, free_mib):
     # else in pinned host memory iff that fits (MIN_HEADROOM_MIB), else image input is off.  device / host are demands: the start is refused when they do not fit.
     wts = mode if mode in ("device", "host") else None
     vis = vision_mib(wts, mp)
+    off = "image input is off on this server (--vision off)" if mode == "off" else None
     S = int(getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1) or 1)
     if S > 1:  # S sequence slots (smk_batch.BatchRunner): its own memory model; image input as for one sequence (auto: device weights iff 256 MiB stay free, else host, else off)
         if df:
@@ -217,12 +268,11 @@ def engine_cfg(vllm_config, free_mib):
             raise ValueError(f"swift-mk: --max-num-seqs {S}: at most {MAX_NUM_SEQS} sequences (one row each in a weight pass of {MAX_NUM_SEQS} rows)")
         pld = k == 3 and pl is not False
         if mode == "auto":
-            for w, hr in (("device", AUTO_TAIL_HEADROOM_MIB), ("host", MIN_HEADROOM_MIB)):
-                if vram_need_batch_mib(L, dt, ht, S, vision_mib(w, mp)) <= free_mib - hr:
-                    wts, vis = w, vision_mib(w, mp)
-                    break
-            else:
-                logger.info("swift-mk: image input off: %d slots at --max-model-len %d leave no room for the ViT (%.0f MiB with host weights) in the %d MiB free", S, L, vision_mib("host", mp), free_mib)
+            wts = auto_vision(L, dt, ht, S, pld, df, cbh, mp, free_mib)
+            vis = vision_mib(wts, mp)
+            if wts is None:
+                off = vision_off_text(free_mib, L, dt, ht, S, k, pl, df, cbh, mp)
+                logger.warning("swift-mk: %s", off)
         vtxt = f" and image input ({vis:.0f} MiB with the ViT weights on the {wts})" if vis else ""
         need = vram_need_batch_mib(L, dt, ht, S, vis)
         if need > free_mib - MIN_HEADROOM_MIB:
@@ -231,19 +281,14 @@ def engine_cfg(vllm_config, free_mib):
                                f"What fits the free memory with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{vtxt} (--profile long = int4 KV + host tables needs the least):\n{batch_limits_text(free_mib, dt, ht, S, L, vis)}")
         return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"],
                                system_checkpoint=OPTIONS["system_checkpoint"], pld=pld, drafter="mtp", dflash_path=None, dflash_codebooks_host=cbh, max_num_seqs=S, vision=wts, vis_mib=vis,
-                               max_patches=max_patches(mp))
-    if df:  # the 9-slot ring is paid by the drafter's verify anyway: the MTP route's tail is free
-        pld = k == 3 and pl is not False
-    else:
-        pld = k == 3 and (vram_need_mib(L, dt, ht, True, vis=vis) <= free_mib - AUTO_TAIL_HEADROOM_MIB if pl == "auto" else bool(pl))
+                               vision_off=off, max_patches=max_patches(mp))
+    pld = tail_on(L, dt, ht, k, pl, df, free_mib, vis)
     if mode == "auto":
-        for w, hr in (("device", AUTO_TAIL_HEADROOM_MIB), ("host", MIN_HEADROOM_MIB)):
-            if vram_need_mib(L, dt, ht, pld or df, df, cbh, vision_mib(w, mp)) <= free_mib - hr:
-                wts, vis = w, vision_mib(w, mp)
-                break
-        else:
-            logger.info("swift-mk: image input off: at --max-model-len %d the ViT needs %.0f MiB more (weights streamed from host memory) than the %d MiB free leave; "
-                        "a shorter --max-model-len, --prompt-lookup 0 or a lower --max-image-pixels makes room", L, vision_mib("host", mp), free_mib)
+        wts = auto_vision(L, dt, ht, 1, pld, df, cbh, mp, free_mib)
+        vis = vision_mib(wts, mp)
+        if wts is None:
+            off = vision_off_text(free_mib, L, dt, ht, 1, k, pl, df, cbh, mp)
+            logger.warning("swift-mk: %s", off)
     vtxt = f" and image input ({vis:.0f} MiB with the ViT weights on the {wts} at --max-image-pixels {mp:,})" if vis else ""
     if df:
         need = vram_need_mib(L, dt, ht, True, True, cbh, vis)
@@ -261,7 +306,7 @@ def engine_cfg(vllm_config, free_mib):
                                f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
                                f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k, vis=vis)}")
     return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld or df), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld,
-                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh, vision=wts, vis_mib=vis, max_patches=max_patches(mp), max_num_seqs=1)
+                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh, vision=wts, vis_mib=vis, vision_off=off, max_patches=max_patches(mp), max_num_seqs=1)
 
 
 def warmup_grid(patches):
@@ -274,8 +319,10 @@ class SwiftCoreClient(EngineCoreClient):
     engine_ranks_managed = [0]
 
     def __init__(self, vllm_config, executor_class, log_stats, client_addresses=None, client_count=1, client_index=0, renderer=None):
-        free_mib = torch.cuda.mem_get_info()[0] >> 20
+        global IMAGE_OFF
+        free_mib = free_gpu_mib()
         cfg = engine_cfg(vllm_config, free_mib)
+        IMAGE_OFF = cfg.vision_off
         self.vllm_config = vllm_config
         self.loop = asyncio.get_running_loop()
         self.out_q: asyncio.Queue = asyncio.Queue()
@@ -307,7 +354,7 @@ class SwiftCoreClient(EngineCoreClient):
                     f", drafter dflash2 (greedy requests without logit processors; {self.runner.df_mib:.0f} MiB device, codebooks on the {'host' if cfg.dflash_codebooks_host else 'device'})" if cfg.drafter == "dflash2" else "",
                     f", {S} sequence slots (batched decode)" if S > 1 else "")
         logger.info("swift-mk image input %s", f"on: ViT weights on the {cfg.vision} ({self.runner.vit.mib:.0f} MiB on the GPU), images up to {cfg.max_patches * 256:,} pixels "
-                    f"({cfg.max_patches // 4} placeholder tokens), {cfg.vis_mib:.0f} MiB counted" if cfg.vision else "off (--vision off)")
+                    f"({cfg.max_patches // 4} placeholder tokens), {cfg.vis_mib:.0f} MiB counted" if cfg.vision else f"off: {cfg.vision_off}")
         self.max_patches = cfg.max_patches
         self.mm_cache = MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(vllm_config) if cfg.vision else None  # vLLM's frontend sends data=None for an item its processor cache already sent once
         self.thread = threading.Thread(target=self._batch_worker if S > 1 else self._worker, name="swift-mk-engine", daemon=True)
@@ -433,8 +480,8 @@ class SwiftCoreClient(EngineCoreClient):
         if not request.mm_features:
             return []
         feats = self.mm_cache.get_and_update_features(request.mm_features) if self.mm_cache is not None else request.mm_features
-        if self.runner.vit is None:
-            raise VLLMValidationError("image input is off on this server (--vision off, or --vision auto found no GPU memory for it at this --max-model-len: see the start log)", parameter="messages")
+        if self.runner.vit is None:  # (the frontend refuses such a request before it streams: install(); this is the engine's own check)
+            raise VLLMValidationError(IMAGE_OFF or "image input is off on this server", parameter="messages")
         bad = sorted({f.modality for f in feats} - {"image"})
         if bad:
             raise VLLMValidationError(f"swift-mk serves image inputs only, not {', '.join(bad)}", parameter=bad[0])
@@ -511,6 +558,19 @@ def install(**options):
         return SwiftCoreClient(vllm_config, executor_class, log_stats, client_addresses, client_count, client_index, renderer)
 
     EngineCoreClient.make_async_mp_client = staticmethod(make)
+    # An image request to a server whose image input is off gets a 400 naming the reason and what would fit BEFORE its response starts (a streaming request would otherwise get a 200
+    # and an error event): the chat parser counts every image item through the model's processing info while it builds the prompt, so the refusal goes there.
+    from vllm.multimodal.processing.context import BaseProcessingInfo
+
+    count = BaseProcessingInfo.validate_num_items
+    if not getattr(count, "swift_mk", False):
+        def validate_num_items(self, modality, num_items):
+            if modality == "image" and IMAGE_OFF:
+                raise VLLMValidationError(IMAGE_OFF, parameter="image")
+            return count(self, modality, num_items)
+
+        validate_num_items.swift_mk = True
+        BaseProcessingInfo.validate_num_items = validate_num_items
     # vLLM refuses min_p and logit_bias whenever a speculative config is set (SamplingParams._validate_spec_decode): a limit of ITS rejection sampler, which applies neither to the verify rows
     # (v1/sample/rejection_sampler.py apply_logits_processors).  This engine's cycle applies every supported processor to every verify row, exactly (engine/src/proc.h), so the check goes.
     SamplingParams._validate_spec_decode = lambda self, speculative_config: None

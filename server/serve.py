@@ -53,8 +53,9 @@ def parse_args(argv=None):
     g.add_argument("--dflash-codebooks", default="host", choices=["device", "host"], help="where the drafter's two 121 MiB candidate-selector codebooks live: host (default) = pinned memory, gathered by row over PCIe (same decode speed, same ids, 244 MiB less VRAM); device = GPU memory")
     g.add_argument("--vision", default="auto", choices=["auto", "device", "host", "off"], help="image input with the checkpoint's vision tower.  device = its 879 MiB of bf16 weights on the GPU "
                    "(fastest encode: 16 ms at 448x448, 65 ms at 1024x768); host = the 27 blocks' weights stay in pinned host memory and are streamed per image (153 MiB on the GPU, +51 ms at "
-                   "448x448, +9 ms at 1024x768, level at 1920x1080); auto (default) = device iff it leaves 256 MiB free at --max-model-len, else host; off = text only, the GPU memory and "
-                   "behaviour of 0.7.0 (an image request gets a 400)")
+                   "448x448, +9 ms at 1024x768, level at 1920x1080); auto (default) = device iff it leaves 256 MiB free at --max-model-len, else host, else off (the start log warns and an "
+                   "image request gets a 400 naming the settings that would fit; without --max-model-len, --max-num-seqs > 1 picks a length that keeps image input on); off = text only, "
+                   "the GPU memory and behaviour of 0.7.0 (an image request gets a 400)")
     g.add_argument("--max-image-pixels", type=int, default=MAX_IMAGE_PIXELS, help="largest image after the processor's resize, in pixels (images are scaled down to fit, aspect kept; "
                    f"256 pixels per ViT patch, 1,024 per placeholder token; default {MAX_IMAGE_PIXELS:,} = 2,048 tokens); the ViT's activation memory grows with it")
     parser.set_defaults(model=DEFAULT_MODEL, served_model_name=["swift"], reasoning_parser="qwen3", tool_call_parser="qwen3_coder", enable_auto_tool_choice=True,
@@ -80,12 +81,13 @@ def parse_args(argv=None):
         if args.max_model_len is None and args.max_num_seqs == 1:
             args.max_model_len = LONG_MAX_MODEL_LEN
     if args.max_model_len is None and args.max_num_seqs > 1:  # S sequence slots, each with its own KV cache: the longest length per sequence the free GPU memory holds (capped at the profile's)
-        import torch
-
         import smk_core_client as cc
 
+        # image input stays on (unless --vision off): room for the ViT with its weights in host memory (156 MiB at the default --max-image-pixels, under 1,000 tokens per slot), on
+        # the GPU for --vision device; --vision auto still puts them on the GPU where the profile's cap leaves room for that
+        vis = 0.0 if args.vision == "off" else cc.vision_mib("device" if args.vision == "device" else "host", args.max_image_pixels)
         cap = LONG_MAX_MODEL_LEN if args.profile == "long" else DEFAULT_MAX_MODEL_LEN
-        fit = cc.batch_max_len(torch.cuda.mem_get_info()[0] >> 20, cc.KV_DTYPES.get(args.kv_cache_dtype or "auto", 0), bool(args.host_tables), args.max_num_seqs, cc.AUTO_TAIL_HEADROOM_MIB)
+        fit = cc.batch_max_len(cc.free_gpu_mib(), cc.KV_DTYPES.get(args.kv_cache_dtype or "auto", 0), bool(args.host_tables), args.max_num_seqs, cc.AUTO_TAIL_HEADROOM_MIB, vis)
         args.max_model_len = max(1024, min(cap, fit))
     if args.max_model_len is None:
         args.max_model_len = DEFAULT_MAX_MODEL_LEN if args.prompt_lookup == "0" else DEFAULT_MAX_MODEL_LEN_PLD
