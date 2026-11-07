@@ -1,97 +1,35 @@
 # qwen-warp
 
-**Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s, several users at once, image input.**
+**Fast Qwen3.8-27B on one RTX 3090.** An OpenAI-compatible server on a custom CUDA engine: 262k context, several users at once, text and images.
 
-I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
-At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, `--drafter dflash2` decodes code / prose / math at 277 / 113 / 254 tok/s, 1.09x to 1.12x HyperQwen's DFlash2 preset; it serves one request at a time and was not measured at long context.
-I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), text and image input; one request at a time by default, up to 8 decoded together with `--max-num-seqs` or `--profile multiuser`: **4 users at once get 425 tok/s in total, 8 users 441, against 155 when they queue** ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
+- **Fast for one user:** 120 to 190 tok/s on short prompts, up to 277 with the DFlash2 drafter, and still 100 tok/s with a 190k-token prompt.
+- **Fast for many users:** requests decode together, so 4 users get about 2.7x the total throughput of one.
+- **Long context:** the model's full 262,144 tokens fit in 24 GB (4-bit KV cache).
+- **Exact:** speculative decoding never changes the output distribution.
 
-## Numbers
+## Speed
 
-Same card at 350 W, greedy. The long-context tables and the first four short-prompt rows were measured on 2026-11-04, HyperQwen included, with the same prompts and client, one run per cell ([method](docs/PERFORMANCE.md#3-speed)); the DFlash2 rows on 2026-11-06; the several-users table on 2026-11-07.
-
-| Speedup: our decode tok/s divided by HyperQwen's | 32k | 64k | 100k | 130k | 190k |
-|---|---|---|---|---|---|
-| **qwen-warp `--profile long` vs HyperQwen `mtp-long`** | **1.17x** | **1.23x** | **1.34x** | **1.29x** | - |
-| qwen-warp `--profile long` vs HyperQwen `mtp-huge` (4/2-bit KV, the only HyperQwen preset that serves 190k) | 1.94x | 2.10x | 2.82x | 3.31x | 3.58x |
-
-
-| Decode, tokens/s, by prompt length | 32k | 64k | 100k | 130k | 190k | 262k |
-|---|---|---|---|---|---|---|
-| **qwen-warp** `--profile long` (4-bit KV cache, prompt-lookup tail) | 124 | 119 | 115 | 108 | 102 | - |
-| **qwen-warp** 4-bit KV cache, tail off | 124 | 133 | 109 | 105 | 96 | 94 |
-| **qwen-warp** fp8 KV cache | 123 | 123 | 112 | 108 | - | - |
-| *reference:* HyperQwen `mtp-long` | 106 | 97 | 86 | 83 | - | - |
-| *reference:* HyperQwen `mtp-huge` | 64 | 57 | 41 | 33 | 28 | - |
-
-`-` = not run (fp8 stops at 130k; the tail-on row stops at the profile's 196,608; HyperQwen `mtp-long` does not serve 190k).
-
-| Short prompts, tokens/s | code | prose | math |
-|---|---|---|---|
-| **qwen-warp** default (bf16 KV cache) | 172 | 110 | 172 |
-| **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
-| *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
-| **speedup**, qwen-warp 4-bit KV vs `mtp-long` | **1.27x** | **1.22x** | **1.21x** |
-| **qwen-warp `--drafter dflash2`** (bf16 KV, `--host-tables`; through the server, 2 interleaved visits) | **277** | **113** | **254** |
-| **qwen-warp `--drafter dflash2`**, 4-bit KV cache | **272** | **124** | **257** |
-| *reference:* HyperQwen DFlash2 (2026-11-06; the same 254 / 103 / 225 on 2026-11-01) | 254 | 103 | 226 |
-| **speedup**, qwen-warp `--drafter dflash2` (bf16 KV) vs HyperQwen DFlash2 (two sessions of the same day) | **1.09x** | **1.10x** | **1.12x** |
-
-In one session with both on the card, engine against HyperQwen's server, the DFlash2 gap was +6% / +3% / +13% after discounting the server ([Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)): level on code and prose, ahead on math. Same drafter checkpoint, same acceptance (about 6 tokens per step on code); the difference is the step time (21.1 vs 23.5 ms). `--drafter dflash2` serves one request at a time and is 31% slower than MTP on copy-heavy agent turns.
-
-| Several users at once, total tokens/s (3 greedy 512-token requests per user, one run per cell) | 1 user | 2 | 4 | 8 |
-|---|---|---|---|---|
-| qwen-warp 0.7.0 (requests queue, one at a time) | 155 | 154 | 155 | 152 |
-| **qwen-warp `--profile multiuser`**, text | **154** | **278** | **425** | **441** |
-| **qwen-warp `--profile multiuser`**, text and images mixed | 161 | 230 | 310 | 318 |
-
-With 8 users the median wait for the first token is 3.6 s instead of 22.3 s. A single user gets the same tokens as 0.7.0 at the same speed (code 181.1 vs 181.4 tok/s). Details: [Performance, section 7](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs).
-
-| | |
+| On one RTX 3090 (350 W, greedy) | tok/s |
 |---|---|
-| Context | 262,144 tokens fit in about 22.5 to 22.7 GiB in use, desktop included (`--host-tables` moves 4.8 GiB of tables to host memory; the 4-bit cache costs 16.5 KiB per token, bf16 64 KiB) |
-| Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
-| Ready after | 21 to 30 s |
-| Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), perplexity +0.056% over bf16 at 98k (previous: +0.26%), a minimal tool schema in the usual key order 92% to 96% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found in every run (previous format: missed in every run). Coding pass@1 was measured on the previous format only (241 against 244 of 283) and not repeated. On one 61-token loop prompt, caused by the exact ring, sampled text repeats more than with bf16; four other prompts match. [KV cache](docs/KV_CACHE.md) |
-| Not measured | multi-turn agent task success, other GPUs, other power limits, DFlash2 (ours or HyperQwen's) at long context, copy-heavy answers with DFlash2's own drafter beyond two prompts (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), more than 8 concurrent users (HyperQwen reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine decodes at most 8 requests together), images other than synthetic test images |
+| One user, short code prompt | 181 (`--drafter dflash2`: 277) |
+| One user, 190k-token prompt | 102 |
+| 4 users at once, in total | 425 |
+| 8 users at once, in total | 441 |
 
-HyperQwen is a general serving project; the comparisons with it are single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
-
-The 2026-11-04 rows were measured with the previous 4-bit format. With the rotated format of this version, two interleaved runs per cell in one session gave the same speed on short prompts, 7% to 12% more at 100k, level to +4% at 190k, and level to 3% less at 32k ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
-
-<details>
-<summary>Exact HyperQwen build and caveats</summary>
-
-- Image `ghcr.io/syv-ai/hyperqwen@sha256:00713ba1e04b68db1be9eba2b15b579250f9fb0c29ed61add40c750228fc0cf8`, revision `bd6c5e2f11628483109031d99d1cc4a7d22b1a26`, built 2026-10-04. A newer build may differ.
-- It decoded 5% to 22% faster on 2026-11-04 than in an earlier session on 2026-11-03, so one run per cell is a rough number.
-- Every table, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-
-</details>
-
-## How it gets there
-
-- **Fused kernels.** The 4-bit weights decode as one CUDA graph of fused kernels, with no framework work per step.
-- **Speculative decoding.** The checkpoint's own MTP head proposes 3 tokens per step (about 3 come out per step), or the DFlash2 block drafter proposes 7 (`--drafter dflash2`, about 4.5 per step); the engine verifies them in one pass and keeps the output distribution exact, greedy or sampled.
-- **A 4-bit KV cache and host-pinned tables.** The cache shrinks 4x; the embedding and rescoring head live in pinned host memory. Together they free the VRAM for 262k tokens.
-- **Prompt lookup and prefix reuse.** Repeated text in the prompt speeds up decoding; a chat's earlier turns skip prefill.
-- **Batched decode.** Decode is bound by reading the weights, not by arithmetic: a weight pass costs about the same for 1 or 16 rows. With several requests, their rows share each pass (up to 16 rows; a row computes the same bits whichever rows share its pass), so 4 users get 2.7x the total throughput of one. The draft depth depends on how many requests are running, so outputs can differ from a lone run at bf16 near-ties ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
-- **Image input.** The checkpoint's bf16 vision tower runs on the GPU (16 ms at 448x448, 65 ms at 1024x768); image rows enter the prefill with 3-D positions like vLLM's.
-
-The code map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Against [HyperQwen](https://github.com/syv-ai/hyperqwen) on the same card: 1.2x to 1.3x faster at 32k to 130k context, 3.6x faster at 190k, and level to 13% ahead with the same DFlash2 drafter on short prompts. Every measurement, method and caveat: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Quick start
 
-You need Linux, an NVIDIA driver 580 or newer, an RTX 3090, and the weights (19 GB; accept the model's licence on Hugging Face first). Prerequisites, disk sizes and troubleshooting: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
+You need Linux, an RTX 3090, an NVIDIA driver 580 or newer, and the weights (19 GB). Details and troubleshooting: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
 ```bash
-# 0. weights, for both paths
-uvx --from huggingface_hub hf auth login
+# weights (accept the model's licence on Hugging Face first)
 uvx --from huggingface_hub hf download ukisai/Swift-1.5-Qwen3.8-27b-INT4 --local-dir ~/models/swift-1.5-int4
 
-# A. Docker (needs the NVIDIA container toolkit; serves the long-context profile on :8000)
+# A. Docker (needs the NVIDIA container toolkit)
 docker compose up --build
 
-# B. native (needs the CUDA 13.0 toolkit and uv; `make setup` takes 20 to 30 minutes, mostly downloads)
+# B. native (needs the CUDA 13.0 toolkit and uv)
 make setup
 uv run server/serve.py --profile long --port 8000
 ```
@@ -103,43 +41,37 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
   "model": "swift", "messages": [{"role": "user", "content": "Write a binary search in Go."}], "max_tokens": 2000}'
 ```
 
-The model thinks before it answers, and the thinking tokens count against `max_tokens` (the text comes back in the `reasoning` field). With 2,000 tokens, 20 of 20 test answers to this prompt finished; at 600 to 1,500 tokens about 1 in 20 ran out
-during thinking. Raise `max_tokens` if an answer is cut off, or switch thinking off per request with `"chat_template_kwargs": {"enable_thinking": false}`. More in [docs/USAGE.md](docs/USAGE.md).
+The model thinks before it answers, and thinking counts against `max_tokens`. Give it room, or turn thinking off per request with `"chat_template_kwargs": {"enable_thinking": false}`.
 
-| Goal | Flags | Context |
-|---|---|---|
-| Long context (the Docker default) | `--profile long` | 196,608 |
-| The model's full context | `--profile long --max-model-len 262144 --prompt-lookup 0` | 262,144 |
-| Fastest at short context | defaults (bf16 KV cache) | 20,480 (28,672 with `--prompt-lookup 0`) |
-| fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 |
-| Several users at once, text and images (Docker: `PROFILE=multiuser`) | `--profile multiuser` | per request: what free memory holds, at most 28,672 |
+## Pick a profile
 
-The server measures the free GPU memory at start and refuses a context that does not fit, before it loads the weights; the limits are in [USAGE](docs/USAGE.md#memory-and-context). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file ([.env.example](.env.example)).
-`make test` checks your install; it needs the GPU and the weights and takes a while ([list](docs/GETTING_STARTED.md#4-verify-it-works)).
-
-## What works and what does not
-
-| | |
+| You want | Flags (Docker: `PROFILE=` in `.env`) |
 |---|---|
-| Sampling | `temperature`, `top_p`, `top_k` (up to 64), `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `allowed_token_ids`, `seed`, `max_tokens`, `stop`, `stop_token_ids`, `ignore_eos`, `n` ([table](docs/USAGE.md#sampling-parameters)) |
-| Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
-| Tool calls | They work, with one caveat: the previous 4-bit format gave a well-formed call in 39% to 46% of requests for a minimal one-parameter schema in the usual key order (bf16: 91%); with the rotated 4-bit cache of this version it is 92% (n = 200, through the server). The default `--sort-tool-schema` stays on ([details](docs/USAGE.md#tool-calls)) |
-| Images | `image_url` parts in chat messages (base64 or URL), up to 4 per prompt and 2 megapixels each by default; the checkpoint's vision tower runs on the GPU (time to first token 0.22 s at 448x448, 1.5 s at 1920x1080), text requests are unchanged; video returns 400 ([details](docs/USAGE.md#images)) |
-| Concurrency | `--max-num-seqs 1` (default): one request decodes at a time, the rest queue. `--max-num-seqs 2..8` or `--profile multiuser` (5): that many requests decode together in one weight pass per cycle; `--drafter dflash2` needs `--max-num-seqs 1` ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs), [Performance](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs)) |
+| Long context, one user (the Docker default) | `--profile long` |
+| Several users at once, with images | `--profile multiuser` |
+| Fastest single user on short prompts | `--drafter dflash2` ([setup](docs/USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental)) |
+| The model's full 262k context | `--profile long --max-model-len 262144 --prompt-lookup 0` |
+
+The server checks free GPU memory at start and refuses a configuration that does not fit. All flags: [docs/USAGE.md](docs/USAGE.md).
+
+## What it supports
+
+- **API:** chat and text completions, streaming, tool calls, reasoning output, and the common sampling parameters ([list](docs/USAGE.md#sampling-parameters)). `logprobs` and structured output return HTTP 400.
+- **Images:** `image_url` parts in chat messages, up to 4 per prompt ([details](docs/USAGE.md#images)). Video is not supported.
+- **Hardware:** RTX 3090 only, one GPU, tested with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4).
 
 ## Documentation
 
 | I want to... | Read |
 |---|---|
-| Install it, check it works, fix a problem | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
-| Call the API, tune flags, understand memory and context | [docs/USAGE.md](docs/USAGE.md) |
-| Understand the 4-bit KV cache: format, measurements, what it costs, what is not known | [docs/KV_CACHE.md](docs/KV_CACHE.md) |
-| See every measurement and its caveats | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
-| Understand the engine and find the code | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Pick up an open question (a list of ideas, not a roadmap) | [docs/IDEAS.md](docs/IDEAS.md) |
-| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md), [changelog](CHANGELOG.md) |
+| Install it, check it works, fix a problem | [GETTING_STARTED](docs/GETTING_STARTED.md) |
+| Call the API, tune flags, understand memory | [USAGE](docs/USAGE.md) |
+| See every measurement and its caveats | [PERFORMANCE](docs/PERFORMANCE.md) |
+| Understand the engine and find the code | [ARCHITECTURE](docs/ARCHITECTURE.md) |
+| Learn about the 4-bit KV cache | [KV_CACHE](docs/KV_CACHE.md) |
+| Pick up an open question | [IDEAS](docs/IDEAS.md) |
+| Contribute, or see what changed | [CONTRIBUTING](CONTRIBUTING.md), [CHANGELOG](CHANGELOG.md) |
 
-## Credits and license
+## License
 
-MIT licensed ([LICENSE](LICENSE)); the model weights are not covered by it. What I took, and did not take, from each third-party project: [NOTICE](NOTICE).
-Thanks to the [HyperQwen](https://github.com/syv-ai/hyperqwen) authors for publishing their work and benchmarks.
+MIT ([LICENSE](LICENSE)); the model weights are not covered. Third-party credits: [NOTICE](NOTICE). Thanks to the [HyperQwen](https://github.com/syv-ai/hyperqwen) authors for publishing their work and benchmarks.
