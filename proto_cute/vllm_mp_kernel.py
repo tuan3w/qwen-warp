@@ -6,6 +6,7 @@ sys.path.insert(0, "/media/fatman/data/workspace/qwen-warp/engine")
 import pack
 import cute_w4
 import cute_dequant
+import w4_gemm
 from vllm.model_executor.kernels.linear.mixed_precision import MPLinearKernel, MPLinearLayerConfig
 from vllm.model_executor.kernels import linear as vlinear
 from vllm.platforms import PlatformEnum
@@ -48,12 +49,8 @@ def _cute_linear_impl(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torc
     if T <= CuteW4A16LinearKernel.MAX_GEMV_ROWS:
         fn = cute_w4.get(N, K, T, w, s, x2, out)                            # one weight pass for up to 16 rows (two n8 token tiles)
         fn(*cute_w4.wrap(w, s, x2, out), cute_w4.cur())
-    else:                                                                    # prefill / many rows: dequantise a row chunk to bf16 scratch, cuBLAS, next chunk
-        ch = cute_dequant.chunk_rows(N, K, MAX_CHUNK_BYTES)
-        scratch = _scratch(x.device)
-        for r0 in range(0, N, ch):
-            cute_dequant.dequant_chunk(w, s, scratch, K, ch, r0)
-            out[:, r0:r0 + ch] = torch.mm(x2, scratch[: ch * K].view(ch, K).t())
+    else:                                                                    # prefill / many rows: fused dequant + tensor-core GEMM (campaign lineage gm-fuse)
+        out = w4_gemm.gemm(x2, w, s)
     return out.view(*x.shape[:-1], N)
 
 def _cute_linear_fake(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -93,7 +90,7 @@ class CuteW4A16LinearKernel(MPLinearKernel):
             layer.weight = torch.nn.Parameter(wbf, requires_grad=False)
             if getattr(layer, "_on_post", None): layer._on_post()
         _register_op(); _inv(wd.device)
-        ch = cute_dequant.chunk_rows(wd.shape[0], wd.shape[1] * 8, MAX_CHUNK_BYTES); cute_dequant.dequant_chunk(wd, sd, torch.empty(ch * wd.shape[1] * 8, dtype=torch.bfloat16, device=wd.device), wd.shape[1] * 8, ch, 0)   # compile now, not inside a graph capture
+        w4_gemm.gemm(torch.zeros(64, wd.shape[1] * 8, dtype=torch.bfloat16, device=wd.device), wd, sd)   # compile now, not inside a graph capture
         N, K = wd.shape[0], wd.shape[1] * 8
         for tn in PRECOMPILE_T:
             xs = torch.zeros(tn, K, dtype=torch.bfloat16, device=wd.device); os_ = torch.empty(tn, N, dtype=torch.bfloat16, device=wd.device)

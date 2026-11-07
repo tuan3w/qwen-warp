@@ -124,3 +124,18 @@ New: `cute_host.py` (pinned host tables + a CuTe gather kernel reading rows over
 - Without the 32-row path the same run collapsed to 25 tok/s per stream at 4 clients (rows above 16 fell to the dequantise-and-GEMM path every step).
 
 - int4 target KV (`--kv-cache-dtype int4_per_token_head`, drafter KV forced to bf16 with `"kv_cache_dtype":"bfloat16"` in the speculative config, because the int4 path asserts causal attention and the DFlash2 drafter is non-causal): works, 1 stream code 306.8 / chat 253.0 tok/s (-5 % vs bf16 KV), but the pool does not grow (12,220 tokens at 12,000 max length, 1 request): for this hybrid model the per-request recurrent-state pages (k+1 = 8 slots x 151 MB per sequence with 7 drafts) and the 3,184-token attention block size set the capacity, not the attention KV bytes. A bigger KV format only pays at context lengths where attention KV, not state, dominates.
+
+# Like-for-like comparison (same card, same scripts: `p1_stream.py` decode rate, `p1_stream_mc.py` chat prompt, one stream)
+
+Engine runs: MTP = the user's container (`--profile multiuser`, vision on, int4 KV); DFlash2 = `qwen-warp:local` with `--drafter dflash2 --profile long --max-model-len 122880` (the engine requires `--max-num-seqs 1` for it). Plugin runs: stock vLLM 0.30.0, text-only, TRITON_ATTN, bf16 KV, 4 sequences, host tables, merged campaign kernels.
+
+| | MTP: engine | MTP: vLLM + plugin | engine / plugin | DFlash2: engine | DFlash2: vLLM + plugin | engine / plugin |
+|---|---|---|---|---|---|---|
+| 1 stream, code | 212.9 | 159.0 | 1.34x | 301.3 | 271.0 (321.5 in the previous build; the repeated-code prompt is noisy) | 1.11x (0.94x) |
+| 1 stream, prose | 121.0 | 107.2 | 1.13x | 129.2 | 115.0 | 1.12x |
+| 1 stream, chat prompt | 186.0 | 156.8 | 1.19x | 290.4 | 274.5 | 1.06x |
+| first token, 250-token prompt | 38-177 ms | 331 ms | | 38-177 ms | 137-192 ms (fused prefill GEMM) | |
+
+- **Like for like, the engine is still faster for one user: by 13-34 % with MTP and by 6-12 % with DFlash2** (the code prompt, where the repeated text makes acceptance noisy, ranges from the plugin ahead to 11 % behind across builds). The earlier "plugin beats the engine" statement compared the plugin's DFlash2 with the engine's MTP and is withdrawn.
+- DFlash2 vs MTP inside each stack: engine +40 % (code) / +56 % (chat); plugin +70 % (code) / +75 % (chat). The plugin gains more from the drafter because its MTP path is the weaker one.
+- At 2 clients the plugin (DFlash2, 4 sequences) aggregates 287 tok/s; the engine's DFlash2 mode serves one sequence at a time (2 clients: 215), its MTP multiuser mode 293.
