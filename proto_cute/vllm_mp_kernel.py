@@ -34,6 +34,7 @@ def dequant_repacked(w, s):
         out[r0:r0 + n] = ((nat.float() - 8.0) * sc.float().unsqueeze(-1)).reshape(n, K8 * 8).to(torch.bfloat16)
     return out
 
+PRECOMPILE_T = (1, 2, 3, 4, 8, 12, 16)      # row counts of decode steps (B drafts, B*4 verify rows); other counts compile lazily outside graph capture
 _SCRATCH = {}
 MAX_CHUNK_BYTES = 32 << 20
 def _scratch(dev):
@@ -86,7 +87,7 @@ class CuteW4A16LinearKernel(MPLinearKernel):
         _register_op(); _inv(wd.device)
         ch = cute_dequant.chunk_rows(wd.shape[0], wd.shape[1] * 8, MAX_CHUNK_BYTES); cute_dequant.dequant_chunk(wd, sd, torch.empty(ch * wd.shape[1] * 8, dtype=torch.bfloat16, device=wd.device), wd.shape[1] * 8, ch, 0)   # compile now, not inside a graph capture
         N, K = wd.shape[0], wd.shape[1] * 8
-        for tn in range(1, 17):
+        for tn in PRECOMPILE_T:
             xs = torch.zeros(tn, K, dtype=torch.bfloat16, device=wd.device); os_ = torch.empty(tn, N, dtype=torch.bfloat16, device=wd.device)
             cute_w4.get(N, K, tn, wd, sd, xs, os_)
         for n in (self.w_q_name, self.w_s_name): setattr(layer, n, None)       # free the checkpoint copies

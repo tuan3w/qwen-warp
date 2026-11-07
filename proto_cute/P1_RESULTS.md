@@ -79,3 +79,26 @@ Plugin env switches: `VLLM_CUTE_W4` (W4 linears), `VLLM_CUTE_HEAD` (`cute_head.p
 - A Python branch on the row count inside a patched layer method is frozen at trace time by vLLM's AOT-compiled graph (no guards): all shape dispatch has to live inside the registered custom op (this hid the small-GEMV patch once).
 - Greedy outputs differ from stock after 45-790 characters on 4 of 6 chat prompts, at bf16 near-ties (`'` vs the typographic apostrophe, "Assumed Schema" vs "Approach"); both coherent. Not isolated between head and linears.
 - Open: first-token time is 2.1 s (rows > 32 use a Python dequant fallback); heads for > 8 rows fall back to the bf16 path; multi-client numbers are not valid yet; sampling above temperature 0 is truncated to 32 candidates.
+
+# P3: real prefill path, 16-row single-pass kernels (same stack as P2's last row: TRITON_ATTN, bf16 KV, MTP k=3, text-only, 1536 max length, 4 sequences)
+
+New in the branch: `cute_dequant.py` (repacked W4 -> bf16 row chunk, bit-exact vs the natural dequant, ~600 GB/s write), prefill = dequant a row chunk + cuBLAS; W4 GEMV with two n8 token tiles (up to 16 rows in one weight pass; bit-exact, row-count invariant, `s11_nt_test.py`); head and small bf16 GEMV for up to 16 rows; compile only the decode row counts at load (1,2,3,4,8,12,16) because precompiling every count pushed model load past 24 GB.
+
+Decode rate from SSE timestamps (`p1_stream.py`, `p1_stream_mc.py`; chat prompts for the multi-stream script):
+
+| | stock 0.30.0 | plugin | engine | plugin / engine |
+|---|---|---|---|---|
+| 1 stream, code | 97.5 | 163.5 | 212.9 | 77 % |
+| 1 stream, prose | 64.3 | 105.9 | 121.0 | 88 % |
+| 1 stream, chat prompt | n/a | 156.0 | 186.0 | 84 % |
+| 2 streams, per stream | n/a | 142.4 | 159.9 | 89 % |
+| 4 streams, per stream | n/a | 132.7 | 120.2 | 110 % |
+| first token, 250-token prompt | 208 ms | 334 ms | 38-167 ms (prefix cache / cold) | |
+| 2 clients, aggregate over the whole span (prefill included) | n/a | 263 | 293 | 90 % |
+| 4 clients, aggregate over the whole span (prefill included) | n/a | 220 | 369 | 60 % |
+| e2e script `p1_bench.py`, 4 clients | 235 (warm) | 187 | 325 | 57 % |
+
+- **Decode is at or near engine level** (77-110 % depending on prompt and concurrency); the 4-stream per-stream rate is above the engine's. What is left of the e2e gap at 4 clients is **prefill**: the plugin prefills four 250-token prompts one after another at ~330 ms each.
+- Prefill profile (nsys, one 250-token request, 317 ms, GPU 96 % busy): cuBLAS GEMM 181 ms (~70 TFLOPs, the card's dense bf16 rate: it is compute bound), CuTe dequant 83 ms, torch copies 11 ms, everything else ~40 ms. Marlin does the same GEMMs without the 94 ms of dequant and copies (TTFT 208 ms). The overhead is a fixed ~95 ms per forward chunk, so it matters for short prompts and is ~5 % at 2k tokens. Removing it needs a fused dequant-GEMM (tensor-core, Marlin-style) kernel.
+- vLLM's hybrid prefix cache works on 1600-token blocks, so a 250-token system prompt never hits it, where the engine restores a prefix in 38 ms.
+- Decision rule (>= 85 % of the engine at one user, holding at four clients): decode part **met** (84-88 % on prose/chat, 77 % on the repeated-code prompt where the engine's lookup tail helps); the aggregate with prefill is **not** met (60 %).

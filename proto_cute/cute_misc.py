@@ -8,6 +8,7 @@ import cutlass, cutlass.cute as cute
 from cutlass import Int32, Uint32, Float32, BFloat16
 import cuda.bindings.driver as cuda
 import pack, cute_w4, ptx, vllm_mp_kernel
+from vllm_mp_kernel import PRECOMPILE_T
 
 class Bf16Small:
     """out[T, N] = x[T, K] @ w[N, K]^T, bf16 in/out, fp32 accumulate; one 128-thread CTA per row."""
@@ -90,13 +91,13 @@ def install():
             w, s = pack.quant_head_i4(wb, rows=256); pack.repack_w4(w, s, rows=128)
             layer.cute_w, layer.cute_s = w, s
             N, K = w.shape[0], w.shape[1] * 8
-            for t in range(1, 17):
+            for t in PRECOMPILE_T:
                 cute_w4.get(N, K, t, w, s, torch.zeros(t, K, dtype=torch.bfloat16, device=wb.device), torch.empty(t, N, dtype=torch.bfloat16, device=wb.device))
             layer.weight = torch.nn.Parameter(torch.empty(0, K, dtype=torch.bfloat16, device=wb.device), requires_grad=False)   # free the bf16 copy
             layer._cute_int4 = True
         elif _small_ok(layer):
             w = layer.weight.data
-            for t in range(1, 17):
+            for t in PRECOMPILE_T:
                 _small_fn(w.shape[0], w.shape[1], t, w, torch.zeros(t, w.shape[1], dtype=torch.bfloat16, device=w.device), torch.empty(t, w.shape[0], dtype=torch.bfloat16, device=w.device))
     def apply(self, layer, x, bias=None):
         if getattr(layer, "_cute_int4", False):

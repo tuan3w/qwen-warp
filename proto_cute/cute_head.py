@@ -6,6 +6,7 @@
  - More than 8 rows: the original bf16 path."""
 import sys, numpy as np, torch
 sys.path.insert(0, "/media/fatman/data/workspace/qwen-warp/engine")
+from vllm_mp_kernel import PRECOMPILE_T
 import pack, cute_w4
 import vllm.model_executor.layers.vocab_parallel_embedding as vpe
 from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
@@ -66,7 +67,7 @@ class CuteHeadMethod(QuantizeMethodBase):
         pack.repack_w4(ws, ss, rows=128)
         layer.cute_head = (w, s, ws, ss, ids); self.org = layer.org_vocab_size; self.ok = True
         for N, (ww, sw) in ((Vp, (w, s)), (nv, (ws, ss))):
-            for t in range(1, MAX_T + 1):
+            for t in PRECOMPILE_T:
                 cute_w4.get(N, K, t, ww, sw, torch.zeros(t, K, dtype=torch.bfloat16, device=wb.device), torch.empty(t, N, dtype=torch.bfloat16, device=wb.device))
 
     def apply(self, layer, x, bias=None):
