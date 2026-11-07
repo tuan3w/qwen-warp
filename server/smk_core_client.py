@@ -149,15 +149,21 @@ def vram_max_len(free_mib, dt, ht, pld, headroom=AUTO_TAIL_HEADROOM_MIB, df=Fals
 # (VRAM_BATCH_KIB_PER_SLOT_TOKEN); the fast-prefill K/V scratch (4 KiB per token) and everything else (weights, tables, activations, prefill scratch, the batched cycle graphs) is shared
 # (VRAM_BATCH_FIXED_MIB[host tables]).  The prompt-lookup tail costs no ring here (the conv ring has 9 slots anyway).  MEASURED with experiments/2026-11-06-qwen-warp-concurrent-vision memfit
 # (least free GPU memory after the warm-up, a request at --max-model-len on one slot and short ones on the others, RTX 3090): S x len x KV = 2 x 8k x bf16 16,926 MiB with host tables / 21,762
-# without, 4 x 8k bf16 18,750, 4 x 16k bf16 20,958, 4 x 32k int4 19,422 (host tables): the model below is within 8 MiB of every point (fp8: the same layout at 32 KiB, not measured).
+# without, 4 x 8k bf16 18,750, 4 x 16k bf16 20,958, 4 x 32k int4 19,422 (host tables): the model below is within 8 MiB of every point.
+# VRAM_BATCH_LOAD_MIB: what that fit missed, re-measured with real server starts that serve a prompt of --max-model-len - 100 tokens in EVERY slot at once, each with a 1920x1080 image
+# (the ViT's activation peak), then 60 mixed requests (memfit_serve.py in the same experiment directory; NVML free memory polled every 5 ms against the server's own free memory at start):
+# the model without it was short by 42 to 172 MiB text-only (2 x 13k bf16, 4 x 21k bf16 + host tables, 6 x 24k fp8 + host tables, 8 x 28k int4 + host tables) and by 68 to 254 MiB with
+# images (2 to 6 slots, ViT weights on the device or the host; 254 = 6 x 24k fp8 + host tables + ViT on the device after the mixed requests, the configuration that went out of memory
+# in a 12k-token prefill).  The fp8 per-token term is right: fp8 and bf16 configurations are short by the same amount (a 4 KiB error would be 570 MiB at 6 x 24k).
 VRAM_BATCH_FIXED_MIB = {False: 19920, True: 15080}
+VRAM_BATCH_LOAD_MIB = 280
 VRAM_BATCH_SLOT_MIB = 368
 VRAM_BATCH_KIB_PER_SLOT_TOKEN = (68.0, 36.0, 20.5)
 MAX_NUM_SEQS = 8  # sequence slots of a batched cycle (SMK_BATCH_MAX, include/batch.h)
 
 
 def vram_need_batch_mib(ctx, dt, ht, S, vis=0.0):
-    return vis + VRAM_BATCH_FIXED_MIB[ht] + S * (VRAM_BATCH_SLOT_MIB + VRAM_KV_FIXED_MIB[dt]) + ctx * (S * VRAM_BATCH_KIB_PER_SLOT_TOKEN[dt] + 4.0) / 1024
+    return vis + VRAM_BATCH_FIXED_MIB[ht] + VRAM_BATCH_LOAD_MIB + S * (VRAM_BATCH_SLOT_MIB + VRAM_KV_FIXED_MIB[dt]) + ctx * (S * VRAM_BATCH_KIB_PER_SLOT_TOKEN[dt] + 4.0) / 1024
 
 
 def batch_max_len(free_mib, dt, ht, S, headroom=MIN_HEADROOM_MIB, vis=0.0):
@@ -280,7 +286,7 @@ def engine_cfg(vllm_config, free_mib):
                                f"What fits the free memory with {KV_NAMES[dt]} KV{' + host tables' if ht else ''}{vtxt} (--profile long = int4 KV + host tables needs the least):\n{batch_limits_text(free_mib, dt, ht, S, L, vis)}")
         return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"],
                                system_checkpoint=OPTIONS["system_checkpoint"], pld=pld, drafter="mtp", dflash_path=None, dflash_codebooks_host=cbh, max_num_seqs=S, vision=wts, vis_mib=vis,
-                               vision_off=off, max_patches=max_patches(mp))
+                               vision_off=off, max_patches=max_patches(mp), need_mib=need)
     pld = tail_on(L, dt, ht, k, pl, df, free_mib, vis)
     if mode == "auto":
         wts = auto_vision(L, dt, ht, 1, pld, df, cbh, mp, free_mib)
@@ -305,7 +311,8 @@ def engine_cfg(vllm_config, free_mib):
                                f"but only {free_mib} MiB are free on the GPU (a desktop and other programs hold the rest).  "
                                f"Largest --max-model-len that fits the free memory:\n{vram_limits_text(free_mib, k, vis=vis)}")
     return SimpleNamespace(ctx_max=L + Runner.slack(g, k, pld or df), kv_fp8=dt, host_tables=ht, k=k, group=g, snapshots=OPTIONS["snapshots"], prefix_cache_gb=OPTIONS["prefix_cache_gb"], system_checkpoint=OPTIONS["system_checkpoint"], pld=pld,
-                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh, vision=wts, vis_mib=vis, vision_off=off, max_patches=max_patches(mp), max_num_seqs=1)
+                           drafter="dflash2" if df else "mtp", dflash_path=OPTIONS["dflash_path"], dflash_codebooks_host=cbh, vision=wts, vis_mib=vis, vision_off=off, max_patches=max_patches(mp), max_num_seqs=1,
+                           need_mib=need)
 
 
 def warmup_grid(patches):
@@ -348,10 +355,11 @@ class SwiftCoreClient(EngineCoreClient):
             raise RuntimeError(f"swift-mk engine ran out of GPU memory at --max-model-len {vllm_config.model_config.max_model_len:,}{f' x --max-num-seqs {S}' if S > 1 else ''} with {KV_NAMES[cfg.kv_fp8]} KV{' + host tables' if cfg.host_tables else ''}"
                                f"{' and the prompt-lookup tail' if cfg.pld else ''}{' and --drafter dflash2' if cfg.drafter == 'dflash2' else ''} ({free_mib} MiB were free at start, another program may have taken memory since).  "
                                f"What fits that memory:\n{batch_limits_text(free_mib, cfg.kv_fp8, cfg.host_tables, S, vllm_config.model_config.max_model_len, cfg.vis_mib) if S > 1 else vram_limits_text(free_mib, cfg.k, cfg.drafter == 'dflash2', cfg.dflash_codebooks_host, cfg.vis_mib)}\n{e}") from e
-        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s%s%s",
+        logger.info("swift-mk engine ready in %.1f s (weights+MTP %.1f s, warmup %.1f s): ctx_max %d, k=%d, %d cycles per sync, kv %s%s, %d snapshots, %.1f GiB host prefix cache, prompt-lookup tail %s%s%s; "
+                    "GPU memory %d MiB free at start, about %.0f MiB predicted at the full length",
                     time.time() - t0, self.runner.load_s, self.runner.warmup_s, cfg.ctx_max, cfg.k, cfg.group, KV_NAMES[cfg.kv_fp8], " + host tables" if cfg.host_tables else "", cfg.snapshots, cfg.prefix_cache_gb, "on" if cfg.pld else "off",
                     f", drafter dflash2 (greedy requests without logit processors; {self.runner.df_mib:.0f} MiB device, codebooks on the {'host' if cfg.dflash_codebooks_host else 'device'})" if cfg.drafter == "dflash2" else "",
-                    f", {S} sequence slots (batched decode)" if S > 1 else "")
+                    f", {S} sequence slots (batched decode)" if S > 1 else "", free_mib, cfg.need_mib)
         logger.info("swift-mk image input %s", f"on: ViT weights on the {cfg.vision} ({self.runner.vit.mib:.0f} MiB on the GPU), images up to {cfg.max_patches * 256:,} pixels "
                     f"({cfg.max_patches // 4} placeholder tokens), {cfg.vis_mib:.0f} MiB counted" if cfg.vision else f"off: {cfg.vision_off}")
         self.max_patches = cfg.max_patches

@@ -184,7 +184,7 @@ def test_vision_off():
     import serve
 
     mp = 8388608
-    for free in (23700, 23228):
+    for free in (23650, 23228):
         real = torch.cuda.mem_get_info
         torch.cuda.mem_get_info = lambda device=None, free=free: (free << 20, 24 << 30)
         try:
@@ -196,6 +196,21 @@ def test_vision_off():
         old_on = cfg(free, old, kv="int4_per_token_head", ht=True, S=S, mp=mp).vision
         check(f"default length at {free} MiB free, 8 slots, --max-image-pixels {mp:,}: {a.max_model_len:,} keeps image input on ({new_on}); the old default {old:,} turned it off",
               new_on is not None and old_on is None and a.max_model_len >= old - 3072)
+    # the configuration that went out of memory in a 12k-token prefill (memory model short by 254 MiB under load, memfit_serve.py): at 23,753 MiB free the server picked 24,576 tokens
+    # per slot and left 43 MiB at the peak; now that length is refused with the reason, and the picked one keeps the old model's shortfall + the minimum headroom free
+    S6 = ["--max-num-seqs", "6", "--host-tables", "--vision", "device", "--kv-cache-dtype", "fp8"]
+    real = torch.cuda.mem_get_info
+    torch.cuda.mem_get_info = lambda device=None: (23753 << 20, 24 << 30)
+    try:
+        a = serve.parse_args(S6)
+    finally:
+        torch.cuda.mem_get_info = real
+    old_need = sc.vram_need_batch_mib(24576, 1, True, 6, sc.vision_mib("device", 2097152)) - sc.VRAM_BATCH_LOAD_MIB  # the model before the fix
+    r = cfg(23753, 24576, mode="device", kv="fp8", ht=True, S=6)
+    picked = cfg(23753, a.max_model_len, mode="device", kv="fp8", ht=True, S=6)
+    check(f"--max-num-seqs 6 --host-tables --vision device fp8 at 23,753 MiB free: 24,576 per slot (measured peak {old_need + 254:.0f} MiB) refused with the reason; the default "
+          f"{a.max_model_len:,} is accepted", isinstance(r, str) and "--max-num-seqs 6" in r and "fp8 KV" in r and a.max_model_len < 24576 and not isinstance(picked, str)
+          and sc.vram_need_batch_mib(a.max_model_len, 1, True, 6, sc.vision_mib("device", 2097152)) - sc.VRAM_BATCH_LOAD_MIB + 254 + sc.MIN_HEADROOM_MIB <= 23753, r[:200] if isinstance(r, str) else r)
 
 
 def test_profiles():

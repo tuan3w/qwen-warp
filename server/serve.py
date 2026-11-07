@@ -3,7 +3,7 @@
 
   python server/serve.py --port 8000                          # default: bf16 KV, 20k context, MTP k=3 + prompt lookup, one request at a time
   python server/serve.py --profile long --port 8000           # int4 KV + host-pinned tables: 196k context (up to 262144 with --max-model-len 262144)
-  python server/serve.py --profile multiuser --port 8000      # 5 requests decoded together (--max-num-seqs 5 --host-tables --vision device), ~15k context each
+  python server/serve.py --profile multiuser --port 8000      # 5 requests decoded together (--max-num-seqs 5 --host-tables --vision device), ~14k context each
   python server/serve.py --kv-cache-dtype fp8 --max-model-len 53248 --num-speculative-tokens 3
 
 Every stock `vllm serve` frontend flag works (--served-model-name, --host/--port, --api-key, --chat-template, --reasoning-parser, --tool-call-parser, ...).

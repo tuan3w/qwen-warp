@@ -221,7 +221,7 @@ For several users at once (chat clients, agents running in parallel, image and t
 python server/serve.py --profile multiuser --port 8000     # = --max-num-seqs 5 --host-tables --vision device, bf16 KV
 ```
 
-It picks the longest `--max-model-len` per sequence that the free memory holds (about 15k tokens with 23.2 GB free, at most 28,672); pass `--max-model-len` (or `--max-num-seqs`,
+It picks the longest `--max-model-len` per sequence that the free memory holds (14,336 tokens with 23.2 GB free, at most 28,672); pass `--max-model-len` (or `--max-num-seqs`,
 `--vision`) to override. Measured on 6 closed-loop clients sending text and image requests: 1.36x the aggregate tok/s of the one-at-a-time server ([Performance](PERFORMANCE.md#7-concurrent-requests---max-num-seqs)).
 
 | Running requests | How a cycle decodes them |
@@ -236,14 +236,14 @@ It picks the longest `--max-model-len` per sequence that the free memory holds (
 - Every request keeps its own sampling parameters, seed, logit processors, stops, `max_tokens` and abort; prefix reuse (`cached_tokens`, the host prefix cache) works per slot: a request goes to the free slot whose conversation it continues, else the least recently used free slot, whose conversation is spilled to the host cache first.
 - Outputs: in the default mode a greedy request's ids can differ between batch sizes at a bf16 near-tie. A request's tokens are the same whether other requests run next to it as long as its draft depth stays the same, but the scheduler changes the depth with the number of running requests (table above), and the DeltaNet kernel sums in another order at another verify width, so a token whose two best logits are almost equal can flip (as with `--num-speculative-tokens`). Measured on 20 prompts x 512 tokens, the native path against batched cycles of 0, 1 and 3 drafts: 20 of 60 answers diverged, always where the top-2 gap of the exact logits was 0.011 to 0.14 (the median gap over all positions is 6.6; the reduction-order noise of that gap between the two runs has a median of 0.028 and a p99 of 0.17); seeded sampling draws other tokens at another depth. The exact mode `SMK_BATCH_K=k` (tests) fixes the depth at every batch size and removes this: a request's ids are then exactly those it gets alone.
 - `--drafter dflash2` needs `--max-num-seqs 1`.
-- Memory: every slot has its own KV cache at `--max-model-len` (368 MiB + 68 / 36 / 20.5 KiB per token with bf16 / fp8 / int4 KV, on top of 19.9 GiB, or 15.1 GiB with `--host-tables`). Without `--max-model-len` the server picks the longest length per sequence that fits next to image input (the ViT with its weights in host memory; with `--vision off` the lengths are 1,024 to 4,096 tokens longer); a configuration that does not fit is refused with the largest `--max-num-seqs` at that length and the largest length at 2, 4 and 8 slots. With 23.7 GB free (a desktop holding 0.3 GB), from the memory model:
+- Memory: every slot has its own KV cache at `--max-model-len` (368 MiB + 68 / 36 / 20.5 KiB per token with bf16 / fp8 / int4 KV, on top of 20.2 GiB, or 15.4 GiB with `--host-tables`, which include 280 MiB of prefill / decode working memory measured with every slot serving a full-length prompt with a 1920x1080 image at once). Without `--max-model-len` the server picks the longest length per sequence that fits next to image input (the ViT with its weights in host memory, or on the GPU with `--vision device`; with `--vision off` the lengths are 1,024 to 4,096 tokens longer); a configuration that does not fit is refused with the largest `--max-num-seqs` at that length and the largest length at 2, 4 and 8 slots. With 23.7 GB free (a desktop holding 0.3 GB), from the memory model:
 
 | Cache | 2 slots | 4 slots | 8 slots |
 |---|---|---|---|
-| bf16 (default profile) | 18,432 | 6,144 | 1,024 (no room for image input) |
-| fp8 | 34,816 | 12,288 | 1,024 |
-| bf16 + `--host-tables` | 54,272 | 24,576 | 9,216 |
-| int4 + `--host-tables` (`--profile long`) | 167,936 | 77,824 | 29,696 |
+| bf16 (default profile) | 16,384 | 5,120 | does not fit |
+| fp8 | 30,720 | 10,240 | does not fit |
+| bf16 + `--host-tables` | 52,224 | 23,552 | 9,216 |
+| int4 + `--host-tables` (`--profile long`) | 161,792 | 74,752 | 28,672 |
 
 Speed: [Performance](PERFORMANCE.md#7-concurrent-requests---max-num-seqs).
 

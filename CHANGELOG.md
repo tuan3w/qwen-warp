@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- `--max-num-seqs` > 1 start-up memory model: it was fitted with one full-length request on one slot and missed 42 to 254 MiB that a server needs when every slot serves a full-length prompt (with a 1920x1080 image) at once, so `--max-num-seqs 6 --host-tables --vision device --kv-cache-dtype fp8` was accepted at a length that ran out of memory in a 12k-token prefill (re-measured: 43 MiB left at the peak). Re-measured with real server starts (2 to 8 slots, bf16 / fp8 / int4, ViT on the device / host / off, `memfit_serve.py` in the research notes); the model adds 280 MiB (`VRAM_BATCH_LOAD_MIB`), so such configurations get 1,024 to 6,144 fewer tokens per slot or are refused with what fits. The fp8 per-token term (36 KiB per slot-token) was confirmed. `tests/test_startup_configs.py` serves every slot at full length at once for three S > 1 configurations; the start log reports the free memory at start and the prediction.
 - An image request that the frontend refused only after processing the image (text within `--max-model-len`, text + image over it) made every later request with the same image fail with an HTTP 500: vLLM's lru multimodal cache counted the image as sent to the engine. The engine runs in the frontend's process, so the frontend now uses the processor-only cache (the data always travels with the request).
 
 ## 0.7.0 - 2026-11-06
