@@ -6,21 +6,24 @@ vLLM runs: text-only (`--limit-mm-per-prompt image=0,video=0`, else the MTP head
 
 ## Throughput
 
-| | vLLM 0.30.0 Marlin | vLLM 0.30.0 + CuTe GEMV (spike) | this engine |
-|---|---|---|---|
-| 1 client, code, decode rate (stream) | 97.5 | **99.2** | **212.9** |
-| 1 client, prose, decode rate (stream) | 64.3 | 69.0 | 121.0 |
-| 1 client, chat code, e2e | 96.5 | 58.3 (prefill) | 181.2 |
-| 1 client, chat explain, e2e | 79.6 | 71.1 (prefill) | 155.8 |
-| 2 clients aggregate, e2e | 163.9 | 65.8 (T>32 path) | 281.0 |
-| 4 clients aggregate, e2e | 235.4 (first run: 142.5) | 75.3 (T>32 path) | 325.2 |
-| 8 clients aggregate, e2e | 259.8 (first run: 145.0) | 78.0 (T>32 path) | 347.1 |
-| TTFT, code prompt (250 tokens) | 208 ms | 2124 ms (dequant prefill) | 38 ms (prefix hit) |
-| tokens / cycle (code) | 3.63-3.66 | 3.63-3.66 | n/a |
+| | vLLM 0.30.0 Marlin | vLLM 0.33.0 Marlin | vLLM 0.30.0 + CuTe GEMV (spike) | this engine |
+|---|---|---|---|---|
+| 1 client, code, decode rate (stream) | 97.5 | 101.7 | **99.2** | **212.9** |
+| 1 client, prose, decode rate (stream) | 64.3 | 62.7 | 69.0 | 121.0 |
+| 1 client, chat code, e2e | 96.5 | 98.7 | 58.3 (prefill) | 181.2 |
+| 1 client, chat explain, e2e | 79.6 | 88.9 | 71.1 (prefill) | 155.8 |
+| 2 clients aggregate, e2e | 163.9 | 159.0 | 65.8 (T>32 path) | 281.0 |
+| 4 clients aggregate, e2e | 235.4 (first run: 142.5) | 134.7 (first run) | 75.3 (T>32 path) | 325.2 |
+| 8 clients aggregate, e2e | 259.8 (first run: 145.0) | 160.5 (first run) | 78.0 (T>32 path) | 347.1 |
+| TTFT, code prompt (250 tokens) | 208 ms | 229 ms | 2124 ms (dequant prefill) | 38 ms (prefix hit) |
+| tokens / cycle (code) | 3.63-3.66 | 3.63-3.66 | 3.63-3.66 | n/a |
 
 - Single user: engine is **2.2x (code) / 1.9x (prose)** faster than stock vLLM. Four clients: 1.4x, eight: 1.3x (vLLM scales better than a naive reading of one client; the first vLLM multi-client run was 40 % lower, so treat vLLM multi-client numbers as +-40 % until repeated).
 - The CuTe rows marked "prefill" / "T>32 path" lose only because the spike's fallback for more than 32 rows is a Python whole-matrix dequant; it is irrelevant for decode (see the stream row). Acceptance is identical to Marlin (3.63-3.66 tokens/cycle): the kernel is numerically equivalent in use.
 - vLLM 0.30.0 cannot load this checkpoint with MTP on 24 GB with the vision tower; text-only leaves 1.5 GiB for KV (about 11k tokens at bf16). The engine serves 262k.
+
+- **vLLM 0.33.0 changes nothing for this setup** (same Marlin, same FlashInfer, same 11.7k-token KV at 8192): single-client decode +4 % on code, -2 % on prose. Its multi-client numbers were taken straight after server start like the first 0.30.0 run (about 40 % below the warmed second run), so only compare them with that first run.
+- **Public context:** HyperQwen (patch series on vLLM, same model, one 3090 at a 250 W cap) reports 127 tok/s single stream, using requantized heads, a calibrated 40k draft vocabulary and int8 Marlin - the same levers the profile below points at. So the gap is about 2x against *unpatched* vLLM and about 1.3-1.4x against a patched one (this README's own comparison: 1.2-1.3x at long context; power caps differ: 250 W vs 350 W).
 
 ## Where a vLLM decode cycle goes (nsys, node-level CUDA graph trace, 16 cycles of code decode)
 
