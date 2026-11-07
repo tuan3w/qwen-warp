@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: swift-cute-vllm
+Version: 0.1
+Summary: CuTe DSL kernels for vLLM (spike)

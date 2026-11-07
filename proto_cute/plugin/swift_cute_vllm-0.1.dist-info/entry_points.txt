@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+swift_cute = swift_cute_vllm:register
