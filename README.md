@@ -1,14 +1,14 @@
 # qwen-warp
 
-**Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s.**
+**Fast Qwen3.8-27B for one RTX 3090. 200k context, 100+ tok/s, several users at once, image input.**
 
 I built qwen-warp to get the most out of my own RTX 3090: a custom CUDA decode engine behind an OpenAI-compatible API. With a **190k-token prompt it decodes at 102 tokens/s, 3.6x faster than [HyperQwen](https://github.com/syv-ai/hyperqwen)'s 200k preset (28 tok/s)**, measured on the same card, the same day and the same prompts. It decodes 94 to 133 tok/s with 32k to 262k tokens in the prompt and fits the model's full 262,144-token context in 24 GB.
-At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, HyperQwen's DFlash2 preset is faster than the MTP engine (about 1.5x on code); the experimental in-engine DFlash2 drafter is level with it in a same-session comparison, and the server can use it for greedy requests with `--drafter dflash2` (through the server: code 277 against 184 tok/s, math 254 against 184, prose 113 against 118, and 31% slower on copy-heavy agent turns; [Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)); neither was measured at long context.
-I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), text and image input; one request at a time by default, up to 8 decoded together with `--max-num-seqs` ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
+At 32k to 130k it is 1.2x to 1.3x faster than HyperQwen's `mtp-long`, which does not serve 190k. On short prompts, `--drafter dflash2` decodes code / prose / math at 277 / 113 / 254 tok/s, 1.09x to 1.12x HyperQwen's DFlash2 preset; it serves one request at a time and was not measured at long context.
+I tested it only with [Swift-1.5-Qwen3.8-27B INT4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-INT4). Other Qwen3.8 27B variants may work; I have not tried them. One GPU (RTX 3090), text and image input; one request at a time by default, up to 8 decoded together with `--max-num-seqs` or `--profile multiuser`: **4 users at once get 425 tok/s in total, 8 users 441, against 155 when they queue** ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
 
 ## Numbers
 
-Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, HyperQwen included, was measured on 2026-11-04 with the same prompts and client ([method](docs/PERFORMANCE.md#3-speed)).
+Same card at 350 W, greedy. The long-context tables and the first four short-prompt rows were measured on 2026-11-04, HyperQwen included, with the same prompts and client, one run per cell ([method](docs/PERFORMANCE.md#3-speed)); the DFlash2 rows on 2026-11-06; the several-users table on 2026-11-07.
 
 | Speedup: our decode tok/s divided by HyperQwen's | 32k | 64k | 100k | 130k | 190k |
 |---|---|---|---|---|---|
@@ -32,8 +32,20 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | **qwen-warp** 4-bit KV cache | 170 | 108 | 162 |
 | *reference:* HyperQwen `mtp-long` | 135 | 89 | 134 |
 | **speedup**, qwen-warp 4-bit KV vs `mtp-long` | **1.27x** | **1.22x** | **1.21x** |
-| *reference:* HyperQwen DFlash2 (earlier session, 2026-11-01, same card and 350 W; 254 / 103 / 226 again in the 2026-11-06 session) | 254 | 103 | 225 |
-| qwen-warp 4-bit KV vs DFlash2 (different days) | 0.67x | 1.05x | 0.72x |
+| **qwen-warp `--drafter dflash2`** (bf16 KV, `--host-tables`; through the server, 2 interleaved visits) | **277** | **113** | **254** |
+| **qwen-warp `--drafter dflash2`**, 4-bit KV cache | **272** | **124** | **257** |
+| *reference:* HyperQwen DFlash2 (2026-11-06; the same 254 / 103 / 225 on 2026-11-01) | 254 | 103 | 226 |
+| **speedup**, qwen-warp `--drafter dflash2` (bf16 KV) vs HyperQwen DFlash2 (two sessions of the same day) | **1.09x** | **1.10x** | **1.12x** |
+
+In one session with both on the card, engine against HyperQwen's server, the DFlash2 gap was +6% / +3% / +13% after discounting the server ([Performance, section 5](docs/PERFORMANCE.md#5-dflash2-block-drafter-experimental)): level on code and prose, ahead on math. Same drafter checkpoint, same acceptance (about 6 tokens per step on code); the difference is the step time (21.1 vs 23.5 ms). `--drafter dflash2` serves one request at a time and is 31% slower than MTP on copy-heavy agent turns.
+
+| Several users at once, total tokens/s (3 greedy 512-token requests per user, one run per cell) | 1 user | 2 | 4 | 8 |
+|---|---|---|---|---|
+| qwen-warp 0.7.0 (requests queue, one at a time) | 155 | 154 | 155 | 152 |
+| **qwen-warp `--profile multiuser`**, text | **154** | **278** | **425** | **441** |
+| **qwen-warp `--profile multiuser`**, text and images mixed | 161 | 230 | 310 | 318 |
+
+With 8 users the median wait for the first token is 3.6 s instead of 22.3 s. A single user gets the same tokens as 0.7.0 at the same speed (code 181.1 vs 181.4 tok/s). Details: [Performance, section 7](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs).
 
 | | |
 |---|---|
@@ -41,11 +53,11 @@ Same card at 350 W, greedy, batch size 1, one run per cell. Everything below, Hy
 | Prefill | 1,890 tok/s at 16k, 1,100 at 190k (3 minutes), 963 at 262k (4.5 minutes); follow-up turns reuse the cached prefix |
 | Ready after | 21 to 30 s |
 | Quality of the 4-bit cache | rotated format with an exact sink and recent-token ring: KL divergence from the bf16 cache 0.069% at 32k (the previous format: 0.51%), perplexity +0.056% over bf16 at 98k (previous: +0.26%), a minimal tool schema in the usual key order 92% to 96% well-formed (previous: 46%; bf16 91%), a planted needle at 100k found in every run (previous format: missed in every run). Coding pass@1 was measured on the previous format only (241 against 244 of 283) and not repeated. On one 61-token loop prompt, caused by the exact ring, sampled text repeats more than with bf16; four other prompts match. [KV cache](docs/KV_CACHE.md) |
-| Not measured | multi-turn agent task success, other GPUs, other power limits, HyperQwen's DFlash2 at long context, copy-heavy answers with DFlash2's own drafter beyond two prompts (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), and more than 8 concurrent users (it reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine decodes at most 8 requests together) |
+| Not measured | multi-turn agent task success, other GPUs, other power limits, DFlash2 (ours or HyperQwen's) at long context, copy-heavy answers with DFlash2's own drafter beyond two prompts (HyperQwen reports 381 tok/s when the answer quotes its own prompt, with its lookup drafter), more than 8 concurrent users (HyperQwen reports about 1,035 tok/s aggregate at 64 concurrent in batch mode; this engine decodes at most 8 requests together), images other than synthetic test images |
 
-HyperQwen is a general serving project; this compares single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
+HyperQwen is a general serving project; the comparisons with it are single-stream decode of this model on this card, against its unmodified public image. Gaps under about 10% are noise.
 
-The speed rows above were measured with the previous 4-bit format. With the rotated format of this version, two interleaved runs per cell in one session gave the same speed on short prompts, 7% to 12% more at 100k, level to +4% at 190k, and level to 3% less at 32k ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
+The 2026-11-04 rows were measured with the previous 4-bit format. With the rotated format of this version, two interleaved runs per cell in one session gave the same speed on short prompts, 7% to 12% more at 100k, level to +4% at 190k, and level to 3% less at 32k ([PERFORMANCE](docs/PERFORMANCE.md#3-speed)).
 
 <details>
 <summary>Exact HyperQwen build and caveats</summary>
@@ -59,9 +71,11 @@ The speed rows above were measured with the previous 4-bit format. With the rota
 ## How it gets there
 
 - **Fused kernels.** The 4-bit weights decode as one CUDA graph of fused kernels, with no framework work per step.
-- **MTP speculative decoding.** The checkpoint's own draft head proposes 3 tokens per step; the engine verifies them in one pass and keeps the output distribution exact, greedy or sampled. About 3 tokens come out per step.
+- **Speculative decoding.** The checkpoint's own MTP head proposes 3 tokens per step (about 3 come out per step), or the DFlash2 block drafter proposes 7 (`--drafter dflash2`, about 4.5 per step); the engine verifies them in one pass and keeps the output distribution exact, greedy or sampled.
 - **A 4-bit KV cache and host-pinned tables.** The cache shrinks 4x; the embedding and rescoring head live in pinned host memory. Together they free the VRAM for 262k tokens.
 - **Prompt lookup and prefix reuse.** Repeated text in the prompt speeds up decoding; a chat's earlier turns skip prefill.
+- **Batched decode.** Decode is bound by reading the weights, not by arithmetic: a weight pass costs about the same for 1 or 16 rows. With several requests, their rows share each pass (up to 16 rows; a row computes the same bits whichever rows share its pass), so 4 users get 2.7x the total throughput of one. The draft depth depends on how many requests are running, so outputs can differ from a lone run at bf16 near-ties ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs)).
+- **Image input.** The checkpoint's bf16 vision tower runs on the GPU (16 ms at 448x448, 65 ms at 1024x768); image rows enter the prefill with 3-D positions like vLLM's.
 
 The code map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -98,6 +112,7 @@ during thinking. Raise `max_tokens` if an answer is cut off, or switch thinking 
 | The model's full context | `--profile long --max-model-len 262144 --prompt-lookup 0` | 262,144 |
 | Fastest at short context | defaults (bf16 KV cache) | 20,480 (28,672 with `--prompt-lookup 0`) |
 | fp8 KV cache | `--kv-cache-dtype fp8 --max-model-len 53248` | 53,248 |
+| Several users at once, text and images (Docker: `PROFILE=multiuser`) | `--profile multiuser` | per request: what free memory holds, at most 28,672 |
 
 The server measures the free GPU memory at start and refuses a context that does not fit, before it loads the weights; the limits are in [USAGE](docs/USAGE.md#memory-and-context). With Docker, set `PROFILE=` and `EXTRA_ARGS=` in a `.env` file ([.env.example](.env.example)).
 `make test` checks your install; it needs the GPU and the weights and takes a while ([list](docs/GETTING_STARTED.md#4-verify-it-works)).
@@ -110,7 +125,7 @@ The server measures the free GPU memory at start and refuses a context that does
 | Returns HTTP 400 | `logprobs`, `bad_words`, structured output, `thinking_token_budget`: each is hard here, and [IDEAS](docs/IDEAS.md) says why |
 | Tool calls | They work, with one caveat: the previous 4-bit format gave a well-formed call in 39% to 46% of requests for a minimal one-parameter schema in the usual key order (bf16: 91%); with the rotated 4-bit cache of this version it is 92% (n = 200, through the server). The default `--sort-tool-schema` stays on ([details](docs/USAGE.md#tool-calls)) |
 | Images | `image_url` parts in chat messages (base64 or URL), up to 4 per prompt and 2 megapixels each by default; the checkpoint's vision tower runs on the GPU (time to first token 0.22 s at 448x448, 1.5 s at 1920x1080), text requests are unchanged; video returns 400 ([details](docs/USAGE.md#images)) |
-| Concurrency | `--max-num-seqs 1` (default): one request decodes at a time, the rest queue. `--max-num-seqs 2..8`: that many requests decode together in one weight pass per cycle ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs), [Performance](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs)) |
+| Concurrency | `--max-num-seqs 1` (default): one request decodes at a time, the rest queue. `--max-num-seqs 2..8` or `--profile multiuser` (5): that many requests decode together in one weight pass per cycle; `--drafter dflash2` needs `--max-num-seqs 1` ([Usage](docs/USAGE.md#concurrent-requests---max-num-seqs), [Performance](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs)) |
 
 ## Documentation
 

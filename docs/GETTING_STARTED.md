@@ -54,7 +54,7 @@ It serves on `http://localhost:8000` with the long-context profile. Change the d
 |---|---|---|
 | `MODEL_DIR` | `$HOME/models/swift-1.5-int4` | host directory with the checkpoint, mounted at `/models/swift-1.5-int4` |
 | `PORT` | `8000` | host port |
-| `PROFILE` | `long` | `long` (4-bit KV cache, 196,608 context) or `default` (bf16 KV cache, 20,480 context) |
+| `PROFILE` | `long` | `long` (4-bit KV cache, 196,608 context), `default` (bf16 KV cache, 20,480 context) or `multiuser` (5 requests decode together, images on the GPU: [Usage](USAGE.md)) |
 | `EXTRA_ARGS` | empty | any [server flag](USAGE.md#server-flags), e.g. `--max-model-len 262144 --prompt-lookup 0` for the full 262,144-token context |
 
 Good to know: a named volume keeps the Triton and vLLM compile caches, so the first start is slower than the next ones (189 s until the container was healthy with an empty volume, measured on 2026-11-04; about 140 s of that is spent before the GPU is touched, so another job can take the card's memory in that window and the engine then refuses to start; later starts were not timed).

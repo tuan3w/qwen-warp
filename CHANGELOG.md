@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-11-07
 
 ### Added
 
+- Docker: `PROFILE=multiuser` (in `.env` or the environment) serves the multi-user configuration from `docker-compose.yml`.
 - `--max-num-seqs 2..8`: that many requests decode together in one weight pass per cycle (continuous batching, `server/smk_batch.py`; engine: sequence slots with one in-place DeltaNet state each and a batched speculative cycle, `engine/src/batch.cu`, `engine/batch.py`). 4 concurrent clients on the default profile: 334 tok/s aggregate against 155 for the 0.7.0 FIFO, TTFT p50 0.12 s against 10 s ([Performance](docs/PERFORMANCE.md#7-concurrent-requests---max-num-seqs)). A long prompt prefilling pauses the running streams for ~0.3 s at a time. Per-request sampling, seeds, processors, stops, aborts and prefix reuse. A measured start-up memory model refuses configurations that do not fit and names the largest slot count / length; without `--max-model-len` the longest length per slot that fits is used. `--drafter dflash2` needs `--max-num-seqs 1`. `--max-num-seqs 1` (default) is the previous engine: same speed, same ids.
 - `SMK_BATCH_K=k`: fixed draft depth at every batch size (exact mode: a request's ids do not depend on the other requests).
 - `SMK_DEBUG=1`: a canary after every device buffer of the engine (`smk_engine_canary_check`).
