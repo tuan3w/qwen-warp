@@ -34,7 +34,7 @@ def dequant_repacked(w, s):
         out[r0:r0 + n] = ((nat.float() - 8.0) * sc.float().unsqueeze(-1)).reshape(n, K8 * 8).to(torch.bfloat16)
     return out
 
-PRECOMPILE_T = (1, 2, 3, 4, 8, 12, 16)      # row counts of decode steps (B drafts, B*4 verify rows); other counts compile lazily outside graph capture
+PRECOMPILE_T = (1, 2, 3, 4, 8, 12, 16, 24, 32)      # row counts of decode steps (B drafts, B*4 verify rows); other counts compile lazily outside graph capture
 _SCRATCH = {}
 MAX_CHUNK_BYTES = 32 << 20
 def _scratch(dev):
@@ -65,7 +65,7 @@ def _register_op():
         direct_register_custom_op("cute_w4a16_linear", _cute_linear_impl, fake_impl=_cute_linear_fake)
 
 class CuteW4A16LinearKernel(MPLinearKernel):
-    MAX_GEMV_ROWS = 16
+    MAX_GEMV_ROWS = 32
 
     @classmethod
     def get_min_capability(cls): return 80
@@ -84,6 +84,14 @@ class CuteW4A16LinearKernel(MPLinearKernel):
         wd = w.data.contiguous().view(torch.int32); sd = s.data.contiguous().to(torch.bfloat16)
         pack.repack_w4(wd, sd, rows=128)
         layer.cute_w = torch.nn.Parameter(wd, requires_grad=False); layer.cute_s = torch.nn.Parameter(sd, requires_grad=False)
+        if getattr(layer, "_keep_bf16", False):          # vLLM's DFlash drafter stacks `qkv_proj.weight` of all layers into one fused KV GEMM: give it a dequantised bf16 copy
+            N0, K0 = wd.shape[0], wd.shape[1] * 8
+            wbf = torch.empty(N0, K0, dtype=torch.bfloat16, device=wd.device)
+            ch0 = cute_dequant.chunk_rows(N0, K0, MAX_CHUNK_BYTES); sc0 = torch.empty(ch0 * K0, dtype=torch.bfloat16, device=wd.device)
+            for r0 in range(0, N0, ch0):
+                cute_dequant.dequant_chunk(wd, sd, sc0, K0, ch0, r0); wbf[r0:r0 + ch0] = sc0[: ch0 * K0].view(ch0, K0)
+            layer.weight = torch.nn.Parameter(wbf, requires_grad=False)
+            if getattr(layer, "_on_post", None): layer._on_post()
         _register_op(); _inv(wd.device)
         ch = cute_dequant.chunk_rows(wd.shape[0], wd.shape[1] * 8, MAX_CHUNK_BYTES); cute_dequant.dequant_chunk(wd, sd, torch.empty(ch * wd.shape[1] * 8, dtype=torch.bfloat16, device=wd.device), wd.shape[1] * 8, ch, 0)   # compile now, not inside a graph capture
         N, K = wd.shape[0], wd.shape[1] * 8

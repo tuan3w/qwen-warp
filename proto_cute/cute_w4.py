@@ -11,7 +11,7 @@ def cur():
 
 class W4Gemv:
     def __init__(self, N, K, T, NW=8, KS=4, U=2, grid=164):
-        assert N % 16 == 0 and K % 128 == 0 and 1 <= T <= 16 and NW % KS == 0
+        assert N % 16 == 0 and K % 128 == 0 and 1 <= T <= 32 and NW % KS == 0
         self.N, self.K, self.T, self.NW, self.KS, self.U, self.grid = N, K, T, NW, KS, U, grid
         self.NT = (T + 7) // 8
         self.nkg = K // 128; assert self.nkg % KS == 0
@@ -122,6 +122,6 @@ def get(N, K, T, w, s, x, out, **cfg):
     if key not in _cache:
         k = W4Gemv(N, K, T, **cfg)
         t0 = time.time(); args = wrap(w, s, x, out)
-        _cache[key] = (cute.compile(k, *args, cur()), args)
+        _cache[key] = cute.compile(k, *args, cur())
         print(f"  [compile N={N} K={K} T={T} {cfg}: {time.time()-t0:.1f}s]", flush=True)
-    return _cache[key][0]
+    return _cache[key]

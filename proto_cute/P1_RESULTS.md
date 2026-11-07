@@ -102,3 +102,23 @@ Decode rate from SSE timestamps (`p1_stream.py`, `p1_stream_mc.py`; chat prompts
 - Prefill profile (nsys, one 250-token request, 317 ms, GPU 96 % busy): cuBLAS GEMM 181 ms (~70 TFLOPs, the card's dense bf16 rate: it is compute bound), CuTe dequant 83 ms, torch copies 11 ms, everything else ~40 ms. Marlin does the same GEMMs without the 94 ms of dequant and copies (TTFT 208 ms). The overhead is a fixed ~95 ms per forward chunk, so it matters for short prompts and is ~5 % at 2k tokens. Removing it needs a fused dequant-GEMM (tensor-core, Marlin-style) kernel.
 - vLLM's hybrid prefix cache works on 1600-token blocks, so a 250-token system prompt never hits it, where the engine restores a prefix in 38 ms.
 - Decision rule (>= 85 % of the engine at one user, holding at four clients): decode part **met** (84-88 % on prose/chat, 77 % on the repeated-code prompt where the engine's lookup tail helps); the aggregate with prefill is **not** met (60 %).
+
+# P4: host-resident tables and the DFlash2 block drafter on stock vLLM 0.30.0
+
+New: `cute_host.py` (pinned host tables + a CuTe gather kernel reading rows over PCIe by UVA pointer, graph-capturable, bit-equal to indexing) used for the embedding and for the lm_head's exact-rescoring rows (`VLLM_CUTE_HOST=1`); the rescoring candidate count is 16 (the engine's greedy setting); GEMV for up to 32 rows in one weight pass (NT up to 4); `CuteDFlash2` (registry override for `DFlash2DraftModel`: vLLM builds the drafter's fused K/V weight stack inside `load_weights`, before a W4A16 layer has a bf16 `weight`, so the build is deferred until our kernel has produced a dequantised qkv copy). Drafter: the engine's W4A16 DFlash2 checkpoint (`~/llm-lab/models/dflash2-w4a16`, 1.28 GB), `{"method":"dflash","num_speculative_tokens":7}`, V2 model runner, Triton attention, bf16 KV, 4 sequences, 4096 max length, text-only.
+
+| | stock vLLM | plugin, MTP k=3 | plugin + host tables, MTP k=3 | **plugin + host tables + DFlash2 k=7** | engine (MTP default) |
+|---|---|---|---|---|---|
+| model weights in VRAM | 17.4 GiB | 17.4 + 1.2 | **12.8 GiB** | 14.3 GiB (incl. drafter) | |
+| KV pool | 1.5 GiB (3.6k tokens) | 1.5 GiB | **8.3 GiB (31k)** | 6.8 GiB (15k) | 262k tokens (4-bit KV) |
+| 1 stream, code, tok/s | 97.5 | 163.5 | 159.0 | **321.5** | 212.9 |
+| 1 stream, prose | 64.3 | 105.9 | 107.2 | 116.3 | 121.0 |
+| 1 stream, chat prompt | n/a | 156.0 | 156.8 | **269.3** | 186.0 |
+| 2 streams, per stream (aggregate over the span) | n/a | 142.4 (263) | 141.2 (258) | **180.0 (291)** | 159.9 (293) |
+| 4 streams, per stream (aggregate over the span) | n/a | 132.7 (220) | 113.4 (364) | 93.8 (321) | 120.2 (369) |
+| first token, 250-token prompt | 208 ms | 334 ms | 331 ms | 335 ms | 38-167 ms |
+
+- Moving the 4.7 GiB of bf16 tables to host memory costs nothing in decode speed and gives 5.6x the KV pool, which is what makes a drafter fit at all; the 4-stream aggregate over the whole span went from 220 to 364 tok/s (the larger pool lets four requests actually run together).
+- **DFlash2 on stock vLLM, with this plugin, beats the engine's MTP default at one stream by 1.5x (chat) / 1.5x (code)** and matches it at 2-4 streams; the engine's own DFlash2 mode is reported at 277 tok/s on code. DFlash2 gains nothing on prose (116 vs 107), as in the engine's measurements.
+- 4 streams x 8 verify rows = 32 rows per step: the 4-token-tile GEMV runs at 440-520 GB/s (`s13_nt4_test.py`), so the plugin is weight-bandwidth-inefficient exactly where the verify block is widest; this is the target of the `gv-nt2` campaign lineage.
+- Without the 32-row path the same run collapsed to 25 tok/s per stream at 4 clients (rows above 16 fell to the dequantise-and-GEMM path every step).

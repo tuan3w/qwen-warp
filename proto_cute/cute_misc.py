@@ -13,7 +13,7 @@ from vllm_mp_kernel import PRECOMPILE_T
 class Bf16Small:
     """out[T, N] = x[T, K] @ w[N, K]^T, bf16 in/out, fp32 accumulate; one 128-thread CTA per row."""
     def __init__(self, N, K, T):
-        assert K % 1024 == 0 and 1 <= T <= 16
+        assert K % 1024 == 0 and 1 <= T <= 32
         self.N, self.K, self.T = N, K, T
 
     @cute.jit
@@ -24,7 +24,7 @@ class Bf16Small:
     def kernel(self, mW: cute.Tensor, mX: cute.Tensor, mO: cute.Tensor):
         K, T = self.K, self.T
         tid, _, _ = cute.arch.thread_idx(); row, _, _ = cute.arch.block_idx()
-        smem = cutlass.utils.SmemAllocator(); red = smem.allocate_tensor(Float32, cute.make_layout((4, 16)))
+        smem = cutlass.utils.SmemAllocator(); red = smem.allocate_tensor(Float32, cute.make_layout((4, 32)))
         acc = cute.make_rmem_tensor((T,), Float32)
         for t in cutlass.range_constexpr(T): acc[t] = Float32(0.0)
         for i in cutlass.range_constexpr(K // 8 // 128):
