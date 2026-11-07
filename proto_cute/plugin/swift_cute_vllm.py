@@ -4,8 +4,16 @@ import os, sys
 from pathlib import Path
 
 def register():
-    if os.environ.get("VLLM_CUTE_W4", "0") not in ("1", "true"): return
+    on = lambda k: os.environ.get(k, "0") in ("1", "true")
+    if not (on("VLLM_CUTE_W4") or on("VLLM_CUTE_HEAD") or on("VLLM_CUTE_MISC")): return
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     sys.path.insert(0, "/media/fatman/data/workspace/qwen-warp/engine")
-    import vllm_mp_kernel
-    vllm_mp_kernel.register()
+    if on("VLLM_CUTE_W4"):
+        import vllm_mp_kernel
+        vllm_mp_kernel.register()
+    if on("VLLM_CUTE_MISC"):
+        import cute_misc
+        cute_misc.install()
+    if on("VLLM_CUTE_HEAD"):
+        import cute_head
+        cute_head.register()

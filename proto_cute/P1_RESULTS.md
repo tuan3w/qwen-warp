@@ -60,3 +60,22 @@ Conclusions that follow from the profile:
 | This engine | 213 (181 chat) | new engine wiring per model | keep as the fast tier until P2 says otherwise |
 
 Decision rule for P2: build the `lm_head` adapter (int4 head + exact rescoring, 64k draft vocabulary for MTP drafts, as an `lm_head` quant method / logits processor) and re-run `p1_stream.py` and the nsys breakdown. If vLLM + plugin reaches >= 85 % of the engine at one user, retire the custom engine loop and keep only the ops library. If it stays near 60-70 %, keep two tiers sharing one CuTe ops library: engine = fast path for the one tuned model, plugin = everything else.
+
+# P2: three CuTe adapters on stock vLLM 0.30.0 (single user, MTP k=3, text-only, bf16/fp8 KV as noted)
+
+Plugin env switches: `VLLM_CUTE_W4` (W4 linears), `VLLM_CUTE_HEAD` (`cute_head.py`: int4 lm_head + exact rescoring of the top-32, 68,864-token draft vocabulary for MTP drafts), `VLLM_CUTE_MISC` (`cute_misc.py`: MTP layer quantised to int4 at load, CuTe GEMV for small bf16 projections such as GDN `in_proj_ba`). Each run needs its own `VLLM_CACHE_ROOT`.
+
+| config | code tok/s | prose tok/s | code tokens/cycle | cycle (ms) |
+|---|---|---|---|---|
+| stock Marlin (FlashInfer, piecewise graphs) | 97.5 | 64.3 | 3.63-3.66 | 36.8 (nsys) |
+| + CuTe W4 linears | 99.2 | 69.0 | 3.66 | 36.0 (nsys) |
+| + int4 head (lm_head 11.5 -> 1.9 ms) | 150.8 | 85.0 | 4.00 | 27.5 (nsys) |
+| + MTP layer int4 + small GEMV (shape branch moved inside the op) | 153.6 | 89.7 | 3.96 | 26.6 (nsys), GPU 83 % busy |
+| + `--attention-backend TRITON_ATTN --kv-cache-dtype bfloat16` (full CUDA graphs with spec decode) | **159.8** | **101.2** | 3.58 | **22.4** (derived) |
+| this engine | 212.9 | 121.0 | n/a | ~19-21 (docs) |
+
+- vLLM + plugin reaches **75 % (code) and 84 % (prose)** of the engine at one user; per-cycle time is within 1-3 ms of the engine's. The code-prompt gap that is left is tokens per cycle (3.58 vs the engine's prompt-lookup tail), not kernels.
+- Default vLLM on this card picked an **fp8 KV cache** (FlashInfer's resolved dtype); Triton attention refuses fp8 on sm_86, so the last row runs bf16 KV (3.6k tokens of pool in this tiny-memory setup).
+- A Python branch on the row count inside a patched layer method is frozen at trace time by vLLM's AOT-compiled graph (no guards): all shape dispatch has to live inside the registered custom op (this hid the small-GEMV patch once).
+- Greedy outputs differ from stock after 45-790 characters on 4 of 6 chat prompts, at bf16 near-ties (`'` vs the typographic apostrophe, "Assumed Schema" vs "Approach"); both coherent. Not isolated between head and linears.
+- Open: first-token time is 2.1 s (rows > 32 use a Python dequant fallback); heads for > 8 rows fall back to the bf16 path; multi-client numbers are not valid yet; sampling above temperature 0 is truncated to 32 candidates.
