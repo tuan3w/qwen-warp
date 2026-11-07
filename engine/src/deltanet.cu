@@ -31,11 +31,13 @@
 
 namespace {
 constexpr int NV = 48, DV = 128, DK = 128, CONVD = 10240, KEYD = 2048, VALD = 6144, TMAX = 8;
+constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T <= TMAX rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX)
 constexpr int NT = 128;  // threads per block (4 warps)
 constexpr size_t STATE_SLOT = (size_t)NV * DV * DK;
 constexpr size_t CONV_SLOT = (size_t)CONVD * 3;
-constexpr size_t WS_CNT_BYTES = 256;
-constexpr size_t WS_BYTES = WS_CNT_BYTES + (size_t)TMAX * NV * DV * sizeof(float);
+constexpr size_t WS_CNT_BYTES = 4096;  // per-head arrival counters: [B <= RMAX sequences][48] u32
+static_assert(WS_CNT_BYTES >= (size_t)RMAX * NV * sizeof(unsigned), "counter region");
+constexpr size_t WS_BYTES = WS_CNT_BYTES + (size_t)RMAX * NV * DV * sizeof(float);
 // Lazy snapshot mode (engine only; MODE 1/2).  A spec step does not write its T per-row state snapshots; it appends the rank-1 updates of its rows to a delta buffer:
 //   S_t = ge_t * S_{t-1} + d_t (x) k_t,  stored per row as ge[48], k[16][128], d[48][128] (fp32, exactly the values the recurrence used), LROWS rows per layer.
 // Device scalar *pend = p | base << 8 | half << 12 (delta buffer half holding the pending rows): the state at ring slot `cur` is NOT materialised; it is ring slot `base` (a full state) with the first p rows of the delta buffer
@@ -54,11 +56,13 @@ struct Params {
   __nv_bfloat16* conv_state;
   const int* cur;
   int slots;
+  int sslots;        // physical state slots: ring slot i keeps its state in slot i % sslots (== slots: a full ring; 1: the lazy entry's in-place state, see deltanet.h)
   __nv_bfloat16* y;
   unsigned* cnt;
   float* o_ws;
   float* dbuf;       // this layer's delta buffer (MODE > 0)
   const int* pend;   // device scalar p | base << 8 | half << 12 (MODE > 0)
+  swiftmk_dn_ind ind;  // optional: the state / conv / delta-buffer base pointers are read from device memory (batched decode, one graph for any set of sequences)
 };
 
 __device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
@@ -83,8 +87,8 @@ struct ConvIn {
   uint2 wr;
 };
 template <int T>
-__device__ __forceinline__ void conv_load(const Params& p, int c, int cur, ConvIn<T>& in) {
-  const __nv_bfloat16* cs = p.conv_state + (size_t)cur * CONV_SLOT + (size_t)c * 3;
+__device__ __forceinline__ void conv_load(const Params& p, const __nv_bfloat16* conv, int c, int cur, ConvIn<T>& in) {
+  const __nv_bfloat16* cs = conv + (size_t)cur * CONV_SLOT + (size_t)c * 3;
 #pragma unroll
   for (int j = 0; j < 3; ++j) in.seq[j] = bf(cs[j]);
 #pragma unroll
@@ -92,7 +96,7 @@ __device__ __forceinline__ void conv_load(const Params& p, int c, int cur, ConvI
   in.wr = *reinterpret_cast<const uint2*>(p.conv_w + (size_t)c * 4);
 }
 template <int T>
-__device__ __forceinline__ void conv_finish(const Params& p, int c, int cur, bool write_state, const ConvIn<T>& in, float (&out)[T]) {
+__device__ __forceinline__ void conv_finish(const Params& p, __nv_bfloat16* conv, int c, int cur, bool write_state, const ConvIn<T>& in, float (&out)[T]) {
   const __nv_bfloat162 w01 = *reinterpret_cast<const __nv_bfloat162*>(&in.wr.x);
   const __nv_bfloat162 w23 = *reinterpret_cast<const __nv_bfloat162*>(&in.wr.y);
   const float w0 = __low2float(w01), w1 = __high2float(w01), w2 = __low2float(w23), w3 = __high2float(w23);
@@ -107,7 +111,7 @@ __device__ __forceinline__ void conv_finish(const Params& p, int c, int cur, boo
   if (write_state) {
 #pragma unroll
     for (int t = 0; t < T; ++t) {
-      __nv_bfloat16* dst = p.conv_state + (size_t)(ring_next(cur, 1 + t, p.slots)) * CONV_SLOT + (size_t)c * 3;
+      __nv_bfloat16* dst = conv + (size_t)(ring_next(cur, 1 + t, p.slots)) * CONV_SLOT + (size_t)c * 3;
 #pragma unroll
       for (int j = 0; j < 3; ++j) dst[j] = __float2bfloat16(in.seq[t + 1 + j]);
     }
@@ -159,8 +163,16 @@ __device__ __forceinline__ float group_sum(float v) {
   return v;
 }
 
-template <int T, int NS, int MODE>
-__global__ void __launch_bounds__(NT) dn_kernel(Params p) {
+// blockIdx.y = sequence i of a fused multi-sequence launch (swiftmk_deltanet_step_multi): pb.p[i] are its parameters (rows, scalars, pointers, counters and scratch, filled by the host).
+// Every sequence computes exactly what its own launch would.  NB = 1: the single-sequence launch (one parameter set: the kernel parameter block stays as small as before the fused
+// launch; a 16-set block made single-user decode 0.2% slower).
+template <int NB>
+struct ParamsN {
+  Params p[NB];
+};
+template <int T, int NS, int MODE, int NB>
+__global__ void __launch_bounds__(NT) dn_kernel(const __grid_constant__ ParamsN<NB> pb) {
+  const Params& p = pb.p[NB == 1 ? 0 : blockIdx.y];
   constexpr int VR = DV / NS;     // V rows per block
   constexpr int RPW = VR / 4;     // V rows per warp (4 warps) = float4 registers per lane
   constexpr int LPR = 32 / RPW;   // lanes per V row: lane = rowg * LPR + lk; lane lk holds float4 i * LPR + lk of K (i < RPW) of its row
@@ -177,6 +189,9 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
   __shared__ float pge[PR];
 
   const int cur = *p.cur;
+  float* const state = p.ind.state_pp ? *p.ind.state_pp + p.ind.state_off : p.state;
+  __nv_bfloat16* const conv = p.ind.conv_pp ? (__nv_bfloat16*)*p.ind.conv_pp + p.ind.conv_off : p.conv_state;
+  float* const dbuf = p.ind.dbuf_pp ? *p.ind.dbuf_pp + p.ind.dbuf_off : p.dbuf;
   int pc = 0, base = cur, row0 = 0, rh = 0, wh = 0;
   bool flush = false;
   if constexpr (MODE > 0) {
@@ -191,14 +206,14 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
 
   // 1. issue the state loads first (the long-latency part), rows [s*VR + warp*RPW, +RPW) of head h
   const size_t soff = ((size_t)h * DV + s * VR + warp * RPW + rowg) * DK + lk * 4;
-  const float* Sin = p.state + (size_t)base * STATE_SLOT + soff;
+  const float* Sin = state + (size_t)(base % p.sslots) * STATE_SLOT + soff;
   float4 st[RPW];
 
   // 1b. pending rank-1 updates of the previous step -> smem (cp.async: no registers, issued before anything can order behind it)
   if constexpr (MODE > 0) {
     constexpr int CPR = VR / 4;  // 16 B chunks per row of d
     static_assert(LROWS * CPR <= NT && LROWS <= NT, "pending-row staging layout");
-    const float* rb = p.dbuf + (size_t)rh * LROWS * DB_ROW;
+    const float* rb = dbuf + (size_t)rh * LROWS * DB_ROW;
 #pragma unroll
     for (int m = 0; m < LROWS * (DK / 4) / NT; ++m) {
       const int i = tid + m * NT, j = i / (DK / 4), c = i % (DK / 4);
@@ -223,14 +238,14 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
   float qv[T], kvv[T];
   const bool wr_qk = (h % 3 == 0) && (s == 0);
   ConvIn<T> inq, ink, inv;
-  conv_load<T>(p, kh * DK + tid, cur, inq);
-  conv_load<T>(p, KEYD + kh * DK + tid, cur, ink);
-  if (tid < VR) conv_load<T>(p, 2 * KEYD + h * DV + s * VR + tid, cur, inv);
-  conv_finish<T>(p, kh * DK + tid, cur, wr_qk, inq, qv);
-  conv_finish<T>(p, KEYD + kh * DK + tid, cur, wr_qk, ink, kvv);
+  conv_load<T>(p, conv, kh * DK + tid, cur, inq);
+  conv_load<T>(p, conv, KEYD + kh * DK + tid, cur, ink);
+  if (tid < VR) conv_load<T>(p, conv, 2 * KEYD + h * DV + s * VR + tid, cur, inv);
+  conv_finish<T>(p, conv, kh * DK + tid, cur, wr_qk, inq, qv);
+  conv_finish<T>(p, conv, KEYD + kh * DK + tid, cur, wr_qk, ink, kvv);
   if (tid < VR) {
     float vv[T];
-    conv_finish<T>(p, 2 * KEYD + h * DV + s * VR + tid, cur, true, inv, vv);
+    conv_finish<T>(p, conv, 2 * KEYD + h * DV + s * VR + tid, cur, true, inv, vv);
 #pragma unroll
     for (int t = 0; t < T; ++t) sv[t][tid] = vv[t];
   }
@@ -285,13 +300,13 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
         }
       }
       if (flush) {
-        float* Sc = p.state + (size_t)cur * STATE_SLOT + soff;
+        float* Sc = state + (size_t)(cur % p.sslots) * STATE_SLOT + soff;
 #pragma unroll
         for (int r = 0; r < RPW; ++r) DN_STORE(reinterpret_cast<float4*>(Sc + (size_t)r * (LPR * 4)), st[r]);
       }
     }
     if constexpr (MODE == 2) {
-      float* dw = p.dbuf + ((size_t)wh * LROWS + row0) * DB_ROW;
+      float* dw = dbuf + ((size_t)wh * LROWS + row0) * DB_ROW;
       if (wr_qk) {
 #pragma unroll
         for (int t = 0; t < T; ++t) dw[t * DB_ROW + DB_K + kh * DK + tid] = sk[t][tid];
@@ -324,7 +339,7 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
     }
     kvp = group_sum<LPR>(kvp);
     const float d = (sv[t][warp * RPW + rowg] - kvp) * beta;
-    float* Sout = p.state + (size_t)(ring_next(cur, 1 + t, p.slots)) * STATE_SLOT + soff;
+    float* Sout = state + (size_t)(ring_next(cur, 1 + t, p.slots) % p.sslots) * STATE_SLOT + soff;
     float op = 0.0f;
 #pragma unroll
     for (int r = 0; r < RPW; ++r) {
@@ -340,7 +355,7 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
       op = r == 0 ? a : op + a;
     }
     if constexpr (MODE == 2) {
-      if (lk == 0) p.dbuf[((size_t)wh * LROWS + row0 + t) * DB_ROW + DB_D + h * DV + s * VR + warp * RPW + rowg] = d;
+      if (lk == 0) dbuf[((size_t)wh * LROWS + row0 + t) * DB_ROW + DB_D + h * DV + s * VR + warp * RPW + rowg] = d;
     }
     o_acc[t] = group_sum<LPR>(op);
   }
@@ -386,21 +401,36 @@ __global__ void __launch_bounds__(NT) dn_kernel(Params p) {
   }
 }
 
-template <int T, int MODE = 0>
-cudaError_t launch_t(const Params& p, cudaStream_t s) {
+template <int T, int MODE, int NB>
+cudaError_t launch_t(const ParamsN<NB>& pb, cudaStream_t s, int B = 1) {
   constexpr int NS = MODE == 2 ? (T <= 2 ? 16 : T <= 4 ? DN_LZ_NS_MID : DN_LZ_NS_HI) : (T <= 2 ? DN_NS_SMALL_T : DN_NS_LARGE_T);
-  dn_kernel<T, NS, MODE><<<NV * NS, NT, 0, s>>>(p);
+  dn_kernel<T, NS, MODE, NB><<<dim3(NV * NS, B), NT, 0, s>>>(pb);
   return cudaGetLastError();
 }
+// the lazy (MODE 1 / 2) step of B sequences with NB parameter sets
+template <int NB>
+cudaError_t launch_lazy(const ParamsN<NB>& pb, int T, int B, cudaStream_t s) {
+  switch (T) {
+    case 1: return launch_t<1, 1>(pb, s, B);
+    case 2: return launch_t<2, 2>(pb, s, B);
+    case 3: return launch_t<3, 2>(pb, s, B);
+    case 4: return launch_t<4, 2>(pb, s, B);
+    case 5: return launch_t<5, 2>(pb, s, B);
+    case 6: return launch_t<6, 2>(pb, s, B);
+    case 7: return launch_t<7, 2>(pb, s, B);
+    case 8: return launch_t<8, 2>(pb, s, B);
+    default: return cudaErrorInvalidValue;
+  }
+}
 
-// materialise the pending rows of every layer into ring slot cur (state: [layers][slots][48][128][128], dbuf: [layers][DB_FLOATS])
-__global__ void dn_materialize_k(float4* __restrict__ state, const float* __restrict__ dbuf, const int* __restrict__ cur_p, const int* __restrict__ pend, int slots) {
+// materialise the pending rows of every layer into ring slot cur (state: [layers][sslots][48][128][128], dbuf: [layers][DB_FLOATS]; ring slot i lives in state slot i % sslots)
+__global__ void dn_materialize_k(float4* __restrict__ state, const float* __restrict__ dbuf, const int* __restrict__ cur_p, const int* __restrict__ pend, int sslots) {
   constexpr int SF4 = (int)(STATE_SLOT / 4);
   const int pv = *pend, pc = pv & 255;
   if (pc == 0) return;
-  const int li = blockIdx.y, cur = *cur_p, base = (pv >> 8) & 15;
-  const float4* in = state + ((size_t)li * slots + base) * SF4;
-  float4* out = state + ((size_t)li * slots + cur) * SF4;
+  const int li = blockIdx.y, cur = *cur_p % sslots, base = ((pv >> 8) & 15) % sslots;
+  const float4* in = state + ((size_t)li * sslots + base) * SF4;  // in == out when sslots == 1: every element is read and written by the same thread
+  float4* out = state + ((size_t)li * sslots + cur) * SF4;
   const float* rb = dbuf + (size_t)li * DB_FLOATS + (size_t)((pv >> 12) & 1) * LROWS * DB_ROW;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < SF4; i += gridDim.x * blockDim.x) {
     const int h = i / (DV * DK / 4), v = (i / (DK / 4)) % DV, k4i = i % (DK / 4);
@@ -424,20 +454,22 @@ extern "C" cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void*
                                              const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                              void* conv_state, const int* cur, int slots, void* y, void* ws, cudaStream_t stream) {
   if (slots <= T || slots > 16) return cudaErrorInvalidValue;
-  Params p;
+  Params p = {};
   p.qkv = (const __nv_bfloat16*)qkv; p.z = (const __nv_bfloat16*)z; p.a = (const __nv_bfloat16*)a; p.b = (const __nv_bfloat16*)b;
   p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;
-  p.norm_w = (const __nv_bfloat16*)norm_w; p.state = state; p.conv_state = (__nv_bfloat16*)conv_state; p.cur = cur; p.slots = slots;
+  p.norm_w = (const __nv_bfloat16*)norm_w; p.state = state; p.conv_state = (__nv_bfloat16*)conv_state; p.cur = cur; p.slots = slots; p.sslots = slots;
   p.y = (__nv_bfloat16*)y; p.cnt = (unsigned*)ws; p.o_ws = (float*)((char*)ws + WS_CNT_BYTES);
+  ParamsN<1> pb = {};
+  pb.p[0] = p;
   switch (T) {
-    case 1: return launch_t<1>(p, stream);
-    case 2: return launch_t<2>(p, stream);
-    case 3: return launch_t<3>(p, stream);
-    case 4: return launch_t<4>(p, stream);
-    case 5: return launch_t<5>(p, stream);
-    case 6: return launch_t<6>(p, stream);
-    case 7: return launch_t<7>(p, stream);
-    case 8: return launch_t<8>(p, stream);
+    case 1: return launch_t<1, 0>(pb, stream);
+    case 2: return launch_t<2, 0>(pb, stream);
+    case 3: return launch_t<3, 0>(pb, stream);
+    case 4: return launch_t<4, 0>(pb, stream);
+    case 5: return launch_t<5, 0>(pb, stream);
+    case 6: return launch_t<6, 0>(pb, stream);
+    case 7: return launch_t<7, 0>(pb, stream);
+    case 8: return launch_t<8, 0>(pb, stream);
     default: return cudaErrorInvalidValue;
   }
 }
@@ -451,27 +483,50 @@ extern "C" cudaError_t swiftmk_deltanet_step_lazy(int T, const void* qkv, const 
                                                   const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                                   void* conv_state, const int* cur, int slots, void* y, void* ws, float* dbuf, const int* pend,
                                                   cudaStream_t stream) {
-  if (slots <= T || slots > 16) return cudaErrorInvalidValue;
-  Params p;
-  p.qkv = (const __nv_bfloat16*)qkv; p.z = (const __nv_bfloat16*)z; p.a = (const __nv_bfloat16*)a; p.b = (const __nv_bfloat16*)b;
-  p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;
-  p.norm_w = (const __nv_bfloat16*)norm_w; p.state = state; p.conv_state = (__nv_bfloat16*)conv_state; p.cur = cur; p.slots = slots;
-  p.y = (__nv_bfloat16*)y; p.cnt = (unsigned*)ws; p.o_ws = (float*)((char*)ws + WS_CNT_BYTES);
-  p.dbuf = dbuf; p.pend = pend;
-  switch (T) {
-    case 1: return launch_t<1, 1>(p, stream);
-    case 2: return launch_t<2, 2>(p, stream);
-    case 3: return launch_t<3, 2>(p, stream);
-    case 4: return launch_t<4, 2>(p, stream);
-    case 5: return launch_t<5, 2>(p, stream);
-    case 6: return launch_t<6, 2>(p, stream);
-    case 7: return launch_t<7, 2>(p, stream);
-    case 8: return launch_t<8, 2>(p, stream);
-    default: return cudaErrorInvalidValue;
-  }
+  return swiftmk_deltanet_step_lazy2(T, qkv, z, a, b, conv_w, A_log, dt_bias, norm_w, state, conv_state, cur, slots, slots, y, ws, dbuf, pend, nullptr, stream);
 }
 
-// Write the pending state of every layer into ring slot cur and clear *pend (external readers / writers of the state ring: snapshot, prefill).
+extern "C" cudaError_t swiftmk_deltanet_step_lazy2(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
+                                                   const void* A_log, const void* dt_bias, const void* norm_w, float* state,
+                                                   void* conv_state, const int* cur, int slots, int sslots, void* y, void* ws, float* dbuf, const int* pend,
+                                                   const swiftmk_dn_ind* ind, cudaStream_t stream) {
+  return swiftmk_deltanet_step_multi(1, T, qkv, z, a, b, conv_w, A_log, dt_bias, norm_w, state, conv_state, cur, 0, slots, sslots, y, ws, dbuf, pend, ind, 0, stream);
+}
+
+extern "C" cudaError_t swiftmk_deltanet_step_multi(int B, int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
+                                                   const void* A_log, const void* dt_bias, const void* norm_w, float* state, void* conv_state, const int* cur,
+                                                   int seq_stride, int slots, int sslots, void* y, void* ws, float* dbuf, const int* pend,
+                                                   const swiftmk_dn_ind* ind, int pp_stride, cudaStream_t stream) {
+  if (slots <= T || slots > 16 || sslots < 1 || sslots > slots || B < 1 || T > TMAX || B * T > RMAX || (B > 1 && !ind)) return cudaErrorInvalidValue;
+  Params p = {};
+  p.qkv = (const __nv_bfloat16*)qkv; p.z = (const __nv_bfloat16*)z; p.a = (const __nv_bfloat16*)a; p.b = (const __nv_bfloat16*)b;
+  p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;
+  p.norm_w = (const __nv_bfloat16*)norm_w; p.state = state; p.conv_state = (__nv_bfloat16*)conv_state; p.cur = cur; p.slots = slots; p.sslots = sslots;
+  p.y = (__nv_bfloat16*)y; p.cnt = (unsigned*)ws; p.o_ws = (float*)((char*)ws + WS_CNT_BYTES);
+  p.dbuf = dbuf; p.pend = pend;
+  if (ind) p.ind = *ind;
+  if (B == 1) {
+    ParamsN<1> pb = {};
+    pb.p[0] = p;
+    return launch_lazy(pb, T, 1, stream);
+  }
+  ParamsN<RMAX> pb = {};
+  for (int i = 0; i < B; i++) {  // sequence i: rows i * T, scalars at i * seq_stride, pointer-table entries at i * pp_stride, its own counters and scratch rows
+    Params q = p;
+    const size_t r0 = (size_t)i * T;
+    q.qkv += r0 * CONVD; q.z += r0 * VALD; q.a += r0 * NV; q.b += r0 * NV; q.y += r0 * VALD;
+    q.cur += (size_t)i * seq_stride;
+    if (q.pend) q.pend += (size_t)i * seq_stride;
+    q.cnt += (size_t)i * NV; q.o_ws += r0 * NV * DV;
+    if (q.ind.state_pp) q.ind.state_pp += (size_t)i * pp_stride;
+    if (q.ind.conv_pp) q.ind.conv_pp += (size_t)i * pp_stride;
+    if (q.ind.dbuf_pp) q.ind.dbuf_pp += (size_t)i * pp_stride;
+    pb.p[i] = q;
+  }
+  return launch_lazy(pb, T, B, stream);
+}
+
+// Write the pending state of every layer into ring slot cur and clear *pend (external readers / writers of the state ring: snapshot, prefill).  slots = PHYSICAL state slots (sslots).
 extern "C" cudaError_t swiftmk_deltanet_materialize(float* state, const float* dbuf, int nlayers, const int* cur, int* pend, int slots, cudaStream_t stream) {
   dn_materialize_k<<<dim3(32, nlayers), 256, 0, stream>>>((float4*)state, dbuf, cur, pend, slots);
   dn_clear_pend_k<<<1, 1, 0, stream>>>(pend);

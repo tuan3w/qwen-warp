@@ -17,6 +17,8 @@
 //          Use swiftmk_attn_kv_bytes() for the per-layer allocation; a 16-layer cache is just 16 of these back to back.
 //   pos0   DEVICE int: absolute position of row 0 (= number of tokens already in the cache).  ctx_len = pos0 + T is derived on the device,
 //          so one captured CUDA graph serves every step (T is baked into the graph: capture one graph per T).
+//   rdelta DEVICE int or NULL: MRoPE offset of the sequence (engine_impl.h DS_RDELTA): the rope angle of row r uses position pos0 + r + *rdelta while the
+//          cache row is pos0 + r (after the last image of a prompt all three MRoPE axes are equal; 0 / NULL = plain rope at the KV position).
 //   out    [T][6144] bf16 = softmax(q.K^T/16) V * sigmoid(gate), heads concatenated (head h at columns 256h..256h+255).
 //   ws     device scratch of swiftmk_attn_ws_bytes() bytes; may be shared by layers that run sequentially on ONE stream.
 //          No initialisation needed (every kernel fully writes what the next one reads).
@@ -45,8 +47,15 @@ cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype
 
 // Returns cudaSuccess or the first launch error.  T must be 1..8.
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
-                              int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, void* out, void* ws,
+                              int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws,
                               cudaStream_t stream);
+// Fused multi-sequence step (batched decode): B sequences of T <= 8 rows each (B * T <= 16) in ONE launch per kernel, every sequence computing exactly what its own swiftmk_attn_step would.
+// Sequence i: rows i * T .. i * T + T - 1 of q_proj / k / v / out, layer cache (char*)kv_pp[i * pp_stride] + kv_off (device pointer table read at launch, so one captured graph
+// serves any set of sequences; required when B > 1, kv ignored when set), position pos0[i * pos_stride], rope offset rdelta[i * rd_stride] (rdelta may be NULL).  ws is shared:
+// each sequence uses its own slice of it.
+cudaError_t swiftmk_attn_step_multi(int B, int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, void* const* kv_pp,
+                                    size_t kv_off, int pp_stride, int ctx_max, int kv_fp8, float k_scale, float v_scale, const int* pos0, int pos_stride,
+                                    const int* rdelta, int rd_stride, void* out, void* ws, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

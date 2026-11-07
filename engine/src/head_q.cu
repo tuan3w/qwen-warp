@@ -101,14 +101,14 @@ constexpr int CAP = NCH_MAX * 64;  // survivor list capacity per row: every chun
 constexpr int FLAT_MAX = 512;  // k_extract: largest survivor set of a chunk ranked by counting
 constexpr int RMAX = SMK_HEADQ_RMAX;
 static_assert(RMAX <= 64, "CAP assumes R <= 64");
-constexpr int ROWS = 8;  // K11: T <= 8 rows (int4 head; the int8 CUDA-core kernel keeps T <= 4: its smem holds T x 20 KB of activations)
+constexpr int ROWS = 16;  // T <= 16 rows (int4 head: the W4 GEMV's two n8 tiles, batched cycles; the int8 CUDA-core kernel keeps T <= 4: its smem holds T x 20 KB of activations)
 
 struct WsLayout {  // byte offsets in ws
-  static constexpr size_t cnt = 0;                                    // int [16]: [0..7] survivor counters, [8..15] rescore done counters
-  static constexpr size_t cm = 64;                                    // uint32 [ROWS][NCH_MAX] ordered chunk maxima
-  static constexpr size_t cand = cm + ROWS * NCH_MAX * 4;             // int [4][RMAX]
-  static constexpr size_t exact = cand + ROWS * RMAX * 4;             // float [4][RMAX]
-  static constexpr size_t list = exact + ROWS * RMAX * 4;             // uint64 [4][CAP]
+  static constexpr size_t cnt = 0;                                    // int [2][ROWS]: [0..ROWS) survivor counters, [ROWS..2 ROWS) rescore done counters
+  static constexpr size_t cm = 2 * ROWS * 4;                          // uint32 [ROWS][NCH_MAX] ordered chunk maxima
+  static constexpr size_t cand = cm + ROWS * NCH_MAX * 4;             // int [ROWS][RMAX]
+  static constexpr size_t exact = cand + ROWS * RMAX * 4;             // float [ROWS][RMAX]
+  static constexpr size_t list = exact + ROWS * RMAX * 4;             // uint64 [ROWS][CAP]
   static constexpr size_t total = list + (size_t)ROWS * CAP * 8;
 };
 
@@ -345,7 +345,7 @@ cudaError_t smk_headq_select_rescore(float* logits, const void* w_bf16, const vo
     rank_init = true;
   }
   k_rank<<<T, 512, CAP * sizeof(uint64_t), st>>>(R, cnt, list, cand);
-  k_rescore<<<dim3((R + 3) / 4, T), 128, 0, st>>>((const uint4*)w_bf16, (const uint4*)x, N, R, logits, cand, exact, cnt + 8, out_tok, out_val);
+  k_rescore<<<dim3((R + 3) / 4, T), 128, 0, st>>>((const uint4*)w_bf16, (const uint4*)x, N, R, logits, cand, exact, cnt + ROWS, out_tok, out_val);
   return cudaGetLastError();
 }
 

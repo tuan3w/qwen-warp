@@ -96,6 +96,10 @@ def setup_engine_api(lib):
     lib.smk_engine_create_ex.restype = vp
     lib.smk_engine_tmax.argtypes = [vp]
     lib.smk_engine_tmax.restype = ci
+    lib.smk_engine_create_slot.argtypes = [C.POINTER(ModelW), ci, ci, ci, ci, vp]
+    lib.smk_engine_create_slot.restype = vp
+    lib.smk_engine_sslots.argtypes = [vp]
+    lib.smk_engine_sslots.restype = ci
     lib.smk_engine_destroy.argtypes = [vp]
     for n in ("smk_engine_reset", "smk_engine_decode", "smk_engine_set_tokens", "smk_engine_step", "smk_engine_step_nograph"):
         getattr(lib, n).restype = ci

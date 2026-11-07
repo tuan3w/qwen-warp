@@ -6,8 +6,13 @@ default ~/models/swift-1.5-int4); starts and stops its own servers, one after th
 
 For each configuration: start serve.py, wait for /health, send a short chat request, then a /v1/completions request with a prompt of (--max-model-len - 64) tokens and 64 generated tokens,
 and report the time to ready and the GPU memory in use afterwards.  --max-model-len defaults come from serve.py, so a default that no longer fits fails here.
-  no flags | --prompt-lookup 0 | --kv-cache-dtype fp8 | --profile long | --profile long --max-model-len 262144 --prompt-lookup 0 | bf16 KV at the longest length a 24 GB card takes
+  no flags | --prompt-lookup 0 | --kv-cache-dtype fp8 | --profile long | --profile long --max-model-len 262144 --prompt-lookup 0 | bf16 KV at the longest length a 24 GB card takes |
+  --vision host | --vision device --max-model-len 16384 | --vision off (the placement the start chose is checked; every start whose image input is on also serves a 1920x1080 image,
+  the ViT's activation peak, next to its full-length cache; the default --vision auto must leave every text configuration as it was)
   --drafter dflash2 --host-tables (default length, and the longest length that fits) when the drafter checkpoint is present; --drafter dflash2 without --host-tables, with --profile long and at 98,304 tokens must be refused
+  --profile multiuser | --max-num-seqs 6 --host-tables --vision device --kv-cache-dtype fp8 (went out of memory in a 12k-token prefill before the S-slot memory model was refitted) |
+  --max-num-seqs 8 --profile long --max-model-len 24576: with the length the server picks (or the given one), EVERY slot serves a prompt of about --max-model-len - 100 tokens at the
+  same time, each with its own 1920x1080 image when image input is on: the S-slot memory model's worst case
 Beyond the memory there must be a fast, actionable refusal: two configurations that need more than the card has must exit non-zero within 60 s (not hang, not die with a raw CUDA OOM
 after loading the weights) and the message must give the free memory and the largest --max-model-len per cache layout.
 A prompt of ~200k tokens takes 3 minutes to prefill: without --full the long profiles get a 32,768-token prompt (their KV cache is allocated up front and the request-time scratch does not
@@ -66,7 +71,8 @@ def launch(flags, port, log):
     return subprocess.Popen([sys.executable, str(SERVE), "--port", str(port)] + flags, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
 
 
-def serves(t, name, flags, limit, prompt_len, port):
+def serves(t, name, flags, limit, prompt_len, port, vision=None):
+    """vision: the image-input placement the start must choose ("device" | "host" | "off"), None = report it only."""
     import httpx
     import numpy as np
 
@@ -92,12 +98,100 @@ def serves(t, name, flags, limit, prompt_len, port):
                                                                           chat_template_kwargs=dict(enable_thinking=False)))
         ok = r.status_code == 200 and r.json()["choices"][0]["message"]["content"].strip() != ""
         t.check(f"{name}: short chat request", ok, f"HTTP {r.status_code}" + ("" if ok else r.text[:150]))
+        line = next((x for x in Path(log).read_text().splitlines() if "swift-mk image input" in x), "")
+        place = "device" if "on the device" in line else "host" if "on the host" in line else "off"
+        if vision is not None:
+            t.check(f"{name}: image input placement {vision}", place == vision, line[line.find("image input"):][:160])
+        if place != "off":  # the largest admitted image (1920x1080 -> 2,040 tokens, the ViT's activation peak) must serve next to the full-length KV cache
+            import base64
+            import io
+
+            from PIL import Image
+
+            b = io.BytesIO()
+            Image.new("RGB", (1920, 1080), (20, 40, 220)).save(b, format="PNG")
+            img = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()}}
+            r = httpx.post(base + "/v1/chat/completions", timeout=120, json=dict(model="swift", max_tokens=8, temperature=0, chat_template_kwargs=dict(enable_thinking=False),
+                                                                              messages=[{"role": "user", "content": [img, {"type": "text", "text": "What colour is this image? One word."}]}]))
+            a = r.json()["choices"][0]["message"]["content"] if r.status_code == 200 else r.text[:150]
+            t.check(f"{name}: 1920x1080 image request (ViT weights on the {place})", r.status_code == 200 and "blue" in a.lower(), f"{a!r}")
         ids = np.random.default_rng(1).integers(1000, 100000, size=prompt_len).tolist()
         t1 = time.time()
         r = httpx.post(base + "/v1/completions", timeout=900, json=dict(model="swift", prompt=ids, max_tokens=64, temperature=0, ignore_eos=True))
         n = r.json()["usage"]["completion_tokens"] if r.status_code == 200 else None
         t.check(f"{name}: {prompt_len:,}-token prompt (limit {limit:,}) + 64 tokens", n == 64 and srv.poll() is None, f"HTTP {r.status_code}" + ("" if n == 64 else r.text[:200]))
         print(f"      time to ready {ready:.1f} s, prefill+decode {time.time() - t1:.1f} s, GPU memory in use {smi_used()} MiB", flush=True)
+    finally:
+        stop(srv)
+
+
+def serves_slots(t, name, flags, port):
+    """--max-num-seqs S > 1: every slot serves a prompt of about --max-model-len - 100 tokens at once (with its own 1920x1080 image when image input is on): the S-slot model's worst case."""
+    import base64
+    import io
+    import random
+    import re
+    import threading
+
+    import httpx
+    from PIL import Image
+
+    log = f"/tmp/swift_mk_startup_{port}.log"
+    srv = launch(flags, port, log)
+    base = f"http://127.0.0.1:{port}"
+    t0 = time.time()
+    try:
+        while srv.poll() is None and time.time() - t0 < 240:
+            try:
+                if httpx.get(base + "/health", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.5)
+        else:
+            tail = "".join(Path(log).read_text().splitlines(True)[-4:]).strip()
+            t.check(f"{name}: starts", False, f"exit {srv.poll()} after {time.time() - t0:.1f} s: {tail[-300:]}")
+            return
+        txt = Path(log).read_text()
+        S = int(re.search(r"(\d+) sequence slots", txt).group(1))
+        L = httpx.get(base + "/v1/models").json()["data"][0]["max_model_len"]
+        images = "swift-mk image input on" in txt
+        t.check(f"{name}: starts", True, f"/health after {time.time() - t0:.1f} s, {S} slots x {L:,} tokens, image input {'on' if images else 'off'}")
+        words = "apple river stone light window garden paper music silver forest cloud engine market winter coffee mirror bridge ocean candle letter".split()
+
+        def body(i, n):
+            r = random.Random(i)
+            content = [{"type": "text", "text": f"Request {i}. " + " ".join(r.choice(words) for _ in range(n)) + "\nWhat colour is the image?"}]
+            if images:
+                b = io.BytesIO()
+                Image.new("RGB", (1920, 1080), ((37 * i) % 256, (91 * i + 40) % 256, (53 * i + 200) % 256)).save(b, format="PNG")
+                content.insert(0, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()}})
+            return dict(model="swift", max_tokens=32, temperature=0, ignore_eos=True, chat_template_kwargs=dict(enable_thinking=False), messages=[{"role": "user", "content": content}])
+
+        p0 = httpx.post(base + "/v1/chat/completions", json=body(100, 200) | {"max_tokens": 1}, timeout=300).json()["usage"]["prompt_tokens"]
+        p1 = httpx.post(base + "/v1/chat/completions", json=body(101, 1200) | {"max_tokens": 1}, timeout=300).json()["usage"]["prompt_tokens"]
+        rate, target = (p1 - p0) / 1000, L - 100
+        out = [None] * S
+
+        def one(i):  # a prompt over the limit gets a 400 naming its length before any prefill: shorten and resend
+            n = int(200 + (target - p0) / rate)
+            for _ in range(8):
+                r = httpx.post(base + "/v1/chat/completions", json=body(i, n), timeout=1800)
+                m = re.search(r"Input length \((\d+)\)|contains at least (\d+) input tokens", r.text) if r.status_code == 400 else None
+                if not m:
+                    out[i] = (r.status_code, r.json()["usage"]["prompt_tokens"] if r.status_code == 200 else r.text[:200])
+                    return
+                n -= int((int(m.group(1) or m.group(2)) + 32 - target) / rate) + 8
+
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(S)]
+        t1 = time.time()
+        for th in ts:
+            th.start()
+        for th in ts:
+            th.join()
+        ok = all(o is not None and o[0] == 200 and o[1] >= L - 400 for o in out) and srv.poll() is None
+        t.check(f"{name}: {S} prompts of ~{L - 100:,} tokens{' with a 1920x1080 image each' if images else ''} at once + 32 tokens each", ok, f"{out}")
+        print(f"      prefill+decode of all slots {time.time() - t1:.1f} s, GPU memory in use {smi_used()} MiB", flush=True)
     finally:
         stop(srv)
 
@@ -142,6 +236,14 @@ def main():
     serves(t, "--profile long", ["--profile", "long"], serve.LONG_MAX_MODEL_LEN, cap(serve.LONG_MAX_MODEL_LEN - 64), a.port)
     serves(t, "--profile long --max-model-len 262144 --prompt-lookup 0", ["--profile", "long", "--max-model-len", "262144", "--prompt-lookup", "0"], 262144, cap(262144 - 64), a.port)
     serves(t, f"bf16 --max-model-len {EDGE_BF16:,} --prompt-lookup 0", ["--max-model-len", str(EDGE_BF16), "--prompt-lookup", "0"], EDGE_BF16, EDGE_BF16 - 64, a.port)
+    # image input: --vision auto must not cost a text configuration anything (the starts above use it); demanded placements that fit start and serve the largest image
+    serves(t, "--vision host", ["--vision", "host"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port, vision="host")
+    serves(t, "--vision device --max-model-len 16384", ["--vision", "device", "--max-model-len", "16384"], 16384, 16384 - 64, a.port, vision="device")
+    serves(t, "--vision off", ["--vision", "off"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port, vision="off")
+    # --max-num-seqs > 1: every slot at its full length at once, with images where image input is on
+    serves_slots(t, "--profile multiuser", ["--profile", "multiuser"], a.port)
+    serves_slots(t, "--max-num-seqs 6 --host-tables --vision device --kv-cache-dtype fp8", ["--max-num-seqs", "6", "--host-tables", "--vision", "device", "--kv-cache-dtype", "fp8"], a.port)
+    serves_slots(t, "--max-num-seqs 8 --profile long --max-model-len 24576", ["--max-num-seqs", "8", "--profile", "long", "--max-model-len", "24576"], a.port)
     # --drafter dflash2 (experimental; needs the drafter checkpoint $DFLASH_W4): the drafter's K/V cache is 20 KiB per token on top of the engine, so it practically needs --host-tables
     if Path(os.environ.get("DFLASH_W4", os.path.expanduser("~/llm-lab/models/dflash2-w4a16"))).is_dir():
         serves(t, "--drafter dflash2 --host-tables", ["--drafter", "dflash2", "--host-tables"], serve.DEFAULT_MAX_MODEL_LEN_PLD, serve.DEFAULT_MAX_MODEL_LEN_PLD - 64, a.port)

@@ -26,6 +26,21 @@
 namespace {
 
 constexpr int HD = 256, NKV = 4, NH = 24, GRP = 6, QG_STRIDE = 12288, TMAX = 8;
+constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T <= TMAX rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX)
+// Optional KV-cache pointer indirection and the fused multi-sequence launch (swiftmk_attn_step_multi): blockIdx.z = sequence bz; with pp set its layer cache is pp[bz * pp_str] + off bytes,
+// read at launch (batched decode: one graph serves any set of sequences), else kv.  Sequence bz takes position pos0p[bz * pos_str], rope offset rdelta[bz * rd_str], rows
+// bz * T .. bz * T + T - 1 of q_proj / k / v / out and its own slices of the workspace (T <= TMAX, B * T <= RMAX rows in total); bz = 0 is the single-sequence launch.
+struct KvInd {
+  void* const* pp;
+  size_t off;
+  int pp_str, pos_str, rd_str;
+};
+template <class P>
+__device__ __forceinline__ P kv_res(P kv, KvInd ki) {
+  return ki.pp ? (P)((char*)ki.pp[(size_t)blockIdx.z * ki.pp_str] + ki.off) : kv;
+}
+// per-sequence workspace / activation offsets of the fused launch (elements)
+__device__ __forceinline__ size_t bz_rows(int T) { return (size_t)blockIdx.z * T; }
 constexpr int S_MAX = SWIFTMK_ATTN_MAX_SPLITS;
 #ifndef ATTN_CH_MIN
 #define ATTN_CH_MIN 128  // minimum keys per split
@@ -83,10 +98,10 @@ constexpr int CH_MIN = ATTN_CH_MIN;
 constexpr float LOG2E = 1.4426950408889634f;
 
 // ---- workspace layout (bytes)
-constexpr size_t WS_Q = 0;                                                  // u16 [TMAX][NH][HD]
-constexpr int NCOLS_MAX = GRP * TMAX;                                       // 6 q heads x T rows per kv head
-constexpr size_t WS_ML = WS_Q + (size_t)TMAX * NH * HD * 2;                // float2 [NKV][S_MAX][6T]
-constexpr size_t WS_PART = WS_ML + (size_t)NKV * S_MAX * NCOLS_MAX * sizeof(float2);  // float [NKV][S_MAX][6T][HD]
+constexpr size_t WS_Q = 0;                                                  // u16 [RMAX][NH][HD]
+constexpr int NCOLS_MAX = GRP * RMAX;                                       // 6 q heads x T rows per kv head, for every sequence of a fused launch
+constexpr size_t WS_ML = WS_Q + (size_t)RMAX * NH * HD * 2;                // float2 [B][NKV][S_MAX][6T]
+constexpr size_t WS_PART = WS_ML + (size_t)NKV * S_MAX * NCOLS_MAX * sizeof(float2);  // float [B][NKV][S_MAX][6T][HD]
 constexpr size_t WS_TOTAL = WS_PART + (size_t)NKV * S_MAX * NCOLS_MAX * HD * sizeof(float);
 
 // Live split geometry from the context length (identical in split and reduce).
@@ -143,18 +158,24 @@ __device__ __forceinline__ void prep_row_load(float (&x)[8], int h, int t, int p
   }
 }
 
+// rdelta (nullable): the sequence's MRoPE offset (engine_impl.h DS_RDELTA): row t is KV position *pos0p + t, its rope angle uses position *pos0p + t + *rdelta
+// (after the last image of a prompt the three MRoPE axes are equal, so this is plain 1-D rope at the shifted position; 0 for text-only prompts).
 template <bool FP8, bool I4>
 __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, const __nv_bfloat16* __restrict__ kk,
                                                         const __nv_bfloat16* __restrict__ vv, const __nv_bfloat16* __restrict__ q_norm,
                                                         const __nv_bfloat16* __restrict__ k_norm, void* kv, int ctx_max, float k_scale,
-                                                        float v_scale, const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf) {
+                                                        float v_scale, const int* __restrict__ pos0p, const int* __restrict__ rdelta, uint16_t* __restrict__ qbuf, KvInd ki) {
+  kv = kv_res(kv, ki);
+  q_proj += bz_rows(T) * QG_STRIDE; kk += bz_rows(T) * (NKV * HD); vv += bz_rows(T) * (NKV * HD); qbuf += bz_rows(T) * (NH * HD);
+  pos0p += blockIdx.z * ki.pos_str;
+  if (rdelta) rdelta += blockIdx.z * ki.rd_str;
   const int lane = threadIdx.x & 31;
   const int gw = blockIdx.x * 4 + (threadIdx.x >> 5);
   const int t = gw >> 5, h = gw & 31;
   if (t >= T) return;
   const int pos = *pos0p + t;
   float x[8];
-  prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+  prep_row_load(x, h, t, pos + (rdelta ? *rdelta : 0), lane, q_proj, kk, vv, q_norm, k_norm);
   if constexpr (I4) kvrot::wht256(x, lane);  // rotated int4 format (kvrot.cuh): q, k, v rows all live in the rotated basis, scores are unchanged
   if (h < NH) {
     uint16_t* dst = qbuf + ((size_t)t * NH + h) * HD;
@@ -189,16 +210,21 @@ __global__ void __launch_bounds__(128) attn_prep_kernel(int T, const __nv_bfloat
 // and warp i stores code row i.  Grid: T * 11 blocks of 256 threads; per token blocks 0..2 = q heads 8 b + w (one warp each), blocks 3..10 = the 8 (K | V, kv head) rows.
 __global__ void __launch_bounds__(256) attn_prep_i4_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, const __nv_bfloat16* __restrict__ kk, const __nv_bfloat16* __restrict__ vv,
                                                            const __nv_bfloat16* __restrict__ q_norm, const __nv_bfloat16* __restrict__ k_norm, void* kv, int ctx_max,
-                                                           const int* __restrict__ pos0p, uint16_t* __restrict__ qbuf) {
+                                                           const int* __restrict__ pos0p, const int* __restrict__ rdelta, uint16_t* __restrict__ qbuf, KvInd ki) {
+  kv = kv_res(kv, ki);
+  q_proj += bz_rows(T) * QG_STRIDE; kk += bz_rows(T) * (NKV * HD); vv += bz_rows(T) * (NKV * HD); qbuf += bz_rows(T) * (NH * HD);
+  pos0p += blockIdx.z * ki.pos_str;
+  if (rdelta) rdelta += blockIdx.z * ki.rd_str;
   static_assert(kvrot::NCAND == 8, "one scale candidate per warp");
   __shared__ float s_err[2][2][kvrot::NCAND];  // [chunk c][half h][candidate k]: squared error of the 16-lane group (2 c + h)
   const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int t = blockIdx.x / 11, b = blockIdx.x % 11;
   const int pos = *pos0p + t;
+  const int rpos = pos + (rdelta ? *rdelta : 0);  // rope position (see attn_prep_kernel)
   float x[8];
   if (b < 3) {
     const int h = b * 8 + w;
-    prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+    prep_row_load(x, h, t, rpos, lane, q_proj, kk, vv, q_norm, k_norm);
     kvrot::wht256(x, lane);
     uint16_t* dst = qbuf + ((size_t)t * NH + h) * HD;
 #pragma unroll
@@ -208,7 +234,7 @@ __global__ void __launch_bounds__(256) attn_prep_i4_kernel(int T, const __nv_bfl
   const int h = NH + (b - 3);
   const int isv = h >= NH + NKV;
   const int kvh = isv ? h - NH - NKV : h - NH;
-  prep_row_load(x, h, t, pos, lane, q_proj, kk, vv, q_norm, k_norm);
+  prep_row_load(x, h, t, rpos, lane, q_proj, kk, vv, q_norm, k_norm);
   kvrot::wht256(x, lane);
   uint8_t* kvb = reinterpret_cast<uint8_t*>(kv);
   if (w == 1) kvrot::sink_store(x, lane, reinterpret_cast<uint16_t*>(kvb + kvrot::ring_off(ctx_max)) + ((size_t)(isv * NKV + kvh) * kvrot::RING_R + (pos & (kvrot::RING_R - 1))) * HD);
@@ -327,7 +353,10 @@ __device__ __forceinline__ uint2 ld_kv8(const void* p) {  // int4: 8 bytes = 16 
 template <bool FP8, bool I4, int NT, int KS>
 __global__ void __launch_bounds__(32 * NT * KS, 1)
     attn_split_kernel(int T, const void* __restrict__ kv, int ctx_max, float k_scale, float v_scale, const int* __restrict__ pos0p,
-                      const uint16_t* __restrict__ qbuf, float2* __restrict__ ml, float* __restrict__ part) {
+                      const uint16_t* __restrict__ qbuf, float2* __restrict__ ml, float* __restrict__ part, KvInd ki) {
+  kv = kv_res(kv, ki);
+  qbuf += bz_rows(T) * (NH * HD); pos0p += blockIdx.z * ki.pos_str;
+  ml += bz_rows(T) * (NKV * S_MAX * GRP); part += bz_rows(T) * ((size_t)NKV * S_MAX * GRP * HD);
   constexpr int NW = NT * KS;
   constexpr int E = (FP8 || I4) ? 16 : 8;  // elements per 16-byte chunk
   constexpr int ROWB = I4 ? HD / 2 : (FP8 ? HD : HD * 2);  // bytes per token row: 128 (int4) / 256 (fp8) / 512 (bf16)
@@ -747,7 +776,10 @@ __global__ void __launch_bounds__(32 * NT * KS, 1)
 template <int NTG, int NG, int DS, int KS>
 __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
     attn_split_i4_kernel(int T, const void* __restrict__ kv, int ctx_max, const int* __restrict__ pos0p, const uint16_t* __restrict__ qbuf, float2* __restrict__ ml,
-                         float* __restrict__ part) {
+                         float* __restrict__ part, KvInd ki) {
+  kv = kv_res(kv, ki);
+  qbuf += bz_rows(T) * (NH * HD); pos0p += blockIdx.z * ki.pos_str;
+  ml += bz_rows(T) * (NKV * S_MAX * GRP); part += bz_rows(T) * ((size_t)NKV * S_MAX * GRP * HD);
   static_assert(DS == 2 || DS == 4, "d-split warps per team");
   static_assert(KS * NG <= 15, "named barriers: one per team");
   constexpr int NT = NTG;       // n-tiles per warp (the group's)
@@ -1173,7 +1205,10 @@ template <bool I4>
 __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bfloat16* __restrict__ q_proj, float vscale_eff,
                                                           const int* __restrict__ pos0p, const float2* __restrict__ ml,
                                                           const float* __restrict__ part, __nv_bfloat16* __restrict__ out,
-                                                          const void* __restrict__ kv, int ctx_max, const uint16_t* __restrict__ qbuf) {
+                                                          const void* __restrict__ kv, int ctx_max, const uint16_t* __restrict__ qbuf, KvInd ki) {
+  kv = kv_res(kv, ki);
+  q_proj += bz_rows(T) * QG_STRIDE; out += bz_rows(T) * (NH * HD); qbuf += bz_rows(T) * (NH * HD); pos0p += blockIdx.z * ki.pos_str;
+  ml += bz_rows(T) * (NKV * S_MAX * GRP); part += bz_rows(T) * ((size_t)NKV * S_MAX * GRP * HD);
   static_assert(S_MAX <= 64, "reduce kernel keeps two split weights per lane");
   __shared__ float wn[64];
   __shared__ float4 red[3][64];
@@ -1260,7 +1295,7 @@ __global__ void __launch_bounds__(256) attn_reduce_kernel(int T, const __nv_bflo
 }
 
 template <bool FP8, bool I4, int NT, int KS>
-cudaError_t launch_split(int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part,
+cudaError_t launch_split(int B, int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, KvInd ki,
                          cudaStream_t st) {
   constexpr int NW = NT * KS;
   const size_t smem = (size_t)NW * 8 * HD * sizeof(float) + (size_t)NW * 16 * sizeof(float);
@@ -1270,12 +1305,12 @@ cudaError_t launch_split(int T, const void* kv, int ctx_max, float k_scale, floa
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
-  attn_split_kernel<FP8, I4, NT, KS><<<dim3(S_MAX, NKV), NW * 32, smem, st>>>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part);
+  attn_split_kernel<FP8, I4, NT, KS><<<dim3(S_MAX, NKV, B), NW * 32, smem, st>>>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki);
   return cudaGetLastError();
 }
 
 template <int NTG, int NG, int DS, int KS>
-cudaError_t launch_split_i4(int T, const void* kv, int ctx_max, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, cudaStream_t st) {
+cudaError_t launch_split_i4(int B, int T, const void* kv, int ctx_max, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, KvInd ki, cudaStream_t st) {
   constexpr int NTT = NTG * NG;
   constexpr size_t merge_b = ((size_t)KS * NTT * 8 * 128 + (size_t)KS * NTT * 16) * sizeof(float);  // one d chunk of every team's partials + (m, l)
   constexpr size_t loop_b = ((size_t)NTT * 16 * 64 + (size_t)KS * NG * 2 * DS * NTG * 4 * 32) * sizeof(float);  // Q fragments + score exchange
@@ -1286,49 +1321,49 @@ cudaError_t launch_split_i4(int T, const void* kv, int ctx_max, const int* pos0,
     if (e != cudaSuccess) return e;
     attr_set = true;
   }
-  attn_split_i4_kernel<NTG, NG, DS, KS><<<dim3(S_MAX, NKV), 32 * DS * KS * NG, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part);
+  attn_split_i4_kernel<NTG, NG, DS, KS><<<dim3(S_MAX, NKV, B), 32 * DS * KS * NG, smem, st>>>(T, kv, ctx_max, pos0, qbuf, ml, part, ki);
   return cudaGetLastError();
 }
 // int4: the d-split kernel with n-tile groups of NTG tiles (NG = 0: the single-warp kernel with NT n-tiles and KSO key-parallel warps per n-tile); everything else: the single-warp kernel
 template <bool FP8, bool I4, int NT, int KSO, int NTG, int NG, int DSV, int KSV>
-cudaError_t launch_multi(int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part,
+cudaError_t launch_multi(int B, int T, const void* kv, int ctx_max, float k_scale, float v_scale, const int* pos0, const uint16_t* qbuf, float2* ml, float* part, KvInd ki,
                          cudaStream_t st) {
   if constexpr (I4 && NG > 0) {
     static_assert(NTG * NG >= NT, "n-tile groups must cover ceil(6 T / 8) n-tiles");
-    return launch_split_i4<NTG, NG, DSV, KSV>(T, kv, ctx_max, pos0, qbuf, ml, part, st);
-  } else return launch_split<FP8, I4, NT, KSO>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st);
+    return launch_split_i4<NTG, NG, DSV, KSV>(B, T, kv, ctx_max, pos0, qbuf, ml, part, ki, st);
+  } else return launch_split<FP8, I4, NT, KSO>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st);
 }
 
 template <bool FP8, bool I4>
-cudaError_t run(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, int ctx_max,
-                float k_scale, float v_scale, const int* pos0, void* out, void* ws, cudaStream_t st) {
+cudaError_t run(int B, int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, int ctx_max,
+                float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws, KvInd ki, cudaStream_t st) {
   char* w = reinterpret_cast<char*>(ws);
   uint16_t* qbuf = reinterpret_cast<uint16_t*>(w + WS_Q);
   float2* ml = reinterpret_cast<float2*>(w + WS_ML);
   float* part = reinterpret_cast<float*>(w + WS_PART);
   if constexpr (I4) {
-    attn_prep_i4_kernel<<<T * 11, 256, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, (const __nv_bfloat16*)q_norm,
-                                                (const __nv_bfloat16*)k_norm, kv, ctx_max, pos0, qbuf);
+    attn_prep_i4_kernel<<<dim3(T * 11, 1, B), 256, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, (const __nv_bfloat16*)q_norm,
+                                                (const __nv_bfloat16*)k_norm, kv, ctx_max, pos0, rdelta, qbuf, ki);
   } else {
-    attn_prep_kernel<FP8, I4><<<T * 8, 128, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
+    attn_prep_kernel<FP8, I4><<<dim3(T * 8, 1, B), 128, 0, st>>>(T, (const __nv_bfloat16*)q_proj, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
                                                      (const __nv_bfloat16*)q_norm, (const __nv_bfloat16*)k_norm, kv, ctx_max, k_scale, v_scale,
-                                                     pos0, qbuf);
+                                                     pos0, rdelta, qbuf, ki);
   }
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return e;
   switch (T) {
-    case 1: e = launch_multi<FP8, I4, 1, ATTN_KS1, ATTN_VC1>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 2: e = launch_multi<FP8, I4, 2, ATTN_KS2, ATTN_VC2>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 3: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC3>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 4: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC4>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 5: e = launch_multi<FP8, I4, 4, ATTN_KS5, ATTN_VC5>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VC6>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    case 7: e = launch_multi<FP8, I4, 6, ATTN_KS7, ATTN_VC7>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
-    default: e = launch_multi<FP8, I4, 6, ATTN_KS8, ATTN_VC8>(T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, st); break;
+    case 1: e = launch_multi<FP8, I4, 1, ATTN_KS1, ATTN_VC1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 2: e = launch_multi<FP8, I4, 2, ATTN_KS2, ATTN_VC2>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 3: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC3>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 4: e = launch_multi<FP8, I4, 3, ATTN_KS3, ATTN_VC4>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 5: e = launch_multi<FP8, I4, 4, ATTN_KS5, ATTN_VC5>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VC6>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 7: e = launch_multi<FP8, I4, 6, ATTN_KS7, ATTN_VC7>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    default: e = launch_multi<FP8, I4, 6, ATTN_KS8, ATTN_VC8>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
   }
   if (e != cudaSuccess) return e;
-  attn_reduce_kernel<I4><<<dim3(GRP * T, NKV), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,
-                                                         (__nv_bfloat16*)out, kv, ctx_max, qbuf);
+  attn_reduce_kernel<I4><<<dim3(GRP * T, NKV, B), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,
+                                                         (__nv_bfloat16*)out, kv, ctx_max, qbuf, ki);
   return cudaGetLastError();
 }
 
@@ -1384,12 +1419,19 @@ cudaError_t swiftmk_attn_kv_range_copy(void* layer_kv, int ctx_max, int kv_dtype
 }
 
 cudaError_t swiftmk_attn_step(int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv,
-                              int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, void* out, void* ws,
+                              int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, const int* rdelta, void* out, void* ws,
                               cudaStream_t stream) {
-  if (T < 1 || T > TMAX) return cudaErrorInvalidValue;
-  if (kv_dtype == 1) return run<true, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, stream);
-  if (kv_dtype == 2) return run<false, true>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, stream);
-  return run<false, false>(T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, out, ws, stream);
+  return swiftmk_attn_step_multi(1, T, q_proj, k, v, q_norm, k_norm, kv, nullptr, 0, 0, ctx_max, kv_dtype, k_scale, v_scale, pos0, 0, rdelta, 0, out, ws, stream);
+}
+
+cudaError_t swiftmk_attn_step_multi(int B, int T, const void* q_proj, const void* k, const void* v, const void* q_norm, const void* k_norm, void* kv, void* const* kv_pp,
+                                    size_t kv_off, int pp_stride, int ctx_max, int kv_dtype, float k_scale, float v_scale, const int* pos0, int pos_stride,
+                                    const int* rdelta, int rd_stride, void* out, void* ws, cudaStream_t stream) {
+  if (T < 1 || B < 1 || T > TMAX || B * T > RMAX || (B > 1 && !kv_pp)) return cudaErrorInvalidValue;
+  const KvInd ki = {kv_pp, kv_off, pp_stride, pos_stride, rd_stride};
+  if (kv_dtype == 1) return run<true, false>(B, T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
+  if (kv_dtype == 2) return run<false, true>(B, T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
+  return run<false, false>(B, T, q_proj, k, v, q_norm, k_norm, kv, ctx_max, k_scale, v_scale, pos0, rdelta, out, ws, ki, stream);
 }
 
 }  // extern "C"

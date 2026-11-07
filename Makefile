@@ -30,3 +30,11 @@ test:
 	uv run tests/test_lineage_cache.py
 	uv run tests/test_server_seed.py
 	uv run tests/test_startup_configs.py
+	uv run tests/test_vision_logic.py
+	uv run tests/test_vision.py
+	uv run tests/test_vision_engine.py
+	uv run tests/test_vision_server.py
+	uv run tests/test_batch_sched.py
+	uv run tests/test_batch_engine.py
+	uv run tests/test_batch_vision_engine.py
+	uv run tests/test_server_batch.py

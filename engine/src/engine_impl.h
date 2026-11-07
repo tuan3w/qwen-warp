@@ -13,8 +13,9 @@
 #include "proc.h"
 
 namespace smk {
-constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX;
-constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_PEND = 19, DS_N = 20;  // DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | delta-buffer parity << 8 (deltanet.h)
+constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX, TR = SMK_RMAX;
+constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_PEND = 19, DS_RDELTA = 20, DS_N = 21;  // DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | delta-buffer parity << 8 (deltanet.h);
+// DS_RDELTA: MRoPE rope offset of the sequence (rope position = KV position + delta; set per request by the host, 0 for text-only prompts; include/attn.h)
 constexpr int DBG_SLOTS = NLAYER + 2;  // 0 embed, 1..64 layer outputs, 65 final norm out
 constexpr int NHEAD_MODES = 3;         // head 0: none, 1: final norm + lm_head + argmax, 2: final norm only (MTP prefill chunks)
 constexpr int NHEAD_VARIANTS = 3;      // head 1 graphs: 0 BF16 head, 1 quantised head + rescore R=16 (greedy), 2 quantised head + rescore R=64 (sampling: top_k <= 64)
@@ -36,6 +37,8 @@ struct smk_engine {
   smk_model_w w;
   int ctx_max = 0, kv_dtype = 0;  // 0=bf16 1=fp8 2=int4
   int tmax = 4, slots = 5;  // K11: largest step (rows) and DeltaNet ring slots = tmax + 1
+  int sslots = 5;           // physical DeltaNet state slots (ring slot i -> state slot i % sslots; deltanet.h swiftmk_deltanet_step_lazy2): slots, or 1 for a batched-decode sequence slot
+  smk_engine* share = nullptr;  // batched decode: the engine whose activations, workspaces and logits this one uses (same stream, never concurrently); nullptr = owns them
   size_t bytes = 0;
   bool failed = false;
   std::vector<void*> allocs;
@@ -59,12 +62,24 @@ struct smk_engine {
   smk::ProcBufs pb = {};  // request-level logit processors (proc.h)
   int* pinned = nullptr;
   int dn_idx[smk::NLAYER], at_idx[smk::NLAYER];
+  std::vector<std::pair<char*, size_t>> canaries;  // SMK_DEBUG=1: (allocation, payload bytes) whose SMK_CANARY_BYTES tail must keep the 0xA5 pattern (smk_engine_canary_check)
 };
+
+constexpr size_t SMK_CANARY_BYTES = 4096;
+static inline bool smk_debug() {
+  static const int on = [] { const char* v = getenv("SMK_DEBUG"); return v && *v && *v != '0'; }();
+  return on;
+}
 
 static inline void* dalloc(smk_engine* e, size_t n, bool zero = false) {
   void* p = nullptr;
-  if (cudaMalloc(&p, n) != cudaSuccess) { fprintf(stderr, "smk_engine: cudaMalloc(%zu) failed\n", n); e->failed = true; return nullptr; }
+  const size_t extra = smk_debug() ? SMK_CANARY_BYTES : 0;  // memory guard (tests): a canary tail after every device buffer of the engine
+  if (cudaMalloc(&p, n + extra) != cudaSuccess) { fprintf(stderr, "smk_engine: cudaMalloc(%zu) failed\n", n); e->failed = true; return nullptr; }
   if (zero) cudaMemset(p, 0, n);
+  if (extra) {
+    cudaMemset((char*)p + n, 0xA5, extra);
+    e->canaries.push_back({(char*)p, n});
+  }
   e->allocs.push_back(p);
   e->bytes += n;
   return p;

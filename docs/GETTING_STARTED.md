@@ -104,8 +104,20 @@ For a deeper check, `make test` (native path, needs an RTX 3090 and the weights;
 | `tests/test_prefill_plan.py` | the prefill segmentation depends on the prompt only, and a resume continues the cold plan | nothing (a few seconds) |
 | `tests/test_server_seed.py` | a seeded request gives the same tokens whatever the cache state; the `top_k` rules (65 and above is HTTP 400) | GPU, weights (starts a server) |
 | `tests/test_startup_configs.py` | every documented start (no flags, `--prompt-lookup 0`, fp8, `--profile long`, 262,144 with and without the tail, bf16 at 32,768) starts and serves a prompt of its full length, and two configurations that do not fit are refused within 60 s with the free memory and the lengths that fit (the longest test, about 4 minutes on its own) | GPU, weights (starts servers) |
+| `tests/test_vision_logic.py` | image input logic: the prefix-cache key with images, request parsing and rejections (video, `--vision off`, oversize, bad placeholders), the start-up `--vision` memory decisions; when `--vision auto` turns image input off, the 400 an image gets before streaming and the settings it names (each checked to turn image input on) | nothing (5 s) |
+| `tests/test_vision.py` | MRoPE positions == vLLM's on 27 prompts (`--no-gpu`: nothing else); the ViT against cached transformers references (fp32 per-token cosine >= 0.99999), bf16 determinism, host-streamed == device weights | GPU, weights |
+| `tests/test_vision_engine.py` | text ids == 0.7.0's exactly (`tests/data/text_ids_v070.json`: greedy, seeded sampling, a resumed turn), before and after image requests; an image request cold == resumed; another image shares nothing past it | GPU, weights (about 20 s) |
+| `tests/test_vision_server.py` | one server: colours, shapes and printed text at 448x448 to 1920x1080, 2 to 4 images in order, a 5th image and video -> 400, no false cache hit, multi-turn `cached_tokens`, text ids == 0.7.0 (`tests/data/server_text_ids_v070.json`); then a `--vision off` server | GPU, weights (starts servers, about 4 minutes) |
+| `tests/test_batch_sched.py` | the continuous-batching scheduler (`--max-num-seqs` > 1) on a deterministic fake engine: admission, prefill interleaving, aborts, prefix-cache resumes, every stream == its replay alone (24 seeds x 40 requests) | nothing (2 s) |
+| `tests/test_batch_engine.py` | row-count invariance of the row-wise kernels; batched decode of B = 1..8 sequences at every draft depth (greedy, seeded sampling, processors) and a 48-request continuous-batching fuzz == each request decoded alone, token for token; memory canaries | GPU, weights (about 20 s) |
+| `tests/test_batch_vision_engine.py` | batches mixing image and text sequences at every B x depth, an image follow-up resumed from the host store and one from the device in one batch, a fuzz of image and text requests == each alone; text ids of a 4-slot runner == 0.7.0 (`tests/data/text_ids_v070.json`) in the default and the exact mode | GPU, weights (about 40 s) |
+| `tests/test_server_batch.py` | one `--max-num-seqs 4` server in the exact mode (`SMK_BATCH_K=1`): concurrent text, image and seeded requests == each alone, processors next to plain requests, a disconnect, joins and leaves, streaming during a long prefill, follow-up turns (text, image from the slot and from the host store) == cold, text ids == 0.7.0; then a server whose `--vision auto` finds no room for the ViT (warning, 400 before streaming) | GPU, weights (starts two servers, about 2 minutes) |
 
-Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py` and `uv run tests/test_prefill_plan.py`.
+Fast checks by tier: `tests/run_tier.sh 0|1|2` runs every test whose docstring has a line `Tier: <n> [arguments]`. Tier 0 needs no GPU (about 10 s), tier 1 is engine level (under 2 minutes),
+tier 2 starts one server per configuration (under 4 minutes). `PY=<python>` picks the interpreter, `GPU_WRAP=<command>` prefixes the GPU runs; tier-1 engines are built by
+`tests/_engine.py` (`SMK_RESIDENT=1` attaches weights kept resident by a holder process, for development).
+
+Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schema.py`, `uv run tests/test_prefill_plan.py` and `tests/run_tier.sh 0`.
 
 ## Troubleshooting
 

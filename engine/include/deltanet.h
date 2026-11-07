@@ -48,7 +48,30 @@ cudaError_t swiftmk_deltanet_step_lazy(int T, const void* qkv, const void* z, co
                                        const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                        void* conv_state, const int* cur, int slots, void* y, void* ws, float* dbuf, const int* pend,
                                        cudaStream_t stream);
-// state = [nlayers][slots][48][128][128] fp32, dbuf = [nlayers][swiftmk_deltanet_dbuf_floats()]
+// Lazy entry with fewer physical state slots and optional pointer indirection (batched decode).
+//   sslots (1..slots): ring slot i keeps its fp32 state in state slot i % sslots; the conv ring keeps `slots` slots.  The lazy entry never needs two states of a ring at once (a
+//   T >= 2 step writes no row state, a flush writes the replayed state of slot base to slot cur, a T == 1 step writes slot cur+1 from slot base + pending rows, and every one of these
+//   writes is an in-place update by the thread that read the element), so sslots = 1 is exact and saves (slots - 1) x 151 MiB per sequence.  swiftmk_deltanet_step_lazy = sslots == slots.
+//   ind (optional, may be NULL): the state / conv / delta-buffer base pointers are *ind.x_pp + ind.x_off (device memory read at launch) instead of state / conv_state / dbuf, so one
+//   captured graph serves any sequence whose pointers the caller writes there before the launch.
+typedef struct swiftmk_dn_ind {
+  float* const* state_pp;
+  void* const* conv_pp;  // bf16 elements
+  float* const* dbuf_pp;
+  size_t state_off, conv_off, dbuf_off;  // in elements of the pointee type
+} swiftmk_dn_ind;
+cudaError_t swiftmk_deltanet_step_lazy2(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
+                                        const void* A_log, const void* dt_bias, const void* norm_w, float* state,
+                                        void* conv_state, const int* cur, int slots, int sslots, void* y, void* ws, float* dbuf, const int* pend,
+                                        const swiftmk_dn_ind* ind, cudaStream_t stream);
+// Fused multi-sequence lazy step (batched decode): B sequences of T <= 8 rows each (B * T <= 16) in ONE launch, every sequence computing exactly what its own lazy2 step would.
+// Sequence i: rows i * T .. i * T + T - 1 of qkv / z / a / b / y, ring scalars cur[i * seq_stride] / pend[i * seq_stride], base pointers ind->x_pp[i * pp_stride] (+ x_off;
+// required when B > 1).  ws is shared (each sequence uses its own counters and scratch rows).
+cudaError_t swiftmk_deltanet_step_multi(int B, int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
+                                        const void* A_log, const void* dt_bias, const void* norm_w, float* state, void* conv_state, const int* cur,
+                                        int seq_stride, int slots, int sslots, void* y, void* ws, float* dbuf, const int* pend,
+                                        const swiftmk_dn_ind* ind, int pp_stride, cudaStream_t stream);
+// state = [nlayers][sslots][48][128][128] fp32 (slots = the PHYSICAL state slots, ring slot cur -> cur % slots), dbuf = [nlayers][swiftmk_deltanet_dbuf_floats()]
 cudaError_t swiftmk_deltanet_materialize(float* state, const float* dbuf, int nlayers, const int* cur, int* pend, int slots, cudaStream_t stream);
 
 #ifdef __cplusplus

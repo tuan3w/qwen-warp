@@ -210,6 +210,43 @@ Set `SWIFT_MODEL` (or pass `--model`) when the weights are not in `~/models/swif
 **vLLM version.** The environment pins `vllm==0.30.0` (`pyproject.toml`, `uv.lock`). The engine-core client (`server/smk_core_client.py`) and the tool-schema hook (`server/tool_schema.py`, which wraps
 `vllm.renderers.hf.safe_apply_chat_template`) use vLLM internals of that version; other versions are untested (a newer one, 0.33.0, exists). Install from the lock file rather than upgrading vLLM by hand.
 
+## Concurrent requests (`--max-num-seqs`)
+
+`--max-num-seqs 1` (the default) decodes one request at a time and queues the rest, exactly as before. `--max-num-seqs S` with S = 2..8 gives the engine S sequence slots on one set of
+weights and decodes the running requests together: every cycle reads the weights once for the rows of all of them, up to 16 rows ([Architecture](ARCHITECTURE.md#batched-decode---max-num-seqs)).
+
+For several users at once (chat clients, agents running in parallel, image and text mixed), use the measured configuration:
+
+```bash
+python server/serve.py --profile multiuser --port 8000     # = --max-num-seqs 5 --host-tables --vision device, bf16 KV
+```
+
+It picks the longest `--max-model-len` per sequence that the free memory holds (14,336 tokens with 23.2 GB free, at most 28,672); pass `--max-model-len` (or `--max-num-seqs`,
+`--vision`) to override. Measured on 6 closed-loop clients sending text and image requests: 1.36x the aggregate tok/s of the one-at-a-time server ([Performance](PERFORMANCE.md#7-concurrent-requests---max-num-seqs)).
+
+| Running requests | How a cycle decodes them |
+|---|---|
+| 1 | the single-sequence path: MTP k = 3 + the prompt-lookup tail (the speed of `--max-num-seqs 1`) |
+| 2 | batched, 3 drafts each (8 rows) |
+| 3, 4 | batched, 3 drafts each (12 / 16 rows) |
+| 5 | batched, 2 drafts each (15 rows) |
+| 6 to 8 | 5 of them per sync group, round robin (least recently decoded first), 2 drafts each: the extra slots let a new request prefill and stream its first token without queueing |
+
+- More requests than slots queue FIFO. A new request is prefilled while the others keep streaming: every ~2,048 tokens of prefill work the running requests get one sync group (`--stream-cycles`), so a long prompt pauses them for about 1 s at a time instead of for its whole prefill.
+- Every request keeps its own sampling parameters, seed, logit processors, stops, `max_tokens` and abort; prefix reuse (`cached_tokens`, the host prefix cache) works per slot: a request goes to the free slot whose conversation it continues, else the least recently used free slot, whose conversation is spilled to the host cache first.
+- Outputs: in the default mode a greedy request's ids can differ between batch sizes at a bf16 near-tie. A request's tokens are the same whether other requests run next to it as long as its draft depth stays the same, but the scheduler changes the depth with the number of running requests (table above), and the DeltaNet kernel sums in another order at another verify width, so a token whose two best logits are almost equal can flip (as with `--num-speculative-tokens`). Measured on 20 prompts x 512 tokens, the native path against batched cycles of 0, 1 and 3 drafts: 20 of 60 answers diverged, always where the top-2 gap of the exact logits was 0.011 to 0.14 (the median gap over all positions is 6.6; the reduction-order noise of that gap between the two runs has a median of 0.028 and a p99 of 0.17); seeded sampling draws other tokens at another depth. The exact mode `SMK_BATCH_K=k` (tests) fixes the depth at every batch size and removes this: a request's ids are then exactly those it gets alone.
+- `--drafter dflash2` needs `--max-num-seqs 1`.
+- Memory: every slot has its own KV cache at `--max-model-len` (368 MiB + 68 / 36 / 20.5 KiB per token with bf16 / fp8 / int4 KV, on top of 20.2 GiB, or 15.4 GiB with `--host-tables`, which include 280 MiB of prefill / decode working memory measured with every slot serving a full-length prompt with a 1920x1080 image at once). Without `--max-model-len` the server picks the longest length per sequence that fits next to image input (the ViT with its weights in host memory, or on the GPU with `--vision device`; with `--vision off` the lengths are 1,024 to 4,096 tokens longer); a configuration that does not fit is refused with the largest `--max-num-seqs` at that length and the largest length at 2, 4 and 8 slots. With 23.7 GB free (a desktop holding 0.3 GB), from the memory model:
+
+| Cache | 2 slots | 4 slots | 8 slots |
+|---|---|---|---|
+| bf16 (default profile) | 16,384 | 5,120 | does not fit |
+| fp8 | 30,720 | 10,240 | does not fit |
+| bf16 + `--host-tables` | 52,224 | 23,552 | 9,216 |
+| int4 + `--host-tables` (`--profile long`) | 161,792 | 74,752 | 28,672 |
+
+Speed: [Performance](PERFORMANCE.md#7-concurrent-requests---max-num-seqs).
+
 ## Memory and context
 
 The KV cache is the only thing that grows with context. The server sizes the engine for `--max-model-len` up front and **measures the free GPU memory at start** (`torch.cuda.mem_get_info`): it compares
@@ -299,6 +336,29 @@ Ids: both routes are exact for their own verify and deterministic, but may resol
 `--profile long` (196,608 tokens) does not fit with the drafter and is refused with the largest length that does (the ring buffer is not built); the start-up check for `--drafter dflash2` without `--host-tables` or at an absurd length refuses within seconds (`tests/test_startup_configs.py`). Time to ready 29 to 47 s.
 
 **Not done:** a drafter ring buffer (long profile), sampling, an adaptive route for copy-heavy answers, carrying the window to a host-cache resume at an earlier snapshot ([Ideas](IDEAS.md#a-block-drafter-dflash2-style)).
+
+## Images
+
+Send images the OpenAI way: a user message whose `content` is a list with `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` (or an http URL) and a text part.
+
+```bash
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "swift", "max_tokens": 64,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 photo.png)"'"}},
+                                            {"type": "text", "text": "Describe this image."}]}]}'
+```
+
+| Flag | Effect |
+|---|---|
+| `--vision auto` (default) | the ViT's 879 MiB of weights on the GPU if 256 MiB stay free at `--max-model-len`, else its block weights stay in pinned host memory and are streamed per image (153 MiB on the GPU), else image input is off. It never changes what a text request gets: the prompt-lookup tail and the length are decided as with `--vision off`. When it turns image input off, the start log says so as a WARNING with the reason and what would fit (the largest `--max-model-len` that keeps image input on, with `--max-num-seqs` > 1 also the largest slot count at this length), and an image request gets an HTTP 400 with the same text before any response starts (streamed or not). Without `--max-model-len`, `--max-num-seqs` > 1 picks a length that leaves room for the ViT (with host weights: 156 MiB at the default `--max-image-pixels`, under 1,000 tokens per slot), so image input stays on |
+| `--vision device` / `host` | demand a placement (the start is refused when it does not fit; `device` may turn the auto tail off to make room) |
+| `--vision off` | text only: the memory and behaviour of 0.7.0, an image request gets a 400 |
+| `--max-image-pixels N` | images are scaled down (aspect kept) to at most N pixels; default 2,097,152: 1920x1080 keeps its size, 2,040 placeholder tokens. One token per 32x32 pixels |
+| `--limit-mm-per-prompt '{"image": 8}'` | images per prompt (default 4); video is always refused with a 400 |
+
+Encode time of the ViT (median of 10): 16 / 65 / 220 ms at 448x448 / 1024x768 / 1920x1080 with the weights on the GPU; host-streamed weights add 51 ms at 448x448, 9 ms at 1024x768 and nothing at 1920x1080. Time to first token of an image request through the server: 218 ms / 617 ms / 1.47 s at the same sizes ([Performance](PERFORMANCE.md#6-image-input)).
+A follow-up turn about the same image resumes past it (`cached_tokens` counts the image rows); the prefix cache keys images by content, so the same text with another image never reuses the first image's state.
+Image requests are decoded by the MTP path even with `--drafter dflash2` (the block drafter's rope and its training are text-only).
 
 ## Using it from a coding agent
 

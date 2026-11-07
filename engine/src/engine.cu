@@ -67,16 +67,16 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 16384, H, T, &ep, st));
       CK(cudaStreamWaitEvent(st, e->ev_join, 0));
       const int di = e->dn_idx[l];
-      CK(swiftmk_deltanet_step_lazy(T, e->qkv, e->z, e->ba, e->bb, L.conv_w, L.A_log, L.dt_bias, L.norm_w,
-                                    e->dn_state + (size_t)di * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS,
-                                    e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, ds + DS_CUR, e->slots, e->y6, e->ws_dn,
-                                    e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), ds + DS_PEND, st));
+      CK(swiftmk_deltanet_step_lazy2(T, e->qkv, e->z, e->ba, e->bb, L.conv_w, L.A_log, L.dt_bias, L.norm_w,
+                                     e->dn_state + (size_t)di * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS,
+                                     e->dn_conv + (size_t)di * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS, ds + DS_CUR, e->slots, e->sslots, e->y6, e->ws_dn,
+                                     e->dn_dbuf + (size_t)di * swiftmk_deltanet_dbuf_floats(), ds + DS_PEND, nullptr, st));
     } else {
       smk_epi ep = {};
       ep.kind = SMK_EPI_SEGS; ep.end[0] = 12288; ep.end[1] = 13312; ep.end[2] = 14336; ep.out[0] = e->qb; ep.out[1] = e->kb; ep.out[2] = e->vb;
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
       CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_dtype,
-                           L.k_scale, L.v_scale, ds + DS_POS, e->y6, e->ws_attn, st));
+                           L.k_scale, L.v_scale, ds + DS_POS, ds + DS_RDELTA, e->y6, e->ws_attn, st));
     }
     {
       smk_epi ep = {};
@@ -113,12 +113,32 @@ smk_engine* smk_engine_create(const smk_model_w* w, int ctx_max, int kv_fp8) {
 }
 
 int smk_engine_tmax(smk_engine* e) { return e->tmax; }
+int smk_engine_sslots(smk_engine* e) { return e->sslots; }
 
-smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax) {
+int smk_engine_canary_check(smk_engine* e) {
+  if (!smk_debug()) return -1;
+  if (cudaDeviceSynchronize() != cudaSuccess) return -2;
+  std::vector<unsigned char> h(SMK_CANARY_BYTES);
+  int bad = 0;
+  for (auto& c : e->canaries) {
+    if (cudaMemcpy(h.data(), c.first + c.second, SMK_CANARY_BYTES, cudaMemcpyDeviceToHost) != cudaSuccess) return -2;
+    for (unsigned char b : h)
+      if (b != 0xA5) { bad++; fprintf(stderr, "smk_engine: canary after the %zu-byte buffer %p overwritten\n", c.second, (void*)c.first); break; }
+  }
+  return bad;
+}
+
+smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax) { return smk_engine_create_slot(w, ctx_max, kv_fp8, tmax, tmax + 1, nullptr); }
+
+smk_engine* smk_engine_create_slot(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax, int sslots, smk_engine* share) {
   if (tmax < 4 || tmax > TM) { fprintf(stderr, "smk_engine: tmax %d outside 4..%d\n", tmax, TM); return nullptr; }
+  if (sslots < 1 || sslots > tmax + 1) { fprintf(stderr, "smk_engine: state slots %d outside 1..%d\n", sslots, tmax + 1); return nullptr; }
+  if (share && (share->share || share->tmax != tmax || share->ctx_max != ctx_max || share->kv_dtype != kv_fp8)) { fprintf(stderr, "smk_engine: share engine of another configuration\n"); return nullptr; }
   smk_engine* e = new smk_engine();
   e->tmax = tmax;
   e->slots = tmax + 1;
+  e->sslots = sslots;
+  e->share = share;
   e->w = *w;
   e->ctx_max = ctx_max;
   e->kv_dtype = kv_fp8;  // 0=bf16 1=fp8 2=int4
@@ -127,27 +147,34 @@ smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, 
   auto B = [&](size_t n) { return dalloc(e, n); };
   e->ds = (int*)dalloc(e, DS_N * sizeof(int), true);
   { const int sl = e->slots; cudaMemcpy(e->ds + DS_SLOTS, &sl, sizeof(int), cudaMemcpyHostToDevice); }
-  e->h = (uint16_t*)B((size_t)TM * H * 2);
-  e->xn = (uint16_t*)B((size_t)TM * H * 2);
-  e->qkv = (uint16_t*)B((size_t)TM * 10240 * 2);
-  e->z = (uint16_t*)B((size_t)TM * 6144 * 2);
-  e->qb = (uint16_t*)B((size_t)TM * 12288 * 2);
-  e->kb = (uint16_t*)B((size_t)TM * 1024 * 2);
-  e->vb = (uint16_t*)B((size_t)TM * 1024 * 2);
-  e->ba = (uint16_t*)B((size_t)TM * 48 * 2);
-  e->bb = (uint16_t*)B((size_t)TM * 48 * 2);
-  e->y6 = (uint16_t*)B((size_t)TM * 6144 * 2);
-  e->mix = (uint16_t*)B((size_t)TM * H * 2);
-  e->act = (uint16_t*)B((size_t)TM * I * 2);
-  e->dn = (uint16_t*)B((size_t)TM * H * 2);
-  e->dbg = (uint16_t*)dalloc(e, (size_t)DBG_SLOTS * TM * H * 2, true);
-  e->logits = (float*)B((size_t)TM * VOC * 4);
-  e->ws_dn = dalloc(e, swiftmk_deltanet_ws_bytes(), true);
-  e->ws_attn = dalloc(e, swiftmk_attn_ws_bytes(), true);
-  e->ws_am = dalloc(e, smk_argmax_ws_bytes(), true);
-  e->ws_hq = dalloc(e, smk_headq_ws_bytes(), true);
+  if (share) {  // activations, taps, logits and workspaces of the owner: every buffer a step only uses within itself (a batched-decode slot runs on the owner's stream)
+    e->h = share->h; e->xn = share->xn; e->qkv = share->qkv; e->z = share->z; e->qb = share->qb; e->kb = share->kb; e->vb = share->vb; e->ba = share->ba; e->bb = share->bb;
+    e->y6 = share->y6; e->mix = share->mix; e->act = share->act; e->dn = share->dn; e->dbg = share->dbg; e->logits = share->logits;
+    e->ws_dn = share->ws_dn; e->ws_attn = share->ws_attn; e->ws_am = share->ws_am; e->ws_hq = share->ws_hq;
+  } else {
+    // TR (16) rows: a batched cycle (batch.cu) runs up to 16 rows through these; a single-sequence step uses T <= TM of them.  The taps keep TM rows per slot (engine.h).
+    e->h = (uint16_t*)B((size_t)TR * H * 2);
+    e->xn = (uint16_t*)B((size_t)TR * H * 2);
+    e->qkv = (uint16_t*)B((size_t)TR * 10240 * 2);
+    e->z = (uint16_t*)B((size_t)TR * 6144 * 2);
+    e->qb = (uint16_t*)B((size_t)TR * 12288 * 2);
+    e->kb = (uint16_t*)B((size_t)TR * 1024 * 2);
+    e->vb = (uint16_t*)B((size_t)TR * 1024 * 2);
+    e->ba = (uint16_t*)B((size_t)TR * 48 * 2);
+    e->bb = (uint16_t*)B((size_t)TR * 48 * 2);
+    e->y6 = (uint16_t*)B((size_t)TR * 6144 * 2);
+    e->mix = (uint16_t*)B((size_t)TR * H * 2);
+    e->act = (uint16_t*)B((size_t)TR * I * 2);
+    e->dn = (uint16_t*)B((size_t)TR * H * 2);
+    e->dbg = (uint16_t*)dalloc(e, (size_t)DBG_SLOTS * TM * H * 2, true);
+    e->logits = (float*)B((size_t)TR * VOC * 4);
+    e->ws_dn = dalloc(e, swiftmk_deltanet_ws_bytes(), true);
+    e->ws_attn = dalloc(e, swiftmk_attn_ws_bytes(), true);
+    e->ws_am = dalloc(e, smk_argmax_ws_bytes(), true);
+    e->ws_hq = dalloc(e, smk_headq_ws_bytes(), true);
+  }
   e->hq_on = w->head_q_kind != SMK_HEADQ_NONE;
-  e->dn_state = (float*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, true);
+  e->dn_state = (float*)dalloc(e, (size_t)nd * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, true);
   e->dn_conv = (uint16_t*)dalloc(e, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, true);
   e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
   e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
@@ -185,8 +212,8 @@ void smk_engine_destroy(smk_engine* e) {
 cudaError_t smk_engine_reset(smk_engine* e, cudaStream_t st) {
   const int nd = 48, na = 16;
   cudaMemsetAsync(e->ds, 0, DS_SLOTS * sizeof(int), st);  // ds[DS_SLOTS] (ring size) is constant
-  cudaMemsetAsync(e->ds + DS_PEND, 0, sizeof(int), st);
-  cudaMemsetAsync(e->dn_state, 0, (size_t)nd * e->slots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, st);
+  cudaMemsetAsync(e->ds + DS_PEND, 0, 2 * sizeof(int), st);  // DS_PEND, DS_RDELTA
+  cudaMemsetAsync(e->dn_state, 0, (size_t)nd * e->sslots * SWIFTMK_DN_STATE_SLOT_FLOATS * 4, st);
   cudaMemsetAsync(e->dn_conv, 0, (size_t)nd * e->slots * SWIFTMK_DN_CONV_SLOT_ELEMS * 2, st);
   cudaMemsetAsync(e->kv, 0, (size_t)na * e->kv_layer_bytes, st);
   return cudaGetLastError();

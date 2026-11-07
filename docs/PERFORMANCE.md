@@ -1,7 +1,7 @@
 # Performance and quality: what was measured, and how far to trust it
 
 Contents: [Summary](#summary) | [1. Memory](#1-memory-how-much-context-fits) | [2. Quality of the 4-bit KV cache](#2-quality-of-the-4-bit-kv-cache) | [3. Speed](#3-speed) |
-[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Reproducing](#6-reproducing) | [Back to README](../README.md)
+[4. HyperQwen as a reference point](#4-hyperqwen-as-a-reference-point) | [5. DFlash2 block drafter](#5-dflash2-block-drafter-experimental) | [6. Image input](#6-image-input) | [7. Concurrent requests](#7-concurrent-requests---max-num-seqs) | [8. Reproducing](#8-reproducing) | [Back to README](../README.md)
 
 Hardware for everything below: one RTX 3090 (24 GB, sm_86) at a 350 W power limit that also drives a desktop (about 0.6 GiB in use before
 the engine starts), checkpoint `ukisai/Swift-1.5-Qwen3.8-27b-INT4`, batch size 1. Every number is a **single run** unless a spread is given.
@@ -18,6 +18,7 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | long context: decode is 1.2x to 1.3x faster than its `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than its `mtp-huge` at 32k to 190k; short prompts: 1.2x to 1.3x faster than its MTP presets but slower than its DFlash2 preset (about 1.5x on code, earlier session); DFlash2 was not measured at long context; prefill within about 10% | same day, same card, prompts and client for the MTP presets; one pinned build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
 | How fast is the experimental DFlash2 drafter? | through the server (`--drafter dflash2`, bf16 KV, 2 interleaved visits per arm, stop at the end token): 276.7 / 113.4 / 254.0 tok/s on code / prose / math against 183.9 / 118.0 / 183.9 for MTP k=3 + tail (+51% / -4% / +38%), +34% on 8 chat prompts, +7% on 12 pooled chat tasks, **-31% on copy-heavy agent turns** (230 against 334 tok/s); cold prefill +1.3%, `cached_tokens` identical; engine-direct 276 / 112 / 261, level with HyperQwen's DFlash2 in an earlier session (254 / 103 / 226); greedy only | interleaved visits, same session | [5](#5-dflash2-block-drafter-experimental) |
+| How many users at once? | `--profile multiuser` (5 slots): 425 / 441 tok/s aggregate at 4 / 8 clients (text; 0.7.0 FIFO 155 / 152), 310 / 318 with every other request about an image; single user unchanged within 0.2% (ids identical) | single runs per cell, one session | [7](#7-concurrent-requests---max-num-seqs) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
 ## 1. Memory: how much context fits
@@ -284,7 +285,103 @@ With 4-bit KV (`--kv-cache-dtype int4_per_token_head --host-tables`, same proced
 
 **Not measured**: sampling (greedy only: sampled requests and requests with logit processors use the MTP path), DFlash2 beyond the lengths in [Usage](USAGE.md#the-dflash2-drafter---drafter-dflash2-experimental) (the drafter KV cache is indexed by absolute position, 20 KiB per token; `--profile long` does not fit and the ring buffer that would cap it is not built), the device lm_head table of `DflashEngine` (the server keeps it on the host), the long-context presets of HyperQwen, and any quoting prompt other than the two above (where HyperQwen's lookup drafter reports 381 tok/s).
 
-## 6. Reproducing
+## 6. Image input
+
+RTX 3090, 2026-11-06. ViT encode (`tests/test_vision.py --time`, median of 10 after 3 warmup calls, bf16, FlashAttention-2, fp32 residual):
+
+| image (patches -> tokens) | 448x448 (784 -> 196) | 1024x768 (3,072 -> 768) | 1920x1080 (8,160 -> 2,040) |
+|---|---|---|---|
+| weights on the GPU (`--vision device`) | 16.4 ms | 65.1 ms | 220.5 ms |
+| weights streamed from pinned host memory (`--vision host`) | 67.9 ms | 74.2 ms | 222.8 ms |
+| activation peak | 32 MiB | 125 MiB | 333 MiB |
+
+Through the server (`tests/test_vision_server.py --bench 3`, `--max-model-len 16384`, `--vision auto`, streamed chat, thinking off, a fresh image per run so nothing is cached; median of 3):
+time to first token 218 ms / 617 ms / 1,468 ms at 448x448 / 1024x768 / 1920x1080 (the prefill of 223 / 795 / 2,067 prompt tokens included).
+Decode after a 1024x768 image: 108.6 tok/s against 123.4 for a text prompt asking for the same kind of story (385 tokens, n = 3). The step is not slower: 19.27 against 19.20 ms per
+cycle (server log: 2.09 against 2.37 tokens per cycle, 184 against 162 cycles), so the gap is the draft acceptance of the two different texts.
+Text requests are unchanged: README short prompts (385 tokens, greedy, ignore_eos, median of 3, same session) 184.3 / 118.2 / 184.1 tok/s against 0.7.0's 184.9 / 118.4 / 184.5 (ratio
+0.997 to 0.998, within noise), with greedy ids identical to 0.7.0.
+GPU memory (`memfit_vision.py` in the research notes, difference of the free memory after warmup + a largest-image request + a full-length request, 8,192 tokens, tail on): +888 MiB
+with the ViT weights on the GPU, +154 MiB streamed, at 8,100 patches. Not measured: quality of descriptions on real photographs, more than two images per prompt at speed, other sizes.
+
+## 7. Concurrent requests (`--max-num-seqs`)
+
+Measured 2026-11-07 on one RTX 3090 (23.7 GB free), one session, through the server with `experiments/2026-11-06-qwen-warp-concurrent-vision/bench_conc.py` (research repository):
+C closed-loop clients, each sending 3 greedy chat requests back to back (thinking off, `max_tokens` 512, stop at the end token; the 8 short code / prose / math prompts of that script,
+cycled), streaming. Mixed: every other request asks about a 1024x768 synthetic image of its own (background colour and three shapes; "describe this image"). Aggregate = all output
+tokens / wall time; per request = (tokens - 1) / (last chunk - first chunk); TTFT = request sent to first content chunk. One run per cell. v0.7.0 has no image input, so the mixed
+rows compare against this version's one-at-a-time server (`--max-num-seqs 1`, the 0.7.0 schedule).
+
+| Server | C = 1 | C = 2 | C = 4 | C = 8 |
+|---|---|---|---|---|
+| **text only** | | | | |
+| v0.7.0 (FIFO), default profile: aggregate tok/s | 155.5 | 154.0 | 155.1 | 151.6 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 2.79 / 4.74 | 9.98 / 11.7 | 22.3 / 26.9 |
+| this version, `--max-num-seqs 1`: aggregate tok/s | 154.5 | 153.0 | 154.3 | 151.4 |
+| `--profile multiuser` (5 slots, 15,360 tokens each here): aggregate tok/s | 154.4 | 278.1 | **424.9 (2.74x)** | **440.5 (2.91x)** |
+| ... per request tok/s | 162.8 | 149.7 | 114.8 | 97.8 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.09 / 0.21 | 3.62 / 5.13 (3 queue) |
+| **mixed text + image** | | | | |
+| this version, `--max-num-seqs 1`: aggregate tok/s | 160.8 | 131.3 | 141.6 | 135.2 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.66 | 2.07 / 4.77 | 7.28 / 9.00 | 15.4 / 21.9 |
+| `--profile multiuser`: aggregate tok/s | 160.9 | 229.8 (1.75x) | **310.0 (2.19x)** | **318.3 (2.35x)** |
+| ... per request tok/s | 172.8 | 139.5 | 98.7 | 83.0 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.63 | 0.08 / 0.66 | 0.63 / 1.22 | 2.94 / 5.21 |
+
+Before the 16-row pass (2026-11-06, same benchmark, text only): `--max-num-seqs 4` 154.9 / 272.2 / 334.1 / 331.8 tok/s at C = 1 / 2 / 4 / 8, `--max-num-seqs 8 --profile long`
+150.6 / 260.6 / 317.3 / 314.0.
+
+Single user, `--max-num-seqs 1` against v0.7.0, runs interleaved (v0.7.0, this version, v0.7.0, this version; 2 visits per prompt per run, 512 tokens): code 181.4 / 181.1, prose
+120.4 / 120.2, math 188.9 / 188.5 tok/s (v0.7.0 / this version, means of 4; spread +-0.15), 0.2% slower, and the token ids of every run are identical to v0.7.0's. (The tree before
+the 16-row pass: 181.5 / 181.4, 120.5 / 120.3, 188.9 / 188.6.)
+
+Rows per weight pass are the limit: the W4 GEMV read the weights once for at most 8 rows (before the 16-row pass below), so the scheduler gives every sequence the most drafts that fit (engine level, greedy, 8 chat
+prompts x 256 tokens, host tables, 2 prompt sets per cell, aggregate tok/s):
+
+| sequences B \ drafts k | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| 1 | 57.8 | 105.8 | 138.3 | 159.0 (native k = 3 + tail: 164.9) |
+| 2 | 109.6 | 195.3 | 254.3 | 291.1 |
+| 3 | 156.8 | 278.0 | | |
+| 4 | 199.5 | 348.6 | | |
+| 5 / 6 / 7 / 8 | 239.2 / 274.9 / 308.1 / 338.1 | | | |
+
+The largest k that fits is the best for every B. Four sequences with one draft (8 rows) beat eight without drafts (8 rows), which is why 8 concurrent clients get no more than 4.
+A cycle of 8 rows costs 23.7 ms against 17.3 ms for 1 row: besides the GEMVs, every extra sequence adds its own DeltaNet and attention launches (~0.8 ms).
+
+**16 rows per weight pass** (2026-11-07, `k_w4` with two n8 token tiles, [Architecture](ARCHITECTURE.md#batched-decode---max-num-seqs)): engine level, greedy, 8 long-answer prompts
+(code, prose, arithmetic), 2 prompt sets per cell, 48 cycles each after one warm-up call, aggregate tok/s / ms per cycle:
+
+| sequences B | 8 rows: best k | 16 rows: best k | rows |
+|---|---|---|---|
+| 3 | k = 1: 277.4 / 20.2 ms | k = 3: **366.8** / 24.8 ms | 12 |
+| 4 | k = 1: 346.5 / 21.5 ms | k = 3: **421.5** / 27.6 ms | 16 |
+| 5 | k = 0: 239.3 / 20.9 ms | k = 2: **465.5** / 27.0 ms | 15 |
+| 6 | k = 0: 274.9 / 21.8 ms | k = 1: **426.7** / 26.2 ms | 12 |
+| 7 | k = 0: 308.0 / 22.7 ms | k = 1: **468.1** / 28.0 ms | 14 |
+| 8 | k = 0: 337.6 / 23.7 ms | k = 1: **503.6** / 29.8 ms | 16 |
+
+Again the largest k that fits is the best for every B (`K_BY_B` in `server/smk_batch.py`). The W4 GEMVs at 16 rows against 8 (us, isolated launches): DeltaNet q|k|v|z 69 / 54, attention q|k|v 75 / 49,
+o 27 / 24, gate|up 131 / 113, down 64 / 56, quantised head 1,038 / 778: about 3 ms of the 6 ms that 16 rows add to a cycle; the rest are the sequences' own DeltaNet, attention and
+MTP rows. Batched ids equal the solo replays (45 sequences in 9 shapes of 9 to 16 rows, greedy, seeded sampling, min_p, penalties) and every row-wise kernel is bit-identical for T = 1..16.
+
+**Server, mixed text + image workload** (2026-11-07, autonomous optimisation campaign, `--profile multiuser` = `--max-num-seqs 5 --host-tables --vision device`): 6 closed-loop clients,
+84 requests (36 with an image, code / prose / arithmetic / thinking / a ~5k-token document), aggregate output tok/s against the same tree before this work at its benchmark
+configuration (`--profile long --max-model-len 16384 --max-num-seqs 8`, ~159 tok/s), 3 runs interleaved with it: **1.358x (+-0.017), ~216 tok/s**. Held-out workload (8 clients,
+other image sizes and prompts, a 12k-token document, 2 seeded sampled requests): 1.20x. Answer accuracy 1.0 on the arithmetic items; 97.6% of the greedy answers are identical to the
+reference tree's, the rest differ at bf16 near-ties (other draft depths, see Outputs below). The steps, each measured on the same workload: 16 rows per weight pass with drafts up
+to 16 rows (1.31x), one launch per layer for the DeltaNet / attention of all sequences and a prefill pause every 2,048 rows (+1 to 4%), a decode cap of 5 per sync group (6 slots:
+1.336x at TTFT p95 3.27 s against 1.272x / 3.17 s without it), asynchronous snapshot copies (13 ms -> 0.6 ms of every prompt over 240 tokens on the request path).
+Outputs: with the default schedule a request's draft depth changes with the number of running requests, and in these runs 4 of 9 (`--max-num-seqs 4`) and 6 of 9 (`--profile long`, 8 slots)
+requests at C = 8 diverged from the same prompt at C = 1 (at token 83 or 155 of 512); with the depth fixed (`SMK_BATCH_K`, the tests) every request equals its solo run exactly.
+These are bf16 near-ties, measured at engine level (`margins.py` in the same experiment directory; 20 prompts x 512 greedy tokens, the native path against batched cycles of 0, 1 and 3
+drafts, the prose prompt diverges at token 83 as in the server runs): 20 of 60 answers diverged before their end, and at every first divergent token the reference's two best
+exact logits were 0.011 to 0.14 apart (median 0.044; 0.08th to 1.9th percentile of the gap over all 16,432 answer positions, whose median is 6.6), and the batched run's token was the
+reference's second best every time. The two runs agree bit for bit on the embedding and on layer 0, and differ from a DeltaNet layer on (layer 1 at 0 / 1 drafts; layer 4 at 3 drafts,
+where only the prompt-lookup-tail cycles differ) by 0.0002 to 0.004 (rounding), which grows to at most 0.13 to 0.41 at the final norm output (|x| up to 12 to 40); the top-2 gap
+moves between the two runs by 0.028 (median) and 0.17 (p99) at positions that do not flip.
+
+## 8. Reproducing
 
 | What | How | Takes |
 |---|---|---|
