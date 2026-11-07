@@ -163,14 +163,16 @@ __device__ __forceinline__ float group_sum(float v) {
   return v;
 }
 
-// blockIdx.y = sequence i of a fused multi-sequence launch (swiftmk_deltanet_step_multi): pb.p[i] are its parameters (rows, scalars, pointers, counters and scratch, filled by the host);
-// i = 0 is the single-sequence launch.  Every sequence computes exactly what its own launch would.
-struct ParamsB {
-  Params p[RMAX];
+// blockIdx.y = sequence i of a fused multi-sequence launch (swiftmk_deltanet_step_multi): pb.p[i] are its parameters (rows, scalars, pointers, counters and scratch, filled by the host).
+// Every sequence computes exactly what its own launch would.  NB = 1: the single-sequence launch (one parameter set: the kernel parameter block stays as small as before the fused
+// launch; a 16-set block made single-user decode 0.2% slower).
+template <int NB>
+struct ParamsN {
+  Params p[NB];
 };
-template <int T, int NS, int MODE>
-__global__ void __launch_bounds__(NT) dn_kernel(const __grid_constant__ ParamsB pb) {
-  const Params& p = pb.p[blockIdx.y];
+template <int T, int NS, int MODE, int NB>
+__global__ void __launch_bounds__(NT) dn_kernel(const __grid_constant__ ParamsN<NB> pb) {
+  const Params& p = pb.p[NB == 1 ? 0 : blockIdx.y];
   constexpr int VR = DV / NS;     // V rows per block
   constexpr int RPW = VR / 4;     // V rows per warp (4 warps) = float4 registers per lane
   constexpr int LPR = 32 / RPW;   // lanes per V row: lane = rowg * LPR + lk; lane lk holds float4 i * LPR + lk of K (i < RPW) of its row
@@ -399,11 +401,26 @@ __global__ void __launch_bounds__(NT) dn_kernel(const __grid_constant__ ParamsB 
   }
 }
 
-template <int T, int MODE = 0>
-cudaError_t launch_t(const ParamsB& pb, cudaStream_t s, int B = 1) {
+template <int T, int MODE, int NB>
+cudaError_t launch_t(const ParamsN<NB>& pb, cudaStream_t s, int B = 1) {
   constexpr int NS = MODE == 2 ? (T <= 2 ? 16 : T <= 4 ? DN_LZ_NS_MID : DN_LZ_NS_HI) : (T <= 2 ? DN_NS_SMALL_T : DN_NS_LARGE_T);
-  dn_kernel<T, NS, MODE><<<dim3(NV * NS, B), NT, 0, s>>>(pb);
+  dn_kernel<T, NS, MODE, NB><<<dim3(NV * NS, B), NT, 0, s>>>(pb);
   return cudaGetLastError();
+}
+// the lazy (MODE 1 / 2) step of B sequences with NB parameter sets
+template <int NB>
+cudaError_t launch_lazy(const ParamsN<NB>& pb, int T, int B, cudaStream_t s) {
+  switch (T) {
+    case 1: return launch_t<1, 1>(pb, s, B);
+    case 2: return launch_t<2, 2>(pb, s, B);
+    case 3: return launch_t<3, 2>(pb, s, B);
+    case 4: return launch_t<4, 2>(pb, s, B);
+    case 5: return launch_t<5, 2>(pb, s, B);
+    case 6: return launch_t<6, 2>(pb, s, B);
+    case 7: return launch_t<7, 2>(pb, s, B);
+    case 8: return launch_t<8, 2>(pb, s, B);
+    default: return cudaErrorInvalidValue;
+  }
 }
 
 // materialise the pending rows of every layer into ring slot cur (state: [layers][sslots][48][128][128], dbuf: [layers][DB_FLOATS]; ring slot i lives in state slot i % sslots)
@@ -442,17 +459,17 @@ extern "C" cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void*
   p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;
   p.norm_w = (const __nv_bfloat16*)norm_w; p.state = state; p.conv_state = (__nv_bfloat16*)conv_state; p.cur = cur; p.slots = slots; p.sslots = slots;
   p.y = (__nv_bfloat16*)y; p.cnt = (unsigned*)ws; p.o_ws = (float*)((char*)ws + WS_CNT_BYTES);
-  ParamsB pb = {};
+  ParamsN<1> pb = {};
   pb.p[0] = p;
   switch (T) {
-    case 1: return launch_t<1>(pb, stream);
-    case 2: return launch_t<2>(pb, stream);
-    case 3: return launch_t<3>(pb, stream);
-    case 4: return launch_t<4>(pb, stream);
-    case 5: return launch_t<5>(pb, stream);
-    case 6: return launch_t<6>(pb, stream);
-    case 7: return launch_t<7>(pb, stream);
-    case 8: return launch_t<8>(pb, stream);
+    case 1: return launch_t<1, 0>(pb, stream);
+    case 2: return launch_t<2, 0>(pb, stream);
+    case 3: return launch_t<3, 0>(pb, stream);
+    case 4: return launch_t<4, 0>(pb, stream);
+    case 5: return launch_t<5, 0>(pb, stream);
+    case 6: return launch_t<6, 0>(pb, stream);
+    case 7: return launch_t<7, 0>(pb, stream);
+    case 8: return launch_t<8, 0>(pb, stream);
     default: return cudaErrorInvalidValue;
   }
 }
@@ -488,7 +505,12 @@ extern "C" cudaError_t swiftmk_deltanet_step_multi(int B, int T, const void* qkv
   p.y = (__nv_bfloat16*)y; p.cnt = (unsigned*)ws; p.o_ws = (float*)((char*)ws + WS_CNT_BYTES);
   p.dbuf = dbuf; p.pend = pend;
   if (ind) p.ind = *ind;
-  ParamsB pb = {};
+  if (B == 1) {
+    ParamsN<1> pb = {};
+    pb.p[0] = p;
+    return launch_lazy(pb, T, 1, stream);
+  }
+  ParamsN<RMAX> pb = {};
   for (int i = 0; i < B; i++) {  // sequence i: rows i * T, scalars at i * seq_stride, pointer-table entries at i * pp_stride, its own counters and scratch rows
     Params q = p;
     const size_t r0 = (size_t)i * T;
@@ -501,17 +523,7 @@ extern "C" cudaError_t swiftmk_deltanet_step_multi(int B, int T, const void* qkv
     if (q.ind.dbuf_pp) q.ind.dbuf_pp += (size_t)i * pp_stride;
     pb.p[i] = q;
   }
-  switch (T) {
-    case 1: return launch_t<1, 1>(pb, stream, B);
-    case 2: return launch_t<2, 2>(pb, stream, B);
-    case 3: return launch_t<3, 2>(pb, stream, B);
-    case 4: return launch_t<4, 2>(pb, stream, B);
-    case 5: return launch_t<5, 2>(pb, stream, B);
-    case 6: return launch_t<6, 2>(pb, stream, B);
-    case 7: return launch_t<7, 2>(pb, stream, B);
-    case 8: return launch_t<8, 2>(pb, stream, B);
-    default: return cudaErrorInvalidValue;
-  }
+  return launch_lazy(pb, T, B, stream);
 }
 
 // Write the pending state of every layer into ring slot cur and clear *pend (external readers / writers of the state ring: snapshot, prefill).  slots = PHYSICAL state slots (sslots).
