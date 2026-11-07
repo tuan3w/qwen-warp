@@ -5,6 +5,7 @@ import sys, torch
 sys.path.insert(0, "/media/fatman/data/workspace/qwen-warp/engine")
 import pack
 import cute_w4
+import cute_dequant
 from vllm.model_executor.kernels.linear.mixed_precision import MPLinearKernel, MPLinearLayerConfig
 from vllm.model_executor.kernels import linear as vlinear
 from vllm.platforms import PlatformEnum
@@ -33,17 +34,25 @@ def dequant_repacked(w, s):
         out[r0:r0 + n] = ((nat.float() - 8.0) * sc.float().unsqueeze(-1)).reshape(n, K8 * 8).to(torch.bfloat16)
     return out
 
+_SCRATCH = {}
+MAX_CHUNK_BYTES = 32 << 20
+def _scratch(dev):
+    if dev not in _SCRATCH: _SCRATCH[dev] = torch.empty(MAX_CHUNK_BYTES >> 1, dtype=torch.bfloat16, device=dev)   # allocated at the first prefill (the profile run), never inside a graph capture
+    return _SCRATCH[dev]
+
 def _cute_linear_impl(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     N, K = w.shape[0], w.shape[1] * 8
     x2 = x.reshape(-1, K).contiguous(); T = x2.shape[0]
     out = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
     if T <= CuteW4A16LinearKernel.MAX_GEMV_ROWS:
-        for t0 in range(0, T, 8):                                           # <=8 rows per launch: a row's bits do not depend on the batch
-            tn = min(8, T - t0); xs = x2[t0:t0 + tn]; os_ = out[t0:t0 + tn]
-            fn = cute_w4.get(N, K, tn, w, s, xs, os_)
-            fn(*cute_w4.wrap(w, s, xs, os_), cute_w4.cur())
-    else:
-        torch.matmul(x2, dequant_repacked(w, s).T, out=out)                 # spike: whole-matrix dequant; production = layer-major scratch + cuBLAS
+        fn = cute_w4.get(N, K, T, w, s, x2, out)                            # one weight pass for up to 16 rows (two n8 token tiles)
+        fn(*cute_w4.wrap(w, s, x2, out), cute_w4.cur())
+    else:                                                                    # prefill / many rows: dequantise a row chunk to bf16 scratch, cuBLAS, next chunk
+        ch = cute_dequant.chunk_rows(N, K, MAX_CHUNK_BYTES)
+        scratch = _scratch(x.device)
+        for r0 in range(0, N, ch):
+            cute_dequant.dequant_chunk(w, s, scratch, K, ch, r0)
+            out[:, r0:r0 + ch] = torch.mm(x2, scratch[: ch * K].view(ch, K).t())
     return out.view(*x.shape[:-1], N)
 
 def _cute_linear_fake(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -55,7 +64,7 @@ def _register_op():
         direct_register_custom_op("cute_w4a16_linear", _cute_linear_impl, fake_impl=_cute_linear_fake)
 
 class CuteW4A16LinearKernel(MPLinearKernel):
-    MAX_GEMV_ROWS = 32
+    MAX_GEMV_ROWS = 16
 
     @classmethod
     def get_min_capability(cls): return 80
@@ -75,8 +84,9 @@ class CuteW4A16LinearKernel(MPLinearKernel):
         pack.repack_w4(wd, sd, rows=128)
         layer.cute_w = torch.nn.Parameter(wd, requires_grad=False); layer.cute_s = torch.nn.Parameter(sd, requires_grad=False)
         _register_op(); _inv(wd.device)
+        ch = cute_dequant.chunk_rows(wd.shape[0], wd.shape[1] * 8, MAX_CHUNK_BYTES); cute_dequant.dequant_chunk(wd, sd, torch.empty(ch * wd.shape[1] * 8, dtype=torch.bfloat16, device=wd.device), wd.shape[1] * 8, ch, 0)   # compile now, not inside a graph capture
         N, K = wd.shape[0], wd.shape[1] * 8
-        for tn in range(1, 9):
+        for tn in range(1, 17):
             xs = torch.zeros(tn, K, dtype=torch.bfloat16, device=wd.device); os_ = torch.empty(tn, N, dtype=torch.bfloat16, device=wd.device)
             cute_w4.get(N, K, tn, wd, sd, xs, os_)
         for n in (self.w_q_name, self.w_s_name): setattr(layer, n, None)       # free the checkpoint copies

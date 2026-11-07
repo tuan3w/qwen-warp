@@ -13,7 +13,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
 
 R_CAND = 32
-MAX_T = 8
+MAX_T = 16
 DRAFT_VOCAB = "/media/fatman/data/workspace/qwen-warp/engine/draft_vocab_ext_68864.npy"
 _state = {"draft": False, "building_draft": False}
 

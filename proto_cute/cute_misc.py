@@ -12,7 +12,7 @@ import pack, cute_w4, ptx, vllm_mp_kernel
 class Bf16Small:
     """out[T, N] = x[T, K] @ w[N, K]^T, bf16 in/out, fp32 accumulate; one 128-thread CTA per row."""
     def __init__(self, N, K, T):
-        assert K % 1024 == 0 and 1 <= T <= 8
+        assert K % 1024 == 0 and 1 <= T <= 16
         self.N, self.K, self.T = N, K, T
 
     @cute.jit
@@ -23,7 +23,7 @@ class Bf16Small:
     def kernel(self, mW: cute.Tensor, mX: cute.Tensor, mO: cute.Tensor):
         K, T = self.K, self.T
         tid, _, _ = cute.arch.thread_idx(); row, _, _ = cute.arch.block_idx()
-        smem = cutlass.utils.SmemAllocator(); red = smem.allocate_tensor(Float32, cute.make_layout((4, 8)))
+        smem = cutlass.utils.SmemAllocator(); red = smem.allocate_tensor(Float32, cute.make_layout((4, 16)))
         acc = cute.make_rmem_tensor((T,), Float32)
         for t in cutlass.range_constexpr(T): acc[t] = Float32(0.0)
         for i in cutlass.range_constexpr(K // 8 // 128):
@@ -90,13 +90,13 @@ def install():
             w, s = pack.quant_head_i4(wb, rows=256); pack.repack_w4(w, s, rows=128)
             layer.cute_w, layer.cute_s = w, s
             N, K = w.shape[0], w.shape[1] * 8
-            for t in range(1, 9):
+            for t in range(1, 17):
                 cute_w4.get(N, K, t, w, s, torch.zeros(t, K, dtype=torch.bfloat16, device=wb.device), torch.empty(t, N, dtype=torch.bfloat16, device=wb.device))
             layer.weight = torch.nn.Parameter(torch.empty(0, K, dtype=torch.bfloat16, device=wb.device), requires_grad=False)   # free the bf16 copy
             layer._cute_int4 = True
         elif _small_ok(layer):
             w = layer.weight.data
-            for t in range(1, 9):
+            for t in range(1, 17):
                 _small_fn(w.shape[0], w.shape[1], t, w, torch.zeros(t, w.shape[1], dtype=torch.bfloat16, device=w.device), torch.empty(t, w.shape[0], dtype=torch.bfloat16, device=w.device))
     def apply(self, layer, x, bias=None):
         if getattr(layer, "_cute_int4", False):

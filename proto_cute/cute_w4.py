@@ -11,8 +11,9 @@ def cur():
 
 class W4Gemv:
     def __init__(self, N, K, T, NW=8, KS=4, U=2, grid=164):
-        assert N % 16 == 0 and K % 128 == 0 and 1 <= T <= 8 and NW % KS == 0
+        assert N % 16 == 0 and K % 128 == 0 and 1 <= T <= 16 and NW % KS == 0
         self.N, self.K, self.T, self.NW, self.KS, self.U, self.grid = N, K, T, NW, KS, U, grid
+        self.NT = (T + 7) // 8
         self.nkg = K // 128; assert self.nkg % KS == 0
         self.per = self.nkg // KS
         self.TPC = NW // KS
@@ -25,7 +26,7 @@ class W4Gemv:
     @cute.kernel
     def kernel(self, mW: cute.Tensor, mS: cute.Tensor, mX: cute.Tensor, mO: cute.Tensor):
         N, K, T, NW, KS, U, grid = self.N, self.K, self.T, self.NW, self.KS, self.U, self.grid
-        nkg, per, TPC, groups = self.nkg, self.per, self.TPC, self.groups
+        nkg, per, TPC, groups, NT = self.nkg, self.per, self.TPC, self.groups, self.NT
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane = tid % 32; warp = tid // 32; g = lane // 4; t = lane % 4
@@ -34,16 +35,18 @@ class W4Gemv:
         total = cnt * per
         gridsz = grid * TPC
         tile0 = tin + bid * TPC
-        xrow = g if g < T else T - 1                           # lanes g >= T read the last row (never stored)
-        xoff = xrow * (K // 2) + (ks * 16 + t * 4) * 4          # u32 units
+        xoffs = []
+        for n in cutlass.range_constexpr(NT):                  # lanes whose token row is >= T read the last row (never stored)
+            xrow = (n * 8 + g) if (n * 8 + g) < T else T - 1
+            xoffs.append(xrow * (K // 2) + (ks * 16 + t * 4) * 4)          # u32 units
         smem = cutlass.utils.SmemAllocator()
-        red = smem.allocate_tensor(Float32, cute.make_layout((NW, 32, 4)))
+        red = smem.allocate_tensor(Float32, cute.make_layout((NW, 32, 4 * NT)))
 
         wa = cute.make_rmem_tensor((U, 4), Uint32)
         wb = cute.make_rmem_tensor((U, 4), Uint32)
         ss = cute.make_rmem_tensor((U,), Uint32)
-        acc = cute.make_rmem_tensor((4,), Float32)
-        for c in cutlass.range_constexpr(4):
+        acc = cute.make_rmem_tensor((4 * NT,), Float32)
+        for c in cutlass.range_constexpr(4 * NT):
             acc[c] = Float32(0.0)
 
         # i = flat (tile, group) index of this thread's stream
@@ -76,34 +79,37 @@ class W4Gemv:
                             wa[j, c] = a0[c]; wb[j, c] = a1[c]
                         ss[j] = ptx.ld32(ptx.addr(mS, (tile2 * nkg + ks + kk2 * KS) * 8 + g))
                     xv = []
-                    for u in cutlass.range_constexpr(4):
-                        x4 = ptx.ldx4(ptx.addr(mX, xoff + kk * (KS * 16 * 4) + u * 4))
-                        for c in cutlass.range_constexpr(4):
-                            xv.append(x4[c])
-                    p0, p1, p2, p3 = ptx.group_mma(ca, cb, xv)
+                    for n in cutlass.range_constexpr(NT):
+                        for u in cutlass.range_constexpr(4):
+                            x4 = ptx.ldx4(ptx.addr(mX, xoffs[n] + kk * (KS * 16 * 4) + u * 4))
+                            for c in cutlass.range_constexpr(4):
+                                xv.append(x4[c])
+                    pp = ptx.group_mma(ca, cb, xv, NT)
                     fsa = ptx.bits2f(sv << 16); fsb = ptx.bits2f(sv & Uint32(0xFFFF0000))
-                    acc[0] = fsa * p0 + acc[0]; acc[1] = fsa * p1 + acc[1]
-                    acc[2] = fsb * p2 + acc[2]; acc[3] = fsb * p3 + acc[3]
+                    for n in cutlass.range_constexpr(NT):
+                        acc[4 * n + 0] = fsa * pp[4 * n + 0] + acc[4 * n + 0]; acc[4 * n + 1] = fsa * pp[4 * n + 1] + acc[4 * n + 1]
+                        acc[4 * n + 2] = fsb * pp[4 * n + 2] + acc[4 * n + 2]; acc[4 * n + 3] = fsb * pp[4 * n + 3] + acc[4 * n + 3]
                     if kk == per - 1:                         # tile finished
                         row = (tile0 + tl * gridsz) * 16
                         if cutlass.const_expr(KS > 1):
                             if ks > 0:
-                                for c in cutlass.range_constexpr(4):
+                                for c in cutlass.range_constexpr(4 * NT):
                                     red[warp, lane, c] = acc[c]
                             cute.arch.sync_threads()
                             if ks == 0:
                                 for q in cutlass.range_constexpr(1, KS):
-                                    for c in cutlass.range_constexpr(4):
+                                    for c in cutlass.range_constexpr(4 * NT):
                                         acc[c] = acc[c] + red[warp + q, lane, c]
                             cute.arch.sync_threads()
                         if ks == 0:
-                            tk0 = 2 * t
                             r0 = row + g
-                            if tk0 < T:
-                                mO[tk0, r0] = acc[0].to(BFloat16); mO[tk0, r0 + 8] = acc[2].to(BFloat16)
-                            if tk0 + 1 < T:
-                                mO[tk0 + 1, r0] = acc[1].to(BFloat16); mO[tk0 + 1, r0 + 8] = acc[3].to(BFloat16)
-                        for c in cutlass.range_constexpr(4):
+                            for n in cutlass.range_constexpr(NT):
+                                tk0 = 8 * n + 2 * t
+                                if tk0 < T:
+                                    mO[tk0, r0] = acc[4 * n].to(BFloat16); mO[tk0, r0 + 8] = acc[4 * n + 2].to(BFloat16)
+                                if tk0 + 1 < T:
+                                    mO[tk0 + 1, r0] = acc[4 * n + 1].to(BFloat16); mO[tk0 + 1, r0 + 8] = acc[4 * n + 3].to(BFloat16)
+                        for c in cutlass.range_constexpr(4 * NT):
                             acc[c] = Float32(0.0)
 
 def wrap(w, s, x, out):
