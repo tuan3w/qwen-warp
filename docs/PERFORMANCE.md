@@ -18,6 +18,7 @@ Decode speed is end-to-end tokens/s through the OpenAI server path with MTP k=3 
 | How fast is prefill? | 1,888 tok/s at 16k, 1,094 at 190k (173.5 s), 963 at 262k (272 s) | single runs, re-measured 2026-11-04 | [3](#3-speed) |
 | How does it compare with HyperQwen? | long context: decode is 1.2x to 1.3x faster than its `mtp-long` at 32k to 130k and 1.9x to 3.6x faster than its `mtp-huge` at 32k to 190k; short prompts: 1.2x to 1.3x faster than its MTP presets but slower than its DFlash2 preset (about 1.5x on code, earlier session); DFlash2 was not measured at long context; prefill within about 10% | same day, same card, prompts and client for the MTP presets; one pinned build; single runs | [4](#4-hyperqwen-as-a-reference-point) |
 | How fast is the experimental DFlash2 drafter? | through the server (`--drafter dflash2`, bf16 KV, 2 interleaved visits per arm, stop at the end token): 276.7 / 113.4 / 254.0 tok/s on code / prose / math against 183.9 / 118.0 / 183.9 for MTP k=3 + tail (+51% / -4% / +38%), +34% on 8 chat prompts, +7% on 12 pooled chat tasks, **-31% on copy-heavy agent turns** (230 against 334 tok/s); cold prefill +1.3%, `cached_tokens` identical; engine-direct 276 / 112 / 261, level with HyperQwen's DFlash2 in an earlier session (254 / 103 / 226); greedy only | interleaved visits, same session | [5](#5-dflash2-block-drafter-experimental) |
+| How many users at once? | `--profile multiuser` (5 slots): 425 / 441 tok/s aggregate at 4 / 8 clients (text; 0.7.0 FIFO 155 / 152), 310 / 318 with every other request about an image; single user unchanged within 0.2% (ids identical) | single runs per cell, one session | [7](#7-concurrent-requests---max-num-seqs) |
 | What was not measured? | multi-turn agentic task success, coding-agent tool sets, other GPUs, other power limits | not measured | |
 
 ## 1. Memory: how much context fits
@@ -305,23 +306,34 @@ with the ViT weights on the GPU, +154 MiB streamed, at 8,100 patches. Not measur
 
 ## 7. Concurrent requests (`--max-num-seqs`)
 
-Measured 2026-11-06 on one RTX 3090 (23.7 GB free), one session, through the server with `experiments/2026-11-06-qwen-warp-concurrent-vision/bench_conc.py` (research repository):
+Measured 2026-11-07 on one RTX 3090 (23.7 GB free), one session, through the server with `experiments/2026-11-06-qwen-warp-concurrent-vision/bench_conc.py` (research repository):
 C closed-loop clients, each sending 3 greedy chat requests back to back (thinking off, `max_tokens` 512, stop at the end token; the 8 short code / prose / math prompts of that script,
-cycled), streaming. Aggregate = all output tokens / wall time; per request = (tokens - 1) / (last chunk - first chunk); TTFT = request sent to first content chunk. One run per cell.
+cycled), streaming. Mixed: every other request asks about a 1024x768 synthetic image of its own (background colour and three shapes; "describe this image"). Aggregate = all output
+tokens / wall time; per request = (tokens - 1) / (last chunk - first chunk); TTFT = request sent to first content chunk. One run per cell. v0.7.0 has no image input, so the mixed
+rows compare against this version's one-at-a-time server (`--max-num-seqs 1`, the 0.7.0 schedule).
 
 | Server | C = 1 | C = 2 | C = 4 | C = 8 |
 |---|---|---|---|---|
-| v0.7.0 (FIFO), default profile: aggregate tok/s | 155.3 | 153.6 | 154.8 | 151.7 |
-| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 2.80 / 4.75 | 10.0 / 11.6 | 22.9 / 25.9 |
-| `--max-num-seqs 4`, default profile (7,168 tokens per slot): aggregate tok/s | 154.9 | 272.2 | **334.1 (2.16x)** | 331.8 |
-| ... per request tok/s | 163.5 | 146.4 | 85.7 | 84.9 |
-| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.12 / 0.21 | 6.0 / 6.5 (4 queue) |
-| `--max-num-seqs 8 --profile long` (30,720 tokens per slot): aggregate tok/s | 150.6 | 260.6 | 317.3 | 314.0 |
-| ... per request tok/s | 160.0 | 141.1 | 82.0 | 39.9 |
-| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.08 / 0.21 | 0.13 / 0.56 |
+| **text only** | | | | |
+| v0.7.0 (FIFO), default profile: aggregate tok/s | 155.5 | 154.0 | 155.1 | 151.6 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 2.79 / 4.74 | 9.98 / 11.7 | 22.3 / 26.9 |
+| this version, `--max-num-seqs 1`: aggregate tok/s | 154.5 | 153.0 | 154.3 | 151.4 |
+| `--profile multiuser` (5 slots, 15,360 tokens each here): aggregate tok/s | 154.4 | 278.1 | **424.9 (2.74x)** | **440.5 (2.91x)** |
+| ... per request tok/s | 162.8 | 149.7 | 114.8 | 97.8 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.05 | 0.08 / 0.13 | 0.09 / 0.21 | 3.62 / 5.13 (3 queue) |
+| **mixed text + image** | | | | |
+| this version, `--max-num-seqs 1`: aggregate tok/s | 160.8 | 131.3 | 141.6 | 135.2 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.66 | 2.07 / 4.77 | 7.28 / 9.00 | 15.4 / 21.9 |
+| `--profile multiuser`: aggregate tok/s | 160.9 | 229.8 (1.75x) | **310.0 (2.19x)** | **318.3 (2.35x)** |
+| ... per request tok/s | 172.8 | 139.5 | 98.7 | 83.0 |
+| ... TTFT p50 / p95 (s) | 0.05 / 0.63 | 0.08 / 0.66 | 0.63 / 1.22 | 2.94 / 5.21 |
 
-Single user, `--max-num-seqs 1` against v0.7.0, runs interleaved (v0.7.0, this version, v0.7.0, this version; 3 + 4 runs of each prompt, 512 tokens): code 181.5 / 181.4, prose
-120.5 / 120.3, math 188.9 / 188.6 tok/s (v0.7.0 / this version, means), and the token ids of every run are identical to v0.7.0's.
+Before the 16-row pass (2026-11-06, same benchmark, text only): `--max-num-seqs 4` 154.9 / 272.2 / 334.1 / 331.8 tok/s at C = 1 / 2 / 4 / 8, `--max-num-seqs 8 --profile long`
+150.6 / 260.6 / 317.3 / 314.0.
+
+Single user, `--max-num-seqs 1` against v0.7.0, runs interleaved (v0.7.0, this version, v0.7.0, this version; 2 visits per prompt per run, 512 tokens): code 181.4 / 181.1, prose
+120.4 / 120.2, math 188.9 / 188.5 tok/s (v0.7.0 / this version, means of 4; spread +-0.15), 0.2% slower, and the token ids of every run are identical to v0.7.0's. (The tree before
+the 16-row pass: 181.5 / 181.4, 120.5 / 120.3, 188.9 / 188.6.)
 
 Rows per weight pass are the limit: the W4 GEMV read the weights once for at most 8 rows (before the 16-row pass below), so the scheduler gives every sequence the most drafts that fit (engine level, greedy, 8 chat
 prompts x 256 tokens, host tables, 2 prompt sets per cell, aggregate tok/s):
