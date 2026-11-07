@@ -10,7 +10,7 @@ def cur():
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 class W4Gemv:
-    def __init__(self, N, K, T, NW=8, KS=4, U=2, grid=164):
+    def __init__(self, N, K, T, NW=8, KS=4, U=1, grid=164):
         assert N % 16 == 0 and K % 128 == 0 and 1 <= T <= 32 and NW % KS == 0
         self.N, self.K, self.T, self.NW, self.KS, self.U, self.grid = N, K, T, NW, KS, U, grid
         self.NT = (T + 7) // 8
@@ -21,7 +21,7 @@ class W4Gemv:
 
     @cute.jit
     def __call__(self, mW: cute.Tensor, mS: cute.Tensor, mX: cute.Tensor, mO: cute.Tensor, stream: cuda.CUstream):
-        self.kernel(mW, mS, mX, mO).launch(grid=[self.grid, 1, 1], block=[self.NW * 32, 1, 1], stream=stream)
+        self.kernel(mW, mS, mX, mO).launch(grid=[self.grid, 1, 1], block=[self.NW * 32, 1, 1], stream=stream, min_blocks_per_mp=2)
 
     @cute.kernel
     def kernel(self, mW: cute.Tensor, mS: cute.Tensor, mX: cute.Tensor, mO: cute.Tensor):
@@ -78,13 +78,14 @@ class W4Gemv:
                         for c in cutlass.range_constexpr(4):
                             wa[j, c] = a0[c]; wb[j, c] = a1[c]
                         ss[j] = ptx.ld32(ptx.addr(mS, (tile2 * nkg + ks + kk2 * KS) * 8 + g))
-                    xv = []
-                    for n in cutlass.range_constexpr(NT):
-                        for u in cutlass.range_constexpr(4):
+                    pp = None
+                    for u in cutlass.range_constexpr(4):
+                        xs = []
+                        for n in cutlass.range_constexpr(NT):
                             x4 = ptx.ldx4(ptx.addr(mX, xoffs[n] + kk * (KS * 16 * 4) + u * 4))
                             for c in cutlass.range_constexpr(4):
-                                xv.append(x4[c])
-                    pp = ptx.group_mma(ca, cb, xv, NT)
+                                xs.append(x4[c])
+                        pp = ptx.mma_u(ca[u], cb[u], xs, pp, NT)
                     fsa = ptx.bits2f(sv << 16); fsb = ptx.bits2f(sv & Uint32(0xFFFF0000))
                     for n in cutlass.range_constexpr(NT):
                         acc[4 * n + 0] = fsa * pp[4 * n + 0] + acc[4 * n + 0]; acc[4 * n + 1] = fsa * pp[4 * n + 1] + acc[4 * n + 1]
@@ -117,7 +118,21 @@ def wrap(w, s, x, out):
             from_dlpack(x.view(torch.int32).view(-1), assumed_align=16), from_dlpack(out, assumed_align=16))
 
 _cache = {}
+def _choose_ks(N, K, NW=8, grid=164):
+    """K-split per tile (warps sharing one tile). Depends on the shape only (never on T: the reduction order must be identical for every row count).
+    The smallest split that still gives >= 0.9 tile-groups per block: fewer K-slices = more tiles in flight per block sharing the activation reloads."""
+    nkg, tiles = K // 128, N // 16
+    ok = [ks for ks in (2, 4, 8) if NW % ks == 0 and nkg % ks == 0 and tiles % (NW // ks) == 0]
+    for ks in ok:
+        if tiles // (NW // ks) >= 0.9 * grid:
+            return ks
+    return ok[-1]
+
+def _defaults(N, K, T):
+    return dict(U=1, KS=_choose_ks(N, K))
+
 def get(N, K, T, w, s, x, out, **cfg):
+    cfg = {**_defaults(N, K, T), **cfg}
     key = (N, K, T, tuple(sorted(cfg.items())))
     if key not in _cache:
         k = W4Gemv(N, K, T, **cfg)

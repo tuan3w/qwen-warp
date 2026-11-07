@@ -37,29 +37,30 @@ def _dq(src, d0, d1, d2, d3):
         lines.append(f"fma.rn.bf16x2 {d}, q, one, off;")
     return lines
 
-def group_mma_ptx(NT=1):
-    """One 128-k group of one thread, NT n8 token tiles sharing the dequantised weight fragments.
-    Operands: $r0..$r3 = wa, $r4..$r7 = wb, then 16 x regs per tile (tile n, u: $r{8+16n+4u+0..3}); $w{4n..4n+3} = partials of tile n."""
+def mma_u_ptx(NT, first):
+    """One k16 step (u) of one thread, NT n8 token tiles sharing the dequantised weight fragments.
+    Operands: $r0 = wa word, $r1 = wb word, x regs of tile n: $r{2+4n..5+4n}, then (unless `first`) the 4*NT incoming partials; $w = partials."""
     L = ["{", ".reg .b32 m, c, one, off, q, s;", ".reg .b32 pa<4>, pb<4>;",
          "mov.b32 m, 0x000F000F;", "mov.b32 c, 0x43004300;", "mov.b32 one, 0x3F803F80;", "mov.b32 off, 0xC308C308;"]
     for n in range(4 * NT):
-        L.append(f"mov.f32 {{$w{n}}}, 0f00000000;")
-    for u in range(4):
-        L += _dq(f"{{$r{u}}}", "pa0", "pa1", "pa2", "pa3")
-        L += _dq(f"{{$r{4+u}}}", "pb0", "pb1", "pb2", "pb3")
-        for n in range(NT):
-            x = 8 + 16 * n + 4 * u
-            w = ", ".join(f"{{$w{4*n+c}}}" for c in range(4))
-            L.append(f"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{w}}}, {{pa0, pb0, pa1, pb1}}, {{{{$r{x}}}, {{$r{x+1}}}}}, {{{w}}};")
-            L.append(f"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{w}}}, {{pa2, pb2, pa3, pb3}}, {{{{$r{x+2}}}, {{$r{x+3}}}}}, {{{w}}};")
+        L.append(f"mov.f32 {{$w{n}}}, 0f00000000;" if first else f"mov.b32 {{$w{n}}}, {{$r{2 + 4 * NT + n}}};")
+    L += _dq("{$r0}", "pa0", "pa1", "pa2", "pa3")
+    L += _dq("{$r1}", "pb0", "pb1", "pb2", "pb3")
+    for n in range(NT):
+        x = 2 + 4 * n
+        w = ", ".join(f"{{$w{4*n+c}}}" for c in range(4))
+        L.append(f"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{w}}}, {{pa0, pb0, pa1, pb1}}, {{{{$r{x}}}, {{$r{x+1}}}}}, {{{w}}};")
+        L.append(f"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{w}}}, {{pa2, pb2, pa3, pb3}}, {{{{$r{x+2}}}, {{$r{x+3}}}}}, {{{w}}};")
     L.append("}")
     return "\n".join(L)
 
-_GROUP_PTX = {}
-def group_mma(wa, wb, xv, NT=1):
-    """wa, wb: 4 Uint32 each; xv: 16*NT Uint32. Returns 4*NT Float32."""
-    if NT not in _GROUP_PTX: _GROUP_PTX[NT] = group_mma_ptx(NT)
-    return inline_ptx(_GROUP_PTX[NT], write_only_types=[Float32] * (4 * NT), read_only_args=list(wa) + list(wb) + list(xv))
+_MMA_U_PTX = {}
+def mma_u(wa, wb, xs, acc, NT=1):
+    """wa, wb: Uint32 weight words; xs: 4*NT Uint32 activation regs; acc: 4*NT Float32 partials, or None to start from zero. Returns 4*NT Float32."""
+    key = (NT, acc is None)
+    if key not in _MMA_U_PTX: _MMA_U_PTX[key] = mma_u_ptx(NT, acc is None)
+    return inline_ptx(_MMA_U_PTX[key], write_only_types=[Float32] * (4 * NT),
+                      read_only_args=[wa, wb] + list(xs) + ([] if acc is None else list(acc)))
 
 # ---- megakernel sync / memory primitives
 def ldg4(a):
