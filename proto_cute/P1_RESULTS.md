@@ -49,3 +49,14 @@ Conclusions that follow from the profile:
 - **The compile cache key ignores the linear-kernel choice**: a cached AOT graph from the Marlin run was loaded into the CuTe run and crashed with `KeyError: 'weight_zero_point'`. Use a separate `VLLM_CACHE_ROOT` per kernel config (or fix the hash).
 - The kernel must be a registered torch custom op (done: `torch.ops.vllm.cute_w4a16_linear` with fake impl) and all CuTe compiles and host-to-device copies must happen at load time, not inside CUDA graph capture (two crashes).
 - A single `MPLinearKernel` class has to serve decode and prefill (one weight layout fits in memory), so a real prefill path (dequant kernel + cuBLAS) is mandatory; the spike's torch dequant makes TTFT 10x worse.
+
+## Go / no-go
+
+| Route | Single-user speed (code) | Adds a model by | Verdict |
+|---|---|---|---|
+| Stock vLLM 0.30 / 0.33 | ~98-102 tok/s (0.5x engine) | nothing (works) | baseline; cannot load with vision + MTP on 24 GB, 11k-token KV |
+| vLLM + CuTe GEMV plugin (this branch) | ~99-100 (parity with Marlin) | config | GO as the compat tier, but it is not where the speed is |
+| vLLM + plugin + int4 `lm_head` / restricted draft vocab + fused small ops | [INFERENCE] ~130 (60-65 % of engine; HyperQwen's 127 is the public data point) | config + 2-3 op modules | GO, next experiment (P2); this is the test of "can vLLM get close" |
+| This engine | 213 (181 chat) | new engine wiring per model | keep as the fast tier until P2 says otherwise |
+
+Decision rule for P2: build the `lm_head` adapter (int4 head + exact rescoring, 64k draft vocabulary for MTP drafts, as an `lm_head` quant method / logits processor) and re-run `p1_stream.py` and the nsys breakdown. If vLLM + plugin reaches >= 85 % of the engine at one user, retire the custom engine loop and keep only the ops library. If it stays near 60-70 %, keep two tiers sharing one CuTe ops library: engine = fast path for the one tuned model, plugin = everything else.
