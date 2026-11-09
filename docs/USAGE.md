@@ -54,7 +54,7 @@ client.chat.completions.create(model="swift", messages=[...], max_tokens=400,
                                extra_body={"chat_template_kwargs": {"enable_thinking": False}})
 ```
 
-The thinking text comes back in the field **`reasoning`** of the message (vLLM 0.30.0; read it from the raw JSON), not in `content`.
+The thinking text comes back in the field **`reasoning`** of the message (vLLM 0.32.0; read it from the raw JSON), not in `content`.
 
 `reasoning_effort` is accepted by the chat template of the checkpoint. The lengths below were measured on a stock vLLM server of the same model; the behaviour of the values was also checked on this server on 2026-11-04 (`none` gave 0
 reasoning tokens, `low`, `medium` and `xhigh` were accepted and reasoned, `high` returned HTTP 400), in both the native server and the Docker container:
@@ -207,8 +207,8 @@ Every stock `vllm serve` frontend flag works (`--host`, `--port`, `--api-key`, `
 
 Set `SWIFT_MODEL` (or pass `--model`) when the weights are not in `~/models/swift-1.5-int4`. With Docker these become `PROFILE`, `EXTRA_ARGS`, `MODEL_DIR` and `PORT` ([table](GETTING_STARTED.md#3a-docker)).
 
-**vLLM version.** The environment pins `vllm==0.30.0` (`pyproject.toml`, `uv.lock`). The engine-core client (`server/smk_core_client.py`) and the tool-schema hook (`server/tool_schema.py`, which wraps
-`vllm.renderers.hf.safe_apply_chat_template`) use vLLM internals of that version; other versions are untested (a newer one, 0.33.0, exists). Install from the lock file rather than upgrading vLLM by hand.
+**vLLM version.** The environment pins `vllm==0.32.0` (`pyproject.toml`, `uv.lock`). The engine-core client (`server/smk_core_client.py`) and the tool-schema hook (`server/tool_schema.py`, which wraps
+`vllm.renderers.hf.safe_apply_chat_template`) use vLLM internals of that version; other versions are untested (a newer one, 0.33.0, needs torch 2.14 and was only resolved, not run). Install from the lock file rather than upgrading vLLM by hand.
 
 ## Concurrent requests (`--max-num-seqs`)
 

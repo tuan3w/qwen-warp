@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- vLLM 0.30.0 to 0.32.0 (`torch` stays 2.13): the 24 open Dependabot advisories of `vllm` are fixed in 0.31.0 / 0.32.0 (request-controlled `mm_processor_kwargs` code execution and DoS, multimodal shared-memory `pickle.loads`, unvalidated token ids, unbounded chat-template rendering, open CORS by default, among others). Two `setuptools` advisories stay open: vLLM requires `setuptools<81` and the fixes are in 83.0 and 84.1.
+
+### Changed
+
+- The server patches the multimodal cache type at its new place (`vllm.multimodal.cache.factories._get_cache_type`) and sets `mm_device_do_normalize = False`: vLLM 0.32 passes raw uint8 pixels and normalises on the device by default, while the engine's ViT takes the normalised floats the frontend produced in 0.30 (with the default, images were misread: `tests/test_vision_server.py` 18 of 28 checks).
+
+### Fixed
+
+- `tests/test_batch_sched.py` (tier 0) failed since the server-prefill grouping of 0.9.0 (the fake engine had no `group_cap`); `tests/test_vision_logic.py` follows the new vLLM cache API.
+
 ## 0.9.0 - 2026-11-09
 
 ### Changed
