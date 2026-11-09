@@ -124,6 +124,7 @@ Without a GPU you can run `scripts/check_repo.sh`, `uv run tests/test_tool_schem
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | `nvcc: command not found` during `make setup` | CUDA toolkit missing or not on `PATH` | install CUDA 13.0, or `make setup CUDA_HOME=/path/to/cuda-13.0` |
+| `fatal error: cutlass/cutlass.h: No such file` while building `prefill_swiglu.cu` | `make -C engine` ran before `uv sync`: the CUTLASS headers come from the flashinfer wheel in `.venv` | run `make setup` (or `uv sync` first), or `make -C engine CUTLASS=/path/to/cutlass` |
 | The weights download fails with 401 or 403 | the licence is not accepted, or you are not logged in | accept it on the model page, then `uv run hf auth login` |
 | Server exits at start with `swift-mk: --max-model-len N ... needs about X MiB of GPU memory but only Y MiB are free` | the length does not fit the GPU memory that is free at start (a desktop, a browser or another job holds the rest) | use one of the lengths in the message, free VRAM (`nvidia-smi` shows other processes), or start with `--profile long`; see [memory and context](USAGE.md#memory-and-context). With Docker the container exits and its restart policy starts it again: `docker compose down`, then fix the flags |
 | Server dies with `swift-mk engine ran out of GPU memory` | another program took GPU memory between the check and the engine's allocation | free VRAM or pick a smaller `--max-model-len` from the table in the message |

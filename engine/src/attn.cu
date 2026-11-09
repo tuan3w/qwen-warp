@@ -304,6 +304,14 @@ __device__ __forceinline__ void mma_t(float (&c)[4], uint32_t a0, uint32_t a1, u
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
   }
 }
+// fp16-accumulate variant (GA102: the f16-accumulate tensor rate is twice the f32-accumulate rate): d = {(row r: cols 2j, 2j+1), (row r+8: cols 2j, 2j+1)}
+// as f16x2, i.e. the f32 accumulator elements {c0, c1}, {c2, c3}.
+__device__ __forceinline__ void mma_h(uint32_t (&d)[2], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ float2 h2f(uint32_t x) { return __half22float2(*reinterpret_cast<const __half2*>(&x)); }
 // fp8 e4m3 pair held as bytes [0, b0, 0, b1] -> fp16x2 holding (b0, b1)/256 (exact incl. subnormals: the e4m3 bias is 8 below fp16's, so the value is 2^-8 x the true one).
 __device__ __forceinline__ uint32_t e4m3x2_to_f16x2_div256(uint32_t x) { return (x & 0x80008000u) | ((x >> 1) & 0x3f803f80u); }
 // ---- int4 KV format (kvrot.cuh), per token and head: the row is Walsh-Hadamard rotated, 128 B of codes (2/byte, low nibble = even d, natural d order) in
@@ -843,6 +851,15 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
         t.v[sl][0] = w;
       }
     }
+    // L2 prefetch of this team's following tile (keys base + 16 KS ..): its register loads are issued one tile later and then hit L2 instead of DRAM.
+    // Warp h covers K / V rows 8 (h & 1) .. + 7, lane: row lane >> 2, 32-byte sector lane & 3; warp 0 also the two 64-byte meta runs (2 sectors each).
+    const int pb = base + KS * 16;
+    if (pb < kend) {
+      const size_t prow = (size_t)min(pb + 8 * (h & 1) + (lane >> 2), klast) * ROWB + (lane & 3) * 32;
+      asm volatile("prefetch.global.L2 [%0];\n" ::"l"(kbase + prow));
+      asm volatile("prefetch.global.L2 [%0];\n" ::"l"(vbase + prow));
+      if (h == 0 && lane < 4) asm volatile("prefetch.global.L2 [%0];\n" ::"l"(((lane & 1) ? vmeta : kmeta) + pb + 8 * (lane >> 1)));
+    }
   };
   // exact ring tile (DS = 2 only): fp16 rows of keys base .. base + 15 in the rotated basis, same lane layout as Tile
   struct RTile {
@@ -886,7 +903,14 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
       const int sidx = h * NSL + sl;
       const int b = sidx >> 2, u = sidx & 3;
       const uint16_t* qq = qp + b * 64 + j * 16 + 8 * (u >> 1) + 2 * (u & 1);
-      qs[((nt0 + nt) * NSTEP + sidx) * 32 + lane] = valid ? make_uint2((uint32_t)qq[0] | ((uint32_t)qq[4] << 16), (uint32_t)qq[1] | ((uint32_t)qq[5] << 16)) : make_uint2(0u, 0u);
+      // q / 16 (power-of-two scaling, exact in fp16 down to 2^-10): keeps the f16-accumulated partial scores of the QK mma far from the fp16 range limit
+      uint2 qv = make_uint2(0u, 0u);
+      if (valid) {
+        const __half2 lo = __hmul2(__halves2half2(__ushort_as_half(qq[0]), __ushort_as_half(qq[4])), __float2half2_rn(0.0625f));
+        const __half2 hi = __hmul2(__halves2half2(__ushort_as_half(qq[1]), __ushort_as_half(qq[5])), __float2half2_rn(0.0625f));
+        qv = make_uint2(*reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
+      }
+      qs[((nt0 + nt) * NSTEP + sidx) * 32 + lane] = qv;
     }
   }
   __syncwarp();
@@ -899,7 +923,8 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
       const int tc = min(c / GRP, T - 1);
       lim[nt][e] = min(pos0 + tc, kend - 1);
     }
-  const float scl = (1.f / 16.f) * LOG2E;
+  const float scl = LOG2E;                      // mma scores: the q fragments carry the 1/16 = 1/sqrt(HD)
+  const float scl_sink = (1.f / 16.f) * LOG2E;  // exact sink scores use the unscaled q of qbuf
   float acc[NT][NI][4];
 #pragma unroll
   for (int nt = 0; nt < NT; nt++)
@@ -909,28 +934,24 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
 #pragma unroll
   for (int nt = 0; nt < NT; nt++) { m_run[nt][0] = m_run[nt][1] = -INFINITY; l_run[nt][0] = l_run[nt][1] = 0.f; }
 
-  auto compute = [&](const auto& t, int base, int par, auto ring_tag) {
+  // ---- QK stage of a tile: S^T = K Q^T over this warp's half of d (K dequantised once, one f16-accumulate mma per n-tile and scale group), the scaled partial sums
+  //      go to the team's score exchange buffer `par`.  The main loop runs the QK stage of tile i+1 inside the softmax stage of tile i (after the team barrier and
+  //      the score loads of tile i), so the tensor / dequant work of one tile overlaps the shuffle / exp latency chains of the other.
+  auto qk = [&](const auto& t, int par, auto ring_tag) {
     constexpr bool RING = decltype(ring_tag)::value;  // true: t is an RTile (exact fp16 ring rows, no scales)
-    float ksc[2][2], vsc[2][GVN];  // [key row r / r+8][local scale group]: K groups 2 ((h NBB) >> 1) + gl (the 2 groups of this warp's K chunks), V groups GVN h + gl
+    float ksc[2][2];  // [key row r / r+8][local scale group]: K groups 2 ((h NBB) >> 1) + gl (the 2 groups of this warp's K chunks)
 #pragma unroll
-    for (int row = 0; row < 2; row++) {
+    for (int row = 0; row < 2; row++)
 #pragma unroll
       for (int gl = 0; gl < 2; gl++) {
         if constexpr (RING) ksc[row][gl] = 1.f;
         else ksc[row][gl] = kvrot::scale_dec((t.km[row] >> (8 * (2 * ((h * NBB) >> 1) + gl))) & 255u, kvrot::LOG2_KGAIN);
       }
-#pragma unroll
-      for (int gl = 0; gl < GVN; gl++) {
-        if constexpr (RING) vsc[row][gl] = 1.f;
-        else vsc[row][gl] = kvrot::scale_dec((t.vm[row] >> (8 * (h * GVN + gl))) & 255u, kvrot::LOG2_VGAIN);
-      }
-    }
-    // ---- S^T = K Q^T over this warp's half of d: K dequantised once, one mma per n-tile
-    float sg[NT][2][4];
+    uint32_t sg[NT][2][2];
 #pragma unroll
     for (int nt = 0; nt < NT; nt++)
 #pragma unroll
-      for (int gl = 0; gl < 2; gl++) sg[nt][gl][0] = sg[nt][gl][1] = sg[nt][gl][2] = sg[nt][gl][3] = 0.f;
+      for (int gl = 0; gl < 2; gl++) sg[nt][gl][0] = sg[nt][gl][1] = 0u;
 #pragma unroll
     for (int sl = 0; sl < NSL; sl++) {
       const int bb = sl >> 2, u = sl & 3, sidx = h * NSL + sl;
@@ -949,35 +970,60 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
         const uint2 q = qs[((nt0 + nt) * NSTEP + sidx) * 32 + lane];
-        mma_t<false, true>(sg[nt][u >> 1], a0, a1, a2, a3, q.x, q.y);
+        mma_h(sg[nt][u >> 1], a0, a1, a2, a3, q.x, q.y);
       }
     }
-    // ---- exchange the partial scores (scaled partial sums over this warp's K chunks) with the other warps of the team, then add them in a fixed order
     float* xw = xs + ((size_t)((team * 2 + par) * DS + h) * (NT * 4)) * 32 + lane;
-    const float* xr = xs + ((size_t)((team * 2 + par) * DS) * (NT * 4)) * 32 + lane;
 #pragma unroll
-    for (int nt = 0; nt < NT; nt++)
+    for (int nt = 0; nt < NT; nt++) {
+      const float2 s00 = h2f(sg[nt][0][0]), s01 = h2f(sg[nt][0][1]), s10 = h2f(sg[nt][1][0]), s11 = h2f(sg[nt][1][1]);
+      const float g0[4] = {s00.x, s00.y, s01.x, s01.y}, g1[4] = {s10.x, s10.y, s11.x, s11.y};
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         const int row = i >> 1;
-        xw[(nt * 4 + i) * 32] = sg[nt][0][i] * ksc[row][0] + sg[nt][1][i] * ksc[row][1];
+        xw[(nt * 4 + i) * 32] = g0[i] * ksc[row][0] + g1[i] * ksc[row][1];
       }
-    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + team), "r"(DS * 32) : "memory");
-
-    const bool sink_tile = !RING && base == 0;  // tile 0 of split 0: keys 0..NSINK-1 use the exact fp16 sink rows instead of the 4-bit codes
-    uint32_t pbg[NT][GVN][2];
-    float pk[NT][kvrot::NSINK][2];
+    }
+  };
+  // ---- softmax / PV stage of a tile whose QK stage wrote buffer `par`: team barrier, the team's partial scores added in a fixed order, then mid() (the next tile's
+  //      QK stage, or nothing), online softmax and O^T += V^T P^T.
+  // sink_tag: std::true_type only for tile 0 of split 0 (keys 0..NSINK-1 use the exact fp16 sink rows instead of the 4-bit codes).  A compile-time flag keeps the
+  // ordinary tiles free of branches, so the compiler can interleave the per-n-tile softmax chains.
+  auto smpv = [&](const auto& t, int base, int par, auto ring_tag, auto sink_tag, auto&& mid) {
+    constexpr bool RING = decltype(ring_tag)::value;
+    constexpr bool sink_tile = decltype(sink_tag)::value;
+    static_assert(!(RING && sink_tile), "the ring never holds the sink keys");
+    float vsc[2][GVN];  // [key row r / r+8][local scale group]: V groups GVN h + gl
 #pragma unroll
-    for (int nt = 0; nt < NT; nt++) {
-      float sc[4];
+    for (int row = 0; row < 2; row++)
+#pragma unroll
+      for (int gl = 0; gl < GVN; gl++) {
+        if constexpr (RING) vsc[row][gl] = 1.f;
+        else vsc[row][gl] = kvrot::scale_dec((t.vm[row] >> (8 * (h * GVN + gl))) & 255u, kvrot::LOG2_VGAIN);
+      }
+    const float* xr = xs + ((size_t)((team * 2 + par) * DS) * (NT * 4)) * 32 + lane;
+    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + team), "r"(DS * 32) : "memory");
+    float scs[NT][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++)
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         float x[DS];
 #pragma unroll
         for (int hh = 0; hh < DS; hh++) x[hh] = xr[(hh * (NT * 4) + nt * 4 + i) * 32];
-        if constexpr (DS == 2) sc[i] = (x[0] + x[1]) * scl;
-        else sc[i] = ((x[0] + x[1]) + (x[2] + x[3])) * scl;
+        if constexpr (DS == 2) scs[nt][i] = (x[0] + x[1]) * scl;
+        else scs[nt][i] = ((x[0] + x[1]) + (x[2] + x[3])) * scl;
       }
+
+    uint32_t pbg[NT][GVN][2];
+    float pk[NT][kvrot::NSINK][2];
+    float alv[NT][2];  // online-softmax rescale factors of this tile (1 when the running max did not grow)
+    float mxs[NT][2];  // this tile's column maxima
+    // first pass: exact sink scores, causal masks and the max shuffles of every n-tile; mid() follows in the same basic block (after the warp-convergence check of the
+    // first shuffle), so the scheduler can fill the shuffle / exp latency with the next tile's dequant and mma
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      float* sc = scs[nt];
       if (sink_tile) {
         // exact scores: lane (col = lane>>2, key = (lane&3) + 4m) computes q[col] . k_sink[key]; holder lanes (key r, columns 2j, 2j+1) fetch them by shuffle
         float dv[kvrot::NSINK / 4];
@@ -1011,7 +1057,7 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
             if ((r >> 2) == m) ex[e] = vsh;
           }
         }
-        if (r < kvrot::NSINK) { sc[0] = ex[0] * scl; sc[1] = ex[1] * scl; }
+        if (r < kvrot::NSINK) { sc[0] = ex[0] * scl_sink; sc[1] = ex[1] * scl_sink; }
       }
       int lim0 = lim[nt][0], lim1 = lim[nt][1];
       if constexpr (RING) {  // the ring is not clipped to the split's key range
@@ -1029,7 +1075,14 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o));
       }
-      const float mn0 = fmaxf(m_run[nt][0], mx0), mn1 = fmaxf(m_run[nt][1], mx1);
+      mxs[nt][0] = mx0;
+      mxs[nt][1] = mx1;
+    }
+    mid();
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      const float* sc = scs[nt];
+      const float mn0 = fmaxf(m_run[nt][0], mxs[nt][0]), mn1 = fmaxf(m_run[nt][1], mxs[nt][1]);
       const float off0 = (mn0 == -INFINITY) ? 0.f : mn0, off1 = (mn1 == -INFINITY) ? 0.f : mn1;
       const float al0 = exp2f(m_run[nt][0] - off0), al1 = exp2f(m_run[nt][1] - off1);
       m_run[nt][0] = mn0;
@@ -1044,10 +1097,8 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
           pk[nt][k][1] = __shfl_sync(0xffffffffu, p1, 4 * k + j);
         }
       }
-#pragma unroll
-      for (int i = 0; i < NI; i++) {
-        acc[nt][i][0] *= al0; acc[nt][i][1] *= al1; acc[nt][i][2] *= al0; acc[nt][i][3] *= al1;
-      }
+      alv[nt][0] = al0;
+      alv[nt][1] = al1;
       // fold the per-key, per-group V scale into P: (p_k * scale_kG) multiplies the integer codes of the d rows of group G
 #pragma unroll
       for (int gl = 0; gl < GVN; gl++) {
@@ -1055,6 +1106,19 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
         pbg[nt][gl][0] = movmatrix_t(pack16(zs ? 0.f : p0 * vsc[0][gl], zs ? 0.f : p1 * vsc[0][gl], true));
         pbg[nt][gl][1] = movmatrix_t(pack16(p2 * vsc[1][gl], p3 * vsc[1][gl], true));
       }
+    }
+    // rescale the running accumulators only when some column's max grew somewhere in the warp (after the first tiles it rarely does): skipping a multiply by
+    // exactly 1 leaves every value bit-identical, and one warp-uniform branch after the n-tile loop keeps the softmax chains interleaved
+    bool grow = false;
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) grow |= (alv[nt][0] != 1.f) | (alv[nt][1] != 1.f);
+    if (__any_sync(0xffffffffu, grow)) {
+#pragma unroll
+      for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+        for (int i = 0; i < NI; i++) {
+          acc[nt][i][0] *= alv[nt][0]; acc[nt][i][1] *= alv[nt][1]; acc[nt][i][2] *= alv[nt][0]; acc[nt][i][3] *= alv[nt][1];
+        }
     }
     // ---- O^T += V^T P^T : V dequantised once per instance g (global instance i = NI h + g: d rows 128 (i >> 3) + r*16 + 2 (i & 7), +1), one mma per n-tile
 #pragma unroll
@@ -1094,26 +1158,40 @@ __global__ void __launch_bounds__(32 * DS * KS * NG, 1)
       }
     }
   };
+  auto nomid = [] {};
+  auto compute = [&](const auto& t, int base, int par, auto ring_tag) {
+    qk(t, par, ring_tag);
+    smpv(t, base, par, ring_tag, std::false_type{}, nomid);
+  };
 
-  // ---- key loop: two tile buffers per warp, the next tile's loads are in flight while the current one is computed
+  // ---- key loop: two tile buffers per warp.  Tile i is in one buffer (its QK stage done), tile i+1 (loaded) in the other: smpv(i) runs qk(i+1) after its barrier,
+  //      then the freed buffer of tile i loads tile i+2.  The tile after a team's last one is a dummy (rows clamped to the split's last key, scores never read).
+  //      Exchange buffers: qk(i+1) writes buffer (i+1) & 1 after barrier i, which the partner warp passed only after reading tile i-1 from it.
   int par = 0;
   if (ks < ntiles) {
+    issue(tb, ks + KS);
+    qk(ta, par, std::false_type{});
     int it = ks;
-    while (it < ntiles) {
+    while (true) {
       const int it1 = it + KS;
-      if (it1 < ntiles) issue(tb, it1);
-      compute(ta, kstart + it * 16, par, std::false_type{});
+      auto mid_b = [&] { qk(tb, par ^ 1, std::false_type{}); };
+      if (kstart + it * 16 == 0) smpv(ta, kstart + it * 16, par, std::false_type{}, std::true_type{}, mid_b);
+      else smpv(ta, kstart + it * 16, par, std::false_type{}, std::false_type{}, mid_b);
       par ^= 1;
       if (it1 >= ntiles) break;
       const int it2 = it1 + KS;
-      if (it2 < ntiles) issue(ta, it2);
-      compute(tb, kstart + it1 * 16, par, std::false_type{});
+      issue(ta, it2);
+      auto mid_a = [&] { qk(ta, par ^ 1, std::false_type{}); };
+      smpv(tb, kstart + it1 * 16, par, std::false_type{}, std::false_type{}, mid_a);
       par ^= 1;
+      if (it2 >= ntiles) break;
+      issue(tb, it2 + KS);
       it = it2;
     }
   }
   // ---- exact ring: the RING_W / 16 tiles of fp16 rotated rows are spread over the (split, team) pairs of the whole grid (pair index s + nsplit ks) and
   //      processed as extra tiles of the same online softmax (the old reduce kernel did the ring by itself, one block per query column)
+  //      (after the main loop, par is the buffer of the dummy QK stage: the partner warp is done with it)
   for (int rt = s + nsplit * ks; rt < kvrot::RING_W / 16; rt += nsplit * KS) {
     RTile rtl;
     issue_ring(rtl, ctx + rt * 16);

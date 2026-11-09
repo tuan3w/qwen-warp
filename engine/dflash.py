@@ -25,6 +25,9 @@ class DfLayerW(C.Structure):
     _fields_ = [(n, C.c_void_p) for n in ("in_ln", "post_ln", "qkv_w", "qkv_s", "q_norm", "k_norm", "o_w", "o_s", "gu_w", "gu_s", "dn_w", "dn_s", "aconv_kp", "mconv_kp", "aconv_base", "mconv_base")]
 
 
+SMK_DF_KRING = 4096  # include/dflash.h: drafter K/V rows per head of the ring variant (smk_dflash_create_ring)
+
+
 class DfW(C.Structure):
     _fields_ = [("layers", DfLayerW * NL)] + [(n, C.c_void_p) for n in ("fc_w", "fc_s", "hidden_norm", "norm", "kv_w", "kv_s", "sel_hp", "pred_cb", "succ_cb", "inv_freq")] + \
                [("mask_id", C.c_int), ("rescore_r", C.c_int)]
@@ -34,6 +37,8 @@ def setup_df_api(lib):
     vp, ci = C.c_void_p, C.c_int
     lib.smk_dflash_create.argtypes = [vp, C.POINTER(DfW)]
     lib.smk_dflash_create.restype = vp
+    lib.smk_dflash_create_ring.argtypes = [vp, C.POINTER(DfW), ci]
+    lib.smk_dflash_create_ring.restype = vp
     lib.smk_dflash_destroy.argtypes = [vp]
     for n in ("reset", "start"):
         getattr(lib, f"smk_dflash_{n}").argtypes = [vp, vp]
@@ -54,6 +59,12 @@ def setup_df_api(lib):
     lib.smk_dflash_ctxd.restype = ci
     lib.smk_dflash_kv_ptr.argtypes = [vp, ci]
     lib.smk_dflash_kv_ptr.restype = vp
+    lib.smk_dflash_vocab_cap.argtypes = []
+    lib.smk_dflash_vocab_cap.restype = ci
+    lib.smk_dflash_vocab_init.argtypes = [vp]
+    lib.smk_dflash_vocab_init.restype = ci
+    lib.smk_dflash_set_vocab.argtypes = [vp, vp, ci, vp]
+    lib.smk_dflash_set_vocab.restype = ci
 
 
 class DfPack:
@@ -138,6 +149,8 @@ def make_dfw(P, mask_id=248070, rescore_r=32):
 
 class DflashEngine(SpecEngine):
     """SpecEngine (MTP k=3 path intact) + the DFlash2 drafter.  tmax must be 8."""
+
+    auto_dflash = False  # this class drives its own drafter (df_prefill / df_cycles)
 
     def __init__(self, dflash_path=DF_PATH, rescore_r=32, codebooks_host=False, mask_id=248070, **kw):
         retry = False

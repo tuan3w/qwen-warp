@@ -21,6 +21,7 @@ extern "C" {
 #define SMK_DF_DRAFTS 7
 #define SMK_DF_RING 4096
 #define SMK_DF_LOG 4096      // per-cycle log entries (ring)
+#define SMK_DF_KRING 4096    // drafter K/V rows kept per head by smk_dflash_create_ring (the attention window is 2048 + 8): longer contexts wrap (position % rows)
 #define SMK_DF_LOGW 18       // per entry: [0] a, [1..8] block (anchor, d1..d7), [9..16] verify argmax y0..y7, [17] position P of the anchor
 
 typedef struct smk_df_layer_w {
@@ -48,6 +49,7 @@ typedef struct smk_df_w {
 
 typedef struct smk_dflash smk_dflash;
 smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w);
+smk_dflash* smk_dflash_create_ring(smk_engine* e, const smk_df_w* w, int ring_rows);  // K/V cache of ring_rows rows per head (a ring once the context outgrows it)
 void smk_dflash_destroy(smk_dflash* s);
 // Zero the state, the output ring, the log and the drafter KV cache (call together with smk_engine_reset).
 cudaError_t smk_dflash_reset(smk_dflash* s, cudaStream_t st);
@@ -70,6 +72,11 @@ size_t smk_dflash_bytes(smk_dflash* s);
 int smk_dflash_ctxd(smk_dflash* s);
 // Device pointer of the drafter's K (which 0) / V (1) cache, bf16 [5][8][ctxd][128]: the host prefix cache copies the rows of the drafter's window with it (server/smk_runner.py).
 void* smk_dflash_kv_ptr(smk_dflash* s, int which);
+// Request vocabulary of the drafter head (greedy SpecEngine): vocab_init allocates the vocab_cap()-row int4 sub-table and switches the head to it (error: not enough free memory,
+// the full head stays); set_vocab(device int ids[n], ascending token ids, 1 <= n <= cap) gathers the rows of a request, before smk_dflash_start.
+int smk_dflash_vocab_cap(void);
+cudaError_t smk_dflash_vocab_init(smk_dflash* s);
+cudaError_t smk_dflash_set_vocab(smk_dflash* s, const int* ids, int n, cudaStream_t st);
 
 #ifdef __cplusplus
 }

@@ -5,6 +5,11 @@
 
 namespace smk {
 constexpr int NH8 = H / 8;  // uint4 chunks per hidden row = 640
+// KV cache format of the MTP layer (attn.h kv_dtype): 0 = bf16, 2 = the rotated 4-bit cache of the target layers (exact sink rows + exact recent ring).  The MTP attention only
+// shapes drafts (verification is exact), and the 4-bit cache streams a quarter of the bf16 bytes over the whole context on every draft step (+1.3% decode at 32k, measured), but
+// the exact sink / ring rows of the MTP layer are state outside the chunk format of the host prefix cache and are not in the prefix snapshots (server/smk_runner.py): a restored
+// lineage would draft from a stale ring.  Keep 0 until those are saved and restored (docs/IDEAS.md).
+constexpr int MTP_KV_DTYPE = 0;
 
 // MTP input row: dst = rmsnorm0(src; w) of one bf16 [5120] row (one block of NH8 threads, thread c owns chunk c; wsum = __shared__ float[32]).  Used for both halves of
 // cat = [ rmsnorm0(embed[tok]; pre_e) | rmsnorm0(hidden; pre_h) ].
@@ -65,7 +70,7 @@ struct smk_spec {
   int head_mode;
   int* ss;                // device state
   int* ring;              // device output ring
-  uint16_t *cat, *hr, *kvbuf;   // cat [8][10240], hr [8][5120] (post-norm MTP hidden of draft j+1), kv of the MTP layer (bf16)
+  uint16_t *cat, *hr, *kvbuf;   // cat [8][10240], hr [8][5120] (post-norm MTP hidden of draft j+1), kv of the MTP layer (MTP_KV_DTYPE layout, attn.h)
   float* lg;              // draft logits [1][max(nv, VOC)]
   int *pinned_ss, *pinned_ring;
   // K7 sampling state: device config, processed distributions of the verify rows / the draft proposals, top-k workspaces

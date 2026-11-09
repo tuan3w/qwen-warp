@@ -27,6 +27,8 @@ cudaError_t smk_headq_gemv(int kind, const void* wq, const void* sq, const void*
 // Select + rescore (steps 2 and 3).  N = 248320 (any N <= 2^24 with N % 4 == 0 works), K % 256 == 0, 1 <= R <= SMK_HEADQ_RMAX, T <= 16.
 // out_tok[t] (device int) = argmax token, out_val[t] (optional) its exact logit.
 cudaError_t smk_headq_select_rescore(float* logits, const void* w_bf16, const void* x, int N, int K, int T, int R, int* out_tok, float* out_val, void* ws, cudaStream_t st);
+// Same over a sub-vocabulary: logits rows are the tokens ids[0..N) (ascending token ids; candidates and out_tok are token ids; ids nullptr = the full vocabulary).
+cudaError_t smk_headq_select_rescore_ids(float* logits, const void* w_bf16, const void* x, int N, int K, int T, int R, int* out_tok, float* out_val, void* ws, cudaStream_t st, const int* ids);
 // Candidate ids of the last select_rescore: device int [16][SMK_HEADQ_RMAX] inside ws (row t, rank r; -1 = unused slot), exact logits float [16][SMK_HEADQ_RMAX].
 const int* smk_headq_ws_cand(const void* ws);
 const float* smk_headq_ws_exact(const void* ws);

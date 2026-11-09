@@ -23,25 +23,31 @@ constexpr int KV_N = NL * 2 * KVD;            // 10240
 constexpr int ATT_SMAX = 2056;                // window 2048 + 8 noise rows (keys per query <= 2055)
 constexpr int SEL_K = 16, SEL_RMAX = SMK_HEADQ_RMAX, SEL_D = 256;
 constexpr int DD_NNEW = 0, DD_BASE = 1, DD_N = 4;
+constexpr int SUB_CAP = 98304;                // rows of the drafter head's request vocabulary (smk_dflash_set_vocab)
 }  // namespace
 
 struct smk_dflash {
   smk_engine* e;
   smk_df_w w;
-  int ctxd;                      // drafter KV rows per head = ctx_max + 8
+  int ctxd;                      // drafter KV rows per head = min(ctx_max + 8, SMK_DF_KRING); a ring (position % ctxd) once the context outgrows it
   int* dd;                       // [DD_N] nnew, base
   int* ss;                       // spec_finish state
   int* ring;
   int* log;
   uint16_t *fcin, *th_raw, *th, *kvraw, *h, *xn, *xc, *kfin, *qb, *kb, *vb, *qn, *att, *oo, *act, *mlp, *hid, *kc, *vc;
-  float *dyn, *hp, *sel_un;
+  float *dyn, *hp, *sel_un, *attws;
   int *tmp_tok, *sel_id;
   int* hist;                     // token history by position (prompt + emitted), for the device-side n-gram lookup
   unsigned long long* lk;        // best n-gram match key (match length << 32 | end position), 0 = none
   int *pinned_ss, *pinned_ring;
   cudaGraphExec_t g_cycle = nullptr, g_verify = nullptr, g_stage = nullptr, g_ctx = nullptr, g_noise = nullptr, g_head = nullptr, g_start = nullptr;
+  cudaStream_t bst = nullptr, bside = nullptr;  // capture streams of the cycle graph's conditional drafter body (df_cycle) and its side branch
+  cudaEvent_t bev[2] = {nullptr, nullptr};
+  uint32_t* sub_w = nullptr;     // request vocabulary of the drafter head: int4 rows (repacked layout) of the tokens sub_ids, nullptr = full vocabulary
+  uint16_t* sub_s = nullptr;
+  int *sub_ids = nullptr, *sub_n = nullptr;
   int kp_cfg = 1;                // smk_bf16_gemv_f32_cfg configuration of the conv projections (env SMK_DF_KP_CFG)
-  int lookup = 0;                // device n-gram lookup over the token history overrides the drafts on a long exact match (env SMK_DF_LOOKUP=1; off by default: no measured gain outside degenerate repetition)
+  int lookup = 1;                // device n-gram lookup over the token history overrides the drafts on a long exact match or a shorter one that agrees with d1 (env SMK_DF_LOOKUP=0 disables)
   unsigned epoch = 0;
   size_t bytes = 0;
 };
@@ -173,10 +179,10 @@ __global__ void __launch_bounds__(128) k_qk_prep(const uint16_t* __restrict__ qb
     const int kh = hh - NQ;
     const float x = bf2f(kb[t * KVD + kh * HD + d]);
     const float o = head_norm_rope(x, bf2f(kn[d]), pos, invf, sh, red, d);
-    if (pos < ctxd) kc[((size_t)kh * ctxd + pos) * HD + d] = f2bf(o);
+    kc[((size_t)kh * ctxd + pos % ctxd) * HD + d] = f2bf(o);
   } else {
     const int vh = hh - NQ - NKV;
-    if (pos < ctxd) vc[((size_t)vh * ctxd + pos) * HD + d] = vb[t * KVD + vh * HD + d];
+    vc[((size_t)vh * ctxd + pos % ctxd) * HD + d] = vb[t * KVD + vh * HD + d];
   }
 }
 
@@ -195,33 +201,38 @@ __global__ void __launch_bounds__(128) k_ctx_kv(const uint16_t* __restrict__ kvr
   if (j < NKV) {
     const float x = bf2f(kvraw[t * KV_N + l * 2 * KVD + j * HD + d]);
     const float o = head_norm_rope(x, bf2f(cp.knorm[l][d]), pos, invf, sh, red, d);
-    if (pos < ctxd) kc[lay + ((size_t)j * ctxd + pos) * HD + d] = f2bf(o);
+    kc[lay + ((size_t)j * ctxd + pos % ctxd) * HD + d] = f2bf(o);
   } else {
     const int vh = j - NKV;
-    if (pos < ctxd) vc[lay + ((size_t)vh * ctxd + pos) * HD + d] = kvraw[t * KV_N + l * 2 * KVD + KVD + vh * HD + d];
+    vc[lay + ((size_t)vh * ctxd + pos % ctxd) * HD + d] = kvraw[t * KV_N + l * 2 * KVD + KVD + vh * HD + d];
   }
 }
 
 // Attention of the 8 noise rows over the cache rows [max(0, start - 2047), start + 8) (committed context ++ the noise rows' own K/V, written at start..start+7): non-causal,
-// |q_pos - k_pos| < 2048.  One block per query head (4 heads share a KV head), 8 query rows; fp32 scores / softmax in smem.
-// QK: a key per thread; PV: 8 key groups x 64 dim pairs (every thread keeps 8 rows x 2 dims, independent V loads in flight), reduced through smem.  grid 32, 512 threads, dynamic smem.
-constexpr int ATT_T = 512;
+// |q_pos - k_pos| < 2048.  Split over keys: block (query head h, split s) takes keys [s * chunk, (s + 1) * chunk) of the window (4 heads share a KV head), 8 query rows; fp32 scores /
+// softmax in smem, partial (max, sum, unnormalised P.V) -> ws; k_attn_combine merges the ATT_NS splits.  (One block per head left 50 of the 82 SMs idle: 159 us per layer at 32k.)
+// QK: a key per thread; PV: 4 key groups x 64 dim pairs (every thread keeps 8 rows x 2 dims), reduced through smem.  grid (32, ATT_NS), ATT_T threads, dynamic smem.
+constexpr int ATT_T = 256, ATT_NS = 8, ATT_CH = (ATT_SMAX + ATT_NS - 1) / ATT_NS;  // keys per split <= 257
+constexpr int ATT_WS = ATT_NS * (R8 * NQ * HD + 2 * R8 * NQ);                      // floats: P.V [ns][8][32][128], max / sum [ns][8][32]
+constexpr int ATT_SMEM = (8 * HD + 8 * ATT_CH > 4 * 8 * HD ? 8 * HD + 8 * ATT_CH : 4 * 8 * HD) * (int)sizeof(float);  // q + scores, or the PV group reduction
 __global__ void __launch_bounds__(ATT_T) k_attn(const uint16_t* __restrict__ qn, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc, const int* __restrict__ dd, int ctxd,
-                                                uint16_t* __restrict__ out) {
+                                                float* __restrict__ ws) {
   extern __shared__ float sm[];
   float* sq = sm;               // [8][128]
-  float* sc = sm + 8 * HD;      // [8][ATT_SMAX]
-  __shared__ float rsum[8];
-  const int h = blockIdx.x, kvh = h >> 2, tid = threadIdx.x;
+  float* sc = sm + 8 * HD;      // [8][ATT_CH]
+  __shared__ float rmax[8], rsum[8];
+  const int h = blockIdx.x, sp = blockIdx.y, kvh = h >> 2, tid = threadIdx.x;
   const int start = dd[DD_BASE] + dd[DD_NNEW];
-  const int lo0 = max(0, start - 2047), nk = start + R8 - lo0;
+  const int lo00 = max(0, start - 2047), nkt = start + R8 - lo00;
+  const int ch = (nkt + ATT_NS - 1) / ATT_NS;
+  const int lo0 = lo00 + sp * ch, nk = max(0, min(ch, nkt - sp * ch));
   for (int i = tid; i < 8 * HD; i += ATT_T) sq[i] = bf2f(qn[(i >> 7) * QD + h * HD + (i & 127)]);
   __syncthreads();
   const uint16_t* kbase = kc + (size_t)kvh * ctxd * HD;
   const float4* sq4 = (const float4*)sq;
   for (int j = tid; j < nk; j += ATT_T) {
     const int kpos = lo0 + j;
-    const uint4* kp = (const uint4*)(kbase + (size_t)kpos * HD);
+    const uint4* kp = (const uint4*)(kbase + (size_t)(kpos % ctxd) * HD);
     uint4 ku[16];
 #pragma unroll
     for (int c = 0; c < 16; c++) ku[c] = kp[c];
@@ -240,22 +251,23 @@ __global__ void __launch_bounds__(ATT_T) k_attn(const uint16_t* __restrict__ qn,
       }
     }
 #pragma unroll
-    for (int i = 0; i < 8; i++) sc[i * ATT_SMAX + j] = (start + i - kpos) < 2048 ? acc[i] * 0.08838834764831845f : -INFINITY;
+    for (int i = 0; i < 8; i++) sc[i * ATT_CH + j] = (start + i - kpos) < 2048 ? acc[i] * 0.08838834764831845f : -INFINITY;
   }
   __syncthreads();
-  if (tid < 256) {
-    const int w = tid >> 5, lane = tid & 31;  // warp = row
+  {
+    const int w = tid >> 5, lane = tid & 31;  // 8 warps = 8 rows
     float m = -INFINITY;
-    for (int j = lane; j < nk; j += 32) m = fmaxf(m, sc[w * ATT_SMAX + j]);
+    for (int j = lane; j < nk; j += 32) m = fmaxf(m, sc[w * ATT_CH + j]);
     m = warp_max(m);
+    const float mm = m == -INFINITY ? 0.f : m;  // a split without a visible key: every p = 0
     float s = 0.f;
     for (int j = lane; j < nk; j += 32) {
-      const float p = expf(sc[w * ATT_SMAX + j] - m);
-      sc[w * ATT_SMAX + j] = p;
+      const float p = expf(sc[w * ATT_CH + j] - mm);
+      sc[w * ATT_CH + j] = p;
       s += p;
     }
     s = warp_sum(s);
-    if (lane == 0) rsum[w] = 1.f / s;
+    if (lane == 0) { rmax[w] = m; rsum[w] = s; }
   }
   __syncthreads();
   const int g = tid >> 6, dp = tid & 63;
@@ -263,31 +275,58 @@ __global__ void __launch_bounds__(ATT_T) k_attn(const uint16_t* __restrict__ qn,
   float a[8][2];
 #pragma unroll
   for (int i = 0; i < 8; i++) a[i][0] = a[i][1] = 0.f;
-#pragma unroll 8
-  for (int j = g; j < nk; j += 8) {
-    const uint32_t v = vbase[(size_t)(lo0 + j) * (HD / 2)];
+#pragma unroll 4
+  for (int j = g; j < nk; j += 4) {
+    const uint32_t v = vbase[(size_t)((lo0 + j) % ctxd) * (HD / 2)];
     const float v0 = bflo(v), v1 = bfhi(v);
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-      const float p = sc[i * ATT_SMAX + j];
+      const float p = sc[i * ATT_CH + j];
       a[i][0] = fmaf(p, v0, a[i][0]);
       a[i][1] = fmaf(p, v1, a[i][1]);
     }
   }
-  __syncthreads();  // sc is dead: reuse it for the group reduction [8 groups][8 rows][128]
+  __syncthreads();  // sc is dead: reuse it for the group reduction [4 groups][8 rows][128] (sq + sc hold >= 8 * 128 + 8 * 257 floats)
+  float* red = sm;
 #pragma unroll
   for (int i = 0; i < 8; i++) {
-    sc[(g * 8 + i) * HD + 2 * dp] = a[i][0];
-    sc[(g * 8 + i) * HD + 2 * dp + 1] = a[i][1];
+    red[(g * 8 + i) * HD + 2 * dp] = a[i][0];
+    red[(g * 8 + i) * HD + 2 * dp + 1] = a[i][1];
   }
   __syncthreads();
+  float* wo = ws + (size_t)sp * R8 * NQ * HD;
+  float* wm = ws + (size_t)ATT_NS * R8 * NQ * HD + (size_t)sp * 2 * R8 * NQ;
 #pragma unroll
-  for (int e = 0; e < 2; e++) {
+  for (int e = 0; e < 4; e++) {
     const int idx = tid + ATT_T * e, i = idx >> 7, d = idx & 127;
     float s = 0.f;
 #pragma unroll
-    for (int gg = 0; gg < 8; gg++) s += sc[(gg * 8 + i) * HD + d];
-    out[i * QD + h * HD + d] = f2bf(s * rsum[i]);
+    for (int gg = 0; gg < 4; gg++) s += red[(gg * 8 + i) * HD + d];
+    wo[((size_t)i * NQ + h) * HD + d] = s;
+  }
+  if (tid < 8) { wm[tid * NQ + h] = rmax[tid]; wm[R8 * NQ + tid * NQ + h] = rsum[tid]; }
+}
+
+// merge the ATT_NS partial softmax blocks -> out [8][4096] bf16.  grid 32 (query heads), 256 threads.
+__global__ void __launch_bounds__(256) k_attn_combine(const float* __restrict__ ws, uint16_t* __restrict__ out) {
+  const int h = blockIdx.x, tid = threadIdx.x;
+  const float* wm = ws + (size_t)ATT_NS * R8 * NQ * HD;
+#pragma unroll
+  for (int e = 0; e < 4; e++) {
+    const int idx = tid + 256 * e, i = idx >> 7, d = idx & 127;
+    float M = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < ATT_NS; s++) M = fmaxf(M, wm[s * 2 * R8 * NQ + i * NQ + h]);
+    float num = 0.f, den = 0.f;
+#pragma unroll
+    for (int s = 0; s < ATT_NS; s++) {
+      const float m = wm[s * 2 * R8 * NQ + i * NQ + h];
+      if (m == -INFINITY) continue;
+      const float f = expf(m - M);
+      den = fmaf(wm[s * 2 * R8 * NQ + R8 * NQ + i * NQ + h], f, den);
+      num = fmaf(ws[((size_t)s * R8 * NQ + (size_t)i * NQ + h) * HD + d], f, num);
+    }
+    out[i * QD + h * HD + d] = f2bf(num / den);
   }
 }
 
@@ -401,7 +440,7 @@ __global__ void k_df_start(const int* ds, int* dd, int* hist) {
 }
 // n-gram lookup over the token history: the longest earlier occurrence (ties: the most recent) of the suffix ending at the anchor (position A = ds[DS_POS]).
 // Scan: every thread takes end positions e < A with hist[e] == hist[A], extends the match backwards (<= LK_NMAX) and the block max goes to lk with one atomicMax.
-constexpr int LK_NMAX = 64, LK_MINLEN = 16, LK_MINPER = 6, LK_BLK = 256, LK_GRID = 64;
+constexpr int LK_NMAX = 64, LK_MINLEN = 8, LK_MINPER = 6, LK_BLK = 256, LK_GRID = 64;
 __global__ void __launch_bounds__(LK_BLK) k_lookup_scan(const int* __restrict__ ds, const int* __restrict__ hist, unsigned long long* lk) {
   __shared__ unsigned long long red[LK_BLK / 32];
   const int A = ds[DS_POS], q = hist[A];
@@ -424,15 +463,58 @@ __global__ void __launch_bounds__(LK_BLK) k_lookup_scan(const int* __restrict__ 
     if (best) atomicMax(lk, best);
   }
 }
-// Override the selector's drafts d1.. with the tokens that followed the best match when it is long enough.  A match whose source ends before the
+// Override the selector's drafts d1.. with the tokens that followed the best match when the evidence is long enough: match length l plus the number m of leading drafts the
+// copy agrees with >= LK_MINLEN (m = 7: nothing to change).  A match whose source ends before the
 // 7 drafts are covered (period p = A - e < 7: the last l + p tokens are p-periodic) continues periodically (token A + j = token A + j - p, as an overlapping LZ copy)
 // and needs only LK_MINPER tokens: a repeating run of < 8 tokens is repeated >= 2 more times.  1 thread.
 __global__ void k_lookup_apply(int* ds, const int* __restrict__ hist, unsigned long long* lk) {
   const unsigned long long key = *lk;
   *lk = 0;
+  if (key == 0) return;
   const int l = (int)(key >> 32), e = (int)(key & 0xffffffffu), A = ds[DS_POS], p = A - e;
-  if (key == 0 || l < (p < SMK_DF_DRAFTS ? LK_MINPER : LK_MINLEN)) return;
+  int m = 0;
+  while (m < SMK_DF_DRAFTS && hist[e + 1 + m % p] == ds[DS_TOK + 1 + m]) m++;
+  if (m == SMK_DF_DRAFTS || (p < SMK_DF_DRAFTS ? l < LK_MINPER : l + m < LK_MINLEN)) return;
   for (int j = 1; j <= SMK_DF_DRAFTS; j++) ds[DS_TOK + j] = hist[e + 1 + (j - 1) % p];
+}
+// Before the drafter runs (cycle graph): a match that overrides the block whatever the drafts are (periodic: l >= LK_MINPER; else l >= LK_MINLEN, so l + m >= LK_MINLEN for any m)
+// is applied here and the conditional node of the drafter (noise block + head + selector) is switched off (value 0); otherwise the key stays in lk for k_lookup_apply after the
+// selector (value 1).  Same drafts as running the drafter and k_lookup_apply.  1 thread.
+__global__ void k_lookup_pre(int* ds, const int* __restrict__ hist, unsigned long long* lk, cudaGraphConditionalHandle hc) {
+  const unsigned long long key = *lk;
+  unsigned run = 1;
+  if (key != 0) {
+    const int l = (int)(key >> 32), e = (int)(key & 0xffffffffu), A = ds[DS_POS], p = A - e;
+    if (p < SMK_DF_DRAFTS ? l >= LK_MINPER : l >= LK_MINLEN) {
+      for (int j = 1; j <= SMK_DF_DRAFTS; j++) ds[DS_TOK + j] = hist[e + 1 + (j - 1) % p];
+      *lk = 0;
+      run = 0;
+    }
+  }
+  cudaGraphSetConditional(hc, run);
+}
+
+// Request vocabulary of the drafter head (smk_dflash_set_vocab): SUB_CAP rows gathered from the engine's int4 head (repacked W4 layout, pack.repack_w4: per (16-row tile,
+// 128-k group) a 1 KB unit of 16 rows x 64 B, row slot = half * 8 + g for row 16 tile + 8 half + g; scales bf16 [tile][kgroup][g][half]).  Row i of the sub-table = token
+// sub_ids[i] (ascending; rows >= sub_n repeat the last id and are masked by k_sub_pad).  grid (SUB_CAP / 16, H / 128), 256 threads (one 32-bit word each).
+__global__ void __launch_bounds__(256) k_sub_gather(const uint32_t* __restrict__ w, const uint16_t* __restrict__ sc, const int* __restrict__ ids, uint32_t* __restrict__ ow,
+                                                    uint16_t* __restrict__ os) {
+  constexpr int NKG = H / 128;
+  const int tile = blockIdx.x, kg = blockIdx.y, slot = threadIdx.x >> 4, wd = threadIdx.x & 15;
+  const int id = ids[tile * 16 + slot];
+  const int st = id >> 4, sslot = id & 15;
+  ow[((size_t)tile * NKG + kg) * 256 + slot * 16 + wd] = w[((size_t)st * NKG + kg) * 256 + sslot * 16 + wd];
+  if (wd == 0) os[(((size_t)tile * NKG + kg) * 8 + (slot & 7)) * 2 + (slot >> 3)] = sc[(((size_t)st * NKG + kg) * 8 + (id & 7)) * 2 + ((id >> 3) & 1)];
+}
+// logits rows [n, SUB_CAP) of the sub-table -> -inf.  grid (SUB_CAP / 256, T), 256 threads.
+__global__ void k_sub_pad(float* __restrict__ logits, const int* __restrict__ n) {
+  const int i = blockIdx.x * 256 + threadIdx.x;
+  if (i >= *n) logits[(size_t)blockIdx.y * SUB_CAP + i] = -INFINITY;
+}
+__global__ void k_sub_ids(const int* __restrict__ src, int n, int* __restrict__ ids, int* __restrict__ nd) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < SUB_CAP) ids[i] = src[i < n ? i : n - 1];
+  if (i == 0) *nd = n;
 }
 __global__ void k_df_set(int* dd, int n, int base) {
   dd[DD_NNEW] = n;
@@ -483,7 +565,8 @@ static cudaError_t df_noise(smk_dflash* s, cudaStream_t st) {
     eq.kind = SMK_EPI_SEGS; eq.end[0] = QD; eq.end[1] = QD + KVD; eq.end[2] = QKV_N; eq.out[0] = s->qb; eq.out[1] = s->kb; eq.out[2] = s->vb;
     DCK(smk_w4r_gemv(L.qkv_w, L.qkv_s, s->xc, QKV_N, H, R8, &eq, st));
     k_qk_prep<<<dim3(R8, NQ + 2 * NKV), 128, 0, st>>>(s->qb, s->kb, s->vb, (const uint16_t*)L.q_norm, (const uint16_t*)L.k_norm, W.inv_freq, s->dd, s->qn, s->kc + lay, s->vc + lay, s->ctxd);
-    k_attn<<<NQ, ATT_T, (R8 * HD + R8 * ATT_SMAX) * sizeof(float), st>>>(s->qn, s->kc + lay, s->vc + lay, s->dd, s->ctxd, s->att);
+    k_attn<<<dim3(NQ, ATT_NS), ATT_T, ATT_SMEM, st>>>(s->qn, s->kc + lay, s->vc + lay, s->dd, s->ctxd, s->attws);
+    k_attn_combine<<<NQ, 256, 0, st>>>(s->attws, s->att);
     DCK(gw4(L.o_w, L.o_s, s->att, H, QD, s->oo, st));
     k_conv_fin_rms<<<R8, NH, 0, st>>>(s->oo, s->kfin, (const uint16_t*)L.aconv_base, s->h, (const uint4*)L.post_ln, (uint4*)s->xn);
     DCK(smk_bf16_gemv_f32_cfg(L.mconv_kp, s->xn, KP_N, H, R8, s->dyn, s->kp_cfg, st));
@@ -497,22 +580,31 @@ static cudaError_t df_noise(smk_dflash* s, cudaStream_t st) {
   return cudaGetLastError();
 }
 
-// (3) head over rows 1..7 + selector -> ds[TOK + 1 ..]
-static cudaError_t df_head(smk_dflash* s, cudaStream_t st) {
+// (3) head over rows 1..7 + selector -> ds[TOK + 1 ..]; scan = 0: the conditional body of the cycle graph (k_lookup_scan ran before the drafter, lk holds its key; the side branch
+// forks to s->bside: e->side already belongs to the outer capture)
+static cudaError_t df_head(smk_dflash* s, cudaStream_t st, bool scan = true) {
   smk_engine* e = s->e;
   const smk_df_w& W = s->w;
   const uint16_t* x = s->hid + H;
   const int T = SMK_DF_DRAFTS;
-  DCK(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, x, VOC, H, T, e->logits, st));
-  DCK(cudaEventRecord(e->ev_fork, st));
-  DCK(cudaStreamWaitEvent(e->side, e->ev_fork, 0));
-  DCK(smk_bf16_gemv_f32(W.sel_hp, x, SEL_D, H, T, s->hp, e->side));  // selector projection: parallel branch, overlaps the select / rescore chain (latency bound, idle SMs)
-  DCK(cudaEventRecord(e->ev_join, e->side));
-  DCK(smk_headq_select_rescore(e->logits, e->w.lm_head, x, VOC, H, T, W.rescore_r, s->tmp_tok, nullptr, e->ws_hq, st));
-  DCK(cudaStreamWaitEvent(st, e->ev_join, 0));
+  cudaStream_t side = scan ? e->side : s->bside;
+  cudaEvent_t ev_fork = scan ? e->ev_fork : s->bev[0], ev_join = scan ? e->ev_join : s->bev[1];
+  if (s->sub_ids) {  // request vocabulary: int4 head rows of the gathered sub-table, padding rows -> -inf, candidates mapped back to token ids by the rescoring
+    DCK(smk_headq_gemv(e->w.head_q_kind, s->sub_w, s->sub_s, x, SUB_CAP, H, T, e->logits, st));
+    k_sub_pad<<<dim3(SUB_CAP / 256, T), 256, 0, st>>>(e->logits, s->sub_n);
+  } else {
+    DCK(smk_headq_gemv(e->w.head_q_kind, e->w.head_q, e->w.head_qs, x, VOC, H, T, e->logits, st));
+  }
+  DCK(cudaEventRecord(ev_fork, st));
+  DCK(cudaStreamWaitEvent(side, ev_fork, 0));
+  DCK(smk_bf16_gemv_f32(W.sel_hp, x, SEL_D, H, T, s->hp, side));  // selector projection: parallel branch, overlaps the select / rescore chain (latency bound, idle SMs)
+  DCK(cudaEventRecord(ev_join, side));
+  if (s->sub_ids) DCK(smk_headq_select_rescore_ids(e->logits, e->w.lm_head, x, SUB_CAP, H, T, W.rescore_r, s->tmp_tok, nullptr, e->ws_hq, st, s->sub_ids));
+  else DCK(smk_headq_select_rescore(e->logits, e->w.lm_head, x, VOC, H, T, W.rescore_r, s->tmp_tok, nullptr, e->ws_hq, st));
+  DCK(cudaStreamWaitEvent(st, ev_join, 0));
   k_select<<<1, 256, 0, st>>>(smk_headq_ws_cand(e->ws_hq), smk_headq_ws_exact(e->ws_hq), s->hp, (const uint16_t*)W.pred_cb, (const uint16_t*)W.succ_cb, e->ds, s->sel_id, s->sel_un, W.rescore_r, T);
   if (s->lookup) {
-    k_lookup_scan<<<LK_GRID, LK_BLK, 0, st>>>(e->ds, s->hist, s->lk);
+    if (scan) k_lookup_scan<<<LK_GRID, LK_BLK, 0, st>>>(e->ds, s->hist, s->lk);
     k_lookup_apply<<<1, 1, 0, st>>>(e->ds, s->hist, s->lk);
   }
   return cudaGetLastError();
@@ -531,6 +623,45 @@ static cudaError_t df_verify_accept(smk_dflash* s, cudaStream_t st) {
   return cudaGetLastError();
 }
 
+// One decode cycle: verify + accept, drafter context append, then (lookup on) the n-gram scan and k_lookup_pre decide on the device whether the drafter runs: its noise block +
+// head sit in a conditional graph node (captured on s->bst into the node's body), skipped when a long context copy overrides the block anyway (copy-heavy turns).
+static cudaError_t df_cycle(smk_dflash* s, cudaStream_t c) {
+  DCK(df_verify_accept(s, c));
+  DCK(df_ctx(s, c));
+  if (!s->lookup || !s->bst) {
+    DCK(df_noise(s, c));
+    return df_head(s, c);
+  }
+  smk_engine* e = s->e;
+  cudaStreamCaptureStatus cs;
+  cudaGraph_t g = nullptr;
+  const cudaGraphNode_t* deps = nullptr;
+  size_t nd = 0;
+  DCK(cudaStreamGetCaptureInfo(c, &cs, nullptr, &g, &deps, nullptr, &nd));
+  cudaGraphConditionalHandle hc;
+  DCK(cudaGraphConditionalHandleCreate(&hc, g, 1, cudaGraphCondAssignDefault));
+  k_lookup_scan<<<LK_GRID, LK_BLK, 0, c>>>(e->ds, s->hist, s->lk);
+  k_lookup_pre<<<1, 1, 0, c>>>(e->ds, s->hist, s->lk, hc);
+  DCK(cudaGetLastError());
+  DCK(cudaStreamGetCaptureInfo(c, &cs, nullptr, &g, &deps, nullptr, &nd));
+  cudaGraphNodeParams p = {};
+  p.type = cudaGraphNodeTypeConditional;
+  p.conditional.handle = hc;
+  p.conditional.type = cudaGraphCondTypeIf;
+  p.conditional.size = 1;
+  cudaGraphNode_t node;
+  DCK(cudaGraphAddNode(&node, g, deps, nullptr, nd, &p));
+  cudaGraph_t body = p.conditional.phGraph_out[0];
+  DCK(cudaStreamUpdateCaptureDependencies(c, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+  DCK(cudaStreamBeginCaptureToGraph(s->bst, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+  cudaError_t err = df_noise(s, s->bst);
+  if (err == cudaSuccess) err = df_head(s, s->bst, false);
+  cudaGraph_t outg = nullptr;
+  const cudaError_t err2 = cudaStreamEndCapture(s->bst, &outg);
+  DCK(err);
+  return err2;
+}
+
 static void drop_graphs(smk_dflash* s) {
   for (cudaGraphExec_t* g : {&s->g_cycle, &s->g_verify, &s->g_stage, &s->g_ctx, &s->g_noise, &s->g_head, &s->g_start}) if (*g) { cudaGraphExecDestroy(*g); *g = nullptr; }
 }
@@ -540,12 +671,12 @@ static void sync_epoch(smk_dflash* s) {
 
 extern "C" {
 
-smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) {
+static smk_dflash* df_create(smk_engine* e, const smk_df_w* w, int ring_rows) {
   if (e->tmax < R8 || e->w.head_q_kind != SMK_HEADQ_I4R || w->rescore_r < SEL_K || w->rescore_r > SEL_RMAX) return nullptr;
   smk_dflash* s = new smk_dflash();
   s->e = e;
   s->w = *w;
-  s->ctxd = e->ctx_max + R8;
+  s->ctxd = ring_rows > 0 && ring_rows < e->ctx_max + R8 ? ring_rows : e->ctx_max + R8;  // positional, or a ring (position % ctxd) of ring_rows rows (the window needs the last 2055)
   if (const char* kc_env = getenv("SMK_DF_KP_CFG")) s->kp_cfg = atoi(kc_env);
   if (const char* lk_env = getenv("SMK_DF_LOOKUP")) s->lookup = atoi(lk_env);
   const size_t b0 = e->bytes;
@@ -567,6 +698,7 @@ smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) {
   s->vb = (uint16_t*)B((size_t)R8 * KVD * 2);
   s->qn = (uint16_t*)B((size_t)R8 * QD * 2);
   s->att = (uint16_t*)B((size_t)R8 * QD * 2);
+  s->attws = (float*)B((size_t)ATT_WS * sizeof(float));
   s->oo = (uint16_t*)B((size_t)R8 * H * 2);
   s->act = (uint16_t*)B((size_t)R8 * I * 2);
   s->mlp = (uint16_t*)B((size_t)R8 * H * 2);
@@ -582,11 +714,21 @@ smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) {
   s->lk = (unsigned long long*)B(sizeof(unsigned long long), true);
   cudaMallocHost((void**)&s->pinned_ss, SS_N * sizeof(int));
   cudaMallocHost((void**)&s->pinned_ring, RING * sizeof(int));
-  if (cudaFuncSetAttribute(k_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)((R8 * HD + R8 * ATT_SMAX) * sizeof(float))) != cudaSuccess) e->failed = true;
+  const char* sk_env = getenv("SMK_DF_SKIP");  // 0: the cycle graph always runs the drafter (no conditional node)
+  if (!sk_env || atoi(sk_env) != 0) {
+    if (cudaStreamCreateWithFlags(&s->bst, cudaStreamNonBlocking) != cudaSuccess || cudaStreamCreateWithFlags(&s->bside, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&s->bev[0], cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&s->bev[1], cudaEventDisableTiming) != cudaSuccess)
+      e->failed = true;
+  }
+  if (cudaFuncSetAttribute(k_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, ATT_SMEM) != cudaSuccess) e->failed = true;
   s->bytes = e->bytes - b0;
   if (e->failed || cudaGetLastError() != cudaSuccess) { smk_dflash_destroy(s); return nullptr; }
   return s;
 }
+
+smk_dflash* smk_dflash_create(smk_engine* e, const smk_df_w* w) { return df_create(e, w, 0); }
+// ring_rows > 0: the drafter K/V cache keeps ring_rows rows per head and wraps (position % rows); only the greedy SpecEngine path (engine/spec.py) uses it, the server's DflashEngine saves and restores windows by absolute position
+smk_dflash* smk_dflash_create_ring(smk_engine* e, const smk_df_w* w, int ring_rows) { return df_create(e, w, ring_rows); }
 
 void smk_dflash_destroy(smk_dflash* s) {
   if (!s) return;
@@ -594,7 +736,39 @@ void smk_dflash_destroy(smk_dflash* s) {
   drop_graphs(s);
   if (s->pinned_ss) cudaFreeHost(s->pinned_ss);
   if (s->pinned_ring) cudaFreeHost(s->pinned_ring);
+  if (s->bst) cudaStreamDestroy(s->bst);
+  if (s->bside) cudaStreamDestroy(s->bside);
+  for (cudaEvent_t ev : s->bev) if (ev) cudaEventDestroy(ev);
   delete s;  // device buffers belong to the engine's allocation list
+}
+
+// Request vocabulary of the drafter head: smk_dflash_vocab_init allocates the SUB_CAP-row sub-table (~255 MB) and switches the head to it (graphs recaptured); every request then
+// calls smk_dflash_set_vocab with its token set (device int ids[n], ascending, n <= SUB_CAP) before smk_dflash_start.
+int smk_dflash_vocab_cap(void) { return SUB_CAP; }
+
+cudaError_t smk_dflash_vocab_init(smk_dflash* s) {
+  if (s->sub_ids) return cudaSuccess;
+  smk_engine* e = s->e;
+  const size_t need = (size_t)SUB_CAP * (H / 2 + (H / 128) * 2 + sizeof(int)) + sizeof(int);
+  size_t fr = 0, tot = 0;
+  if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < need + ((size_t)768 << 20)) return cudaErrorMemoryAllocation;  // keep headroom: the sub-table is only a speedup
+  const size_t b0 = e->bytes;
+  uint32_t* w = (uint32_t*)dalloc(e, (size_t)SUB_CAP * (H / 2));
+  uint16_t* sc = (uint16_t*)dalloc(e, (size_t)SUB_CAP * (H / 128) * 2);
+  int* ids = (int*)dalloc(e, (size_t)SUB_CAP * sizeof(int), true);
+  int* n = (int*)dalloc(e, sizeof(int), true);
+  if (e->failed || !w || !sc || !ids || !n) return cudaErrorMemoryAllocation;
+  s->bytes += e->bytes - b0;
+  drop_graphs(s);
+  s->sub_w = w; s->sub_s = sc; s->sub_ids = ids; s->sub_n = n;
+  return cudaSuccess;
+}
+
+cudaError_t smk_dflash_set_vocab(smk_dflash* s, const int* ids, int n, cudaStream_t st) {
+  if (!s->sub_ids || n < 1 || n > SUB_CAP) return cudaErrorInvalidValue;
+  k_sub_ids<<<SUB_CAP / 256, 256, 0, st>>>(ids, n, s->sub_ids, s->sub_n);
+  k_sub_gather<<<dim3(SUB_CAP / 16, H / 128), 256, 0, st>>>((const uint32_t*)s->e->w.head_q, (const uint16_t*)s->e->w.head_qs, s->sub_ids, s->sub_w, s->sub_s);
+  return cudaGetLastError();
 }
 
 cudaError_t smk_dflash_reset(smk_dflash* s, cudaStream_t st) {
@@ -611,7 +785,7 @@ cudaError_t smk_dflash_reset(smk_dflash* s, cudaStream_t st) {
 }
 
 cudaError_t smk_dflash_prefill_chunk(smk_dflash* s, int T, int pos0, cudaStream_t st) {
-  if (T < 1 || T > R8 || pos0 + T > s->ctxd) return cudaErrorInvalidValue;
+  if (T < 1 || T > R8 || pos0 + T > s->e->ctx_max + R8) return cudaErrorInvalidValue;
   k_df_set<<<1, 1, 0, st>>>(s->dd, T, pos0);
   DCK(cudaGetLastError());
   return df_ctx(s, st);
@@ -636,7 +810,7 @@ cudaError_t smk_dflash_launch(smk_dflash* s, int which, int n, cudaStream_t st) 
   smk_engine* e = s->e;
   for (int i = 0; i < n; i++) {
     switch (which) {
-      case 0: DCK(smk_graph_launch(e, &s->g_cycle, [&](cudaStream_t c) { DCK(df_verify_accept(s, c)); return df_stage(s, c); }, st)); break;
+      case 0: DCK(smk_graph_launch(e, &s->g_cycle, [&](cudaStream_t c) { return df_cycle(s, c); }, st)); break;
       case 1: DCK(smk_graph_launch(e, &s->g_verify, [&](cudaStream_t c) { return df_verify_accept(s, c); }, st)); break;
       case 2: DCK(smk_graph_launch(e, &s->g_stage, [&](cudaStream_t c) { return df_stage(s, c); }, st)); break;
       case 3: DCK(smk_graph_launch(e, &s->g_ctx, [&](cudaStream_t c) { return df_ctx(s, c); }, st)); break;

@@ -4,7 +4,7 @@
 //   * DeltaNet: causal conv1d(k=4)+SiLU with the engine's 3-token conv state, gate/beta, gated RMSNorm (same maths as src/deltanet.cu),
 //   * attention: per-head q/k RMSNorm + partial rope (fp64 angle, as src/attn.cu), KV-cache write (bf16 or fp8 e4m3 with the checkpoint scales)
 //     into the engine layout, token-major bf16 K/V for flash-attn, history gather (cache -> bf16), * sigmoid(gate),
-//   * SiLU*mul on the interleaved gate|up GEMM output, MTP input concat.
+//   * the de-interleaving gate|up dequant for the fused SwiGLU GEMM (src/prefill_swiglu.cu), MTP input concat.
 // Layouts: include/engine.h, include/attn.h, include/deltanet.h.  All launches are async on the given stream.
 #include <cuda_fp8.h>
 #include <math.h>
@@ -33,8 +33,10 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x));
 // ------------------------------------------------------------------------------------------------ W4 -> bf16
 // out[r][k] = (nibble - 8) * scale[row0 + r][k / 128] for r in [0, nrows).  One thread = 4 words = 32 columns.
 // RP = 1: repacked layout of smk_w4r_gemv (engine.h): word chunk (tile, kg, half, g, t), nibble j / j+4 = columns 2j / 2j+1, u32 scale pair per (tile, kg, g).
+// split > 0: gate|up rows interleaved per 8 (gate 8i.. = rows 16i.., up = rows 16i+8..) are written de-interleaved: gate i -> out row i, up i -> out row split + i.
 template <int RP>
-__global__ void __launch_bounds__(256) k_dequant(const uint4* __restrict__ w, const void* __restrict__ sv, uint4* __restrict__ out, int K, int row0, long long total) {
+__global__ void __launch_bounds__(256) k_dequant(const uint4* __restrict__ w, const void* __restrict__ sv, uint4* __restrict__ out, int K, int row0, long long total,
+                                                 long long split) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int cpr = K >> 5;  // 32-column chunks per row
@@ -53,7 +55,8 @@ __global__ void __launch_bounds__(256) k_dequant(const uint4* __restrict__ w, co
     sc = bf2f(((const uint16_t*)sv)[row * (K >> 7) + (c >> 2)]);
   }
   const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
-  uint4* dst = out + (size_t)r * (K >> 3) + (size_t)c * 4;
+  const long long orow = split ? ((r >> 4) << 3) + (r & 7) + ((r & 8) ? split : 0) : r;
+  uint4* dst = out + (size_t)orow * (K >> 3) + (size_t)c * 4;
 #pragma unroll
   for (int j = 0; j < 4; j++) {
     float v[8];
@@ -300,21 +303,6 @@ __global__ void k_attn_gate(const uint16_t* __restrict__ ao, const uint16_t* __r
 }
 
 // ------------------------------------------------------------------------------------------------ MLP / MTP
-// gu [R][2I] interleaved per 8 rows (gate 8i..8i+7 at cols 16i.., up at 16i+8..) -> act [R][I] = bf16(bf16(silu(gate)) * up).  One thread = 8 channels.
-__global__ void k_silu_mul(const uint4* __restrict__ gu, uint4* __restrict__ act, long long total) {
-  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const uint4 g = gu[2 * i], u = gu[2 * i + 1];
-  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, uw[4] = {u.x, u.y, u.z, u.w};
-  uint32_t o[4];
-#pragma unroll
-  for (int j = 0; j < 4; j++) {
-    const float s0 = bf16r(silu_f(bflo(gw[j]))), s1 = bf16r(silu_f(bfhi(gw[j])));
-    o[j] = pack_bf16x2(s0 * bflo(uw[j]), s1 * bfhi(uw[j]));
-  }
-  act[i] = make_uint4(o[0], o[1], o[2], o[3]);
-}
-
 constexpr int NH8 = H / 8;  // 640
 // cat[t] = [ rmsnorm0(embed[tok[t]]; wE) | rmsnorm0(hid[t]; wH) ]   grid (T, 2), NH8 threads  (same as mtp.cu k_mtp_prep)
 __global__ void __launch_bounds__(NH8) k_mtp_cat(const uint4* __restrict__ embed, const int* __restrict__ tok, const uint4* __restrict__ hid, const uint4* __restrict__ wE,
@@ -422,13 +410,13 @@ cudaError_t smkp_head_finish(smk_engine* e, int pos, cudaStream_t st) {
   return cudaGetLastError();
 }
 
-// MTP layer KV cache (bf16 [2][4][ctx_max][256]) of a spec object: defined in mtp.cu.
+// MTP layer KV cache of a spec object (kv_dtype smk_spec_kv_dtype(), spec_impl.h MTP_KV_DTYPE): defined in mtp.cu.
 void* smk_spec_kv_ptr(smk_spec* s);
 
 cudaError_t smkp_dequant_w4(const void* w, const void* scale, void* out, int K, int row0, int nrows, cudaStream_t st) {
   if (K % 128 || nrows < 1) return cudaErrorInvalidValue;
   const long long total = (long long)nrows * (K >> 5);
-  k_dequant<0><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total);
+  k_dequant<0><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total, 0);
   return cudaGetLastError();
 }
 
@@ -436,7 +424,15 @@ cudaError_t smkp_dequant_w4(const void* w, const void* scale, void* out, int K, 
 cudaError_t smkp_dequant_w4r(const void* w, const void* scale, void* out, int K, int row0, int nrows, cudaStream_t st) {
   if (K % 128 || nrows < 1) return cudaErrorInvalidValue;
   const long long total = (long long)nrows * (K >> 5);
-  k_dequant<1><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total);
+  k_dequant<1><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, row0, total, 0);
+  return cudaGetLastError();
+}
+
+// gate|up weights (row0 = 0, nrows = 2 x I rows interleaved per 8) -> [gate rows | up rows] for smkp_swiglu_gemm
+cudaError_t smkp_dequant_w4r_gu(const void* w, const void* scale, void* out, int K, int nrows, cudaStream_t st) {
+  if (K % 128 || nrows < 16 || nrows % 16) return cudaErrorInvalidValue;
+  const long long total = (long long)nrows * (K >> 5);
+  k_dequant<1><<<cdiv(total, 256), 256, 0, st>>>((const uint4*)w, scale, (uint4*)out, K, 0, total, nrows / 2);
   return cudaGetLastError();
 }
 
@@ -488,12 +484,6 @@ cudaError_t smkp_gather_kv(const void* kv, int ctx_max, int kv_dtype, int npos, 
 
 cudaError_t smkp_attn_gate(const void* ao, const void* qproj, int ldq, void* y, int T, cudaStream_t st) {
   k_attn_gate<<<cdiv((long long)T * NHQ * 32, 256), 256, 0, st>>>((const uint16_t*)ao, (const uint16_t*)qproj, ldq, (uint16_t*)y, T);
-  return cudaGetLastError();
-}
-
-cudaError_t smkp_silu_mul(const void* gu, void* act, int R, cudaStream_t st) {
-  const long long total = (long long)R * (SMK_INTER / 8);
-  k_silu_mul<<<cdiv(total, 256), 256, 0, st>>>((const uint4*)gu, (uint4*)act, total);
   return cudaGetLastError();
 }
 

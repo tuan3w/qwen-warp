@@ -49,7 +49,10 @@ __device__ __forceinline__ float scale_of(uint32_t e) { return ex2f((float)((int
 // the attention logits (K) and the attention output (V).  Readers (split kernel, prefill gather) decode scale codes with these exponent offsets; the writer does NOT know them.
 constexpr float LOG2_KGAIN = 0.010779f;  // log2(1.0075) = log2(1 / 0.9926): shrink factor of the writer's quantiser measured on N(0,1) groups of 64 (notes.md); no eval text involved
 constexpr float LOG2_VGAIN = 0.010779f;
-__device__ __forceinline__ float scale_dec(uint32_t e, float log2gain) { return ex2f(fmaf((float)e, 1.f / E_RES, log2gain - (float)E_BIAS / E_RES)); }
+// (float)e via the 2^23 magic (LOP3 + FADD, exact for e < 2^23) instead of I2F, which shares the quarter-rate MUFU pipe with the readers' exp2
+__device__ __forceinline__ float scale_dec(uint32_t e, float log2gain) {
+  return ex2f(fmaf(__uint_as_float(0x4B000000u | e) - 8388608.f, 1.f / E_RES, log2gain - (float)E_BIAS / E_RES));
+}
 
 // in place y = H x / 16 over the 256 values held by a warp (x[i] = element lane + 32 i).  All 32 lanes must call.
 __device__ __forceinline__ void wht256(float (&x)[8], int lane) {

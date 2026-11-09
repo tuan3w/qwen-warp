@@ -255,7 +255,7 @@ cudaError_t batch_cycle(smk_batch* b, int B, int kv, int kd, int rs, cudaStream_
     smk_epi eq = {};
     eq.kind = SMK_EPI_SEGS; eq.end[0] = 12288; eq.end[1] = 13312; eq.end[2] = 14336; eq.out[0] = e->qb; eq.out[1] = e->kb; eq.out[2] = e->vb;
     CKB(smk_w4r_gemv(M.qkv_w, M.qkv_s, e->xn, 14336, H, rows, &eq, st));
-    CKB(swiftmk_attn_step_multi(B, Tq, e->qb, e->kb, e->vb, M.q_norm, M.k_norm, nullptr, &b->ptr_b[0].mtp_kv, 0, PP_STR, e->ctx_max, 0, 1.f, 1.f,
+    CKB(swiftmk_attn_step_multi(B, Tq, e->qb, e->kb, e->vb, M.q_norm, M.k_norm, nullptr, &b->ptr_b[0].mtp_kv, 0, PP_STR, e->ctx_max, MTP_KV_DTYPE, 1.f, 1.f,
                                 b->ss_b + SS_DPOS + j, SS_N, b->ds_b + DS_RDELTA, DS_N, e->y6, e->ws_attn, st));
     if (kd == 0) break;  // catch-up only: the MTP KV of the accepted rows is what later drafting needs
     smk_epi eo = {};

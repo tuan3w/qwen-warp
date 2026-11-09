@@ -43,6 +43,12 @@ Third-party projects: credits and what was taken
     bd6c5e2f11628483109031d99d1cc4a7d22b1a26, built 2026-10-04 (the project changes quickly).
     None of its patches, scripts or model files are included.
 
+  CUTLASS (NVIDIA, BSD-3-Clause): engine/src/dualgemm/ holds the DualGemm headers of CUTLASS's
+    examples/45_dual_gemm (CUTLASS 4.8), copied byte for byte (their licence headers are
+    intact; the SiLU*mul epilogue is our own, in engine/src/prefill_swiglu.cu, which uses them
+    for the fused gate|up GEMM of the prefill). The rest of CUTLASS is not
+    included: the build reads its headers from the flashinfer wheel of the locked environment.
+
   vLLM (Apache-2.0): used as a library and as the baseline. server/ drives vLLM's AsyncLLM and
     OpenAI frontend through an in-process engine-core client and a plugin; no vLLM file is
     modified or redistributed. engine/prefill.py calls vLLM's bundled FlashAttention-2
