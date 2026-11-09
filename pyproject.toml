@@ -11,7 +11,7 @@ dependencies = [
     "torch==2.13.0",
     "torchvision==0.28.0",
     "torchaudio==2.11.0",
-    "vllm==0.30.0",
+    "vllm==0.32.0",
     "flash-linear-attention==0.5.2",
     "transformers==5.18.0",
     "numpy==2.3.5",
