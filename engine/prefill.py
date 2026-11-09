@@ -544,18 +544,25 @@ class FastPrefill:
 
     GRP_RESERVE = 1536 << 20  # device bytes a group's scratch must leave free (fla / flash-attn temporaries, cuBLAS workspace, the decode graphs)
 
-    def _groups(self, segs):
-        """Split consecutive segments into layer-major groups of near-equal segment counts, each of <= grp_rows rows and small enough that the group's persistent rows (h, dn:
-        20 KiB per row) and its qkvz / o dequant buffers leave GRP_RESERVE of device memory free.  The grouping never changes the numerics (see _group)."""
-        if len(segs) < 2 or self.grp_rows <= self.seg:
-            return [[s] for s in segs]
+    def group_cap(self):
+        """Most rows a layer-major group may hold now: <= grp_rows and small enough that the group's persistent rows (h, dn: 20 KiB per row) and its qkvz / o dequant buffers
+        leave GRP_RESERVE of device memory free.  0 = no group (grouping off, or the memory is short): segments run one at a time.  The server's plan (Runner.plan_groups) and
+        _groups both size groups with it."""
+        if self.grp_rows <= self.seg:
+            return 0
         per_row, fixed = 2 * H * 2, (16384 + 6144) * H * 2
         box = getattr(self.e, "_fp_holder", self.e)
         old = getattr(box, "_fp_alloc", None)
         avail = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         if old:  # freed (and reallocated larger) by _scratch
             avail += sum(old[k].numel() * old[k].element_size() for k in ("h", "dn", "Wq", "Wo") if k in old)
-        cap = min(self.grp_rows, (avail - self.GRP_RESERVE - fixed) // per_row)
+        return max(0, min(self.grp_rows, int((avail - self.GRP_RESERVE - fixed) // per_row)))
+
+    def _groups(self, segs):
+        """Split consecutive segments into layer-major groups of near-equal segment counts, each of <= group_cap() rows.  The grouping never changes the numerics (see _group)."""
+        cap = self.group_cap() if len(segs) >= 2 else 0
+        if not cap:
+            return [[s] for s in segs]
         rows = [len(s[0]) for s in segs]
         if cap < 2 * min(rows):
             return [[s] for s in segs]

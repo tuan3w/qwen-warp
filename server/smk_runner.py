@@ -446,7 +446,7 @@ class Runner:
     @staticmethod
     def plan_groups(ends, q, seg, min_fast, snap_at, enabled=True):
         """Group the plan segments [prev end, end) after position q into runs executed layer by layer (FastPrefill._group): consecutive segments while their total rows stay <= seg (the
-        scratch of one segment), a group ends at every snapshot position (the DeltaNet state must be exact there) and a segment of fewer than min_fast rows (the decode-step path) is
+        row cap of a group: FastPrefill.group_cap(), at least the scratch of one segment), a group ends at every snapshot position (the DeltaNet state must be exact there) and a segment of fewer than min_fast rows (the decode-step path) is
         alone.  enabled=False: one segment per group (the previous behaviour).  Returns a list of lists of (start, end)."""
         groups, cur, rows, i = [], [], 0, q
         for j in (x for x in ends if x > q):
@@ -495,7 +495,9 @@ class Runner:
         if sys_at is not None and sys_at > q:
             snap_at.add(sys_at)
         i = q
-        for g in self.plan_groups(ends, q, fp.seg, fp.min_fast, snap_at, self.group_prefill):
+        cap = fp.group_cap() if self.group_prefill else 0  # rows per layer-major group: as many as the free memory allows (a single-turn 32k prompt becomes one group of 4,096-row segments); 0 = none
+        grouped = cap >= fp.seg
+        for g in self.plan_groups(ends, q, cap if grouped else fp.seg, fp.min_fast, snap_at, grouped):
             if cancelled():
                 self.lineage = key[:i]
                 return False
