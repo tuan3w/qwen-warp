@@ -1,6 +1,6 @@
 [project]
 name = "qwen-warp"
-version = "0.8.0"
+version = "0.9.0"
 description = "Single-stream CUDA decode engine + OpenAI server for Swift-1.5-Qwen3.8-27B INT4 on one RTX 3090, with a 4-bit KV cache for 262k-token contexts"
 readme = "README.md"
 license = { file = "LICENSE" }
