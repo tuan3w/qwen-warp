@@ -90,17 +90,12 @@ def test_parse():
     check("feature without data (a frontend cache that is not processor-only) -> error", r[0] == "error", r[1])
     # install(): the frontend's multimodal cache is the processor-only one (an "lru" sender / receiver pair drifts when the frontend refuses a processed image request)
     import smk_core_client as sc
-    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.multimodal.cache import factories
 
     sc.install()
-    vc = SimpleNamespace(model_config=SimpleNamespace(get_multimodal_config=lambda: SimpleNamespace(mm_processor_cache_gb=4, mm_processor_cache_type="lru")),
+    vc = SimpleNamespace(model_config=SimpleNamespace(supports_multimodal_inputs=True, get_multimodal_config=lambda: SimpleNamespace(mm_processor_cache_gb=4, mm_processor_cache_type="lru")),
                          parallel_config=SimpleNamespace(_api_process_count=1, data_parallel_size=1, data_parallel_external_lb=False))
-    real = MULTIMODAL_REGISTRY.supports_multimodal_inputs
-    MULTIMODAL_REGISTRY.supports_multimodal_inputs = lambda mc: True
-    try:
-        kinds = MULTIMODAL_REGISTRY._get_cache_type(vc), MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(vc)
-    finally:
-        MULTIMODAL_REGISTRY.supports_multimodal_inputs = real
+    kinds = factories._get_cache_type(vc), factories.engine_receiver_cache_from_config(vc)
     check("install(): an lru processor cache becomes processor-only, no engine receiver cache", kinds == ("processor_only", None), str(kinds))
 
 

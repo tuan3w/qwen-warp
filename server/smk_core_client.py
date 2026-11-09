@@ -579,16 +579,16 @@ def install(**options):
     # The engine runs in the frontend's process, so the processed images need no second cache: vLLM's "lru" pair (the frontend keeps metadata and sends data=None for an item it already
     # sent; the engine keeps the data) drifts when the frontend refuses a request AFTER processing its image (a prompt over --max-model-len): the image counts as sent, never reaches the
     # engine, and every later request with it failed (HTTP 500).  The processor-only cache keeps the processed items in the frontend and always sends the data.
-    from vllm.multimodal.registry import MultiModalRegistry
+    from vllm.multimodal.cache import factories as mm_cache_factories
 
-    cache_type = MultiModalRegistry._get_cache_type
+    cache_type = mm_cache_factories._get_cache_type
     if not getattr(cache_type, "swift_mk", False):
-        def _get_cache_type(self, vllm_config):
-            t = cache_type(self, vllm_config)
+        def _get_cache_type(vllm_config):
+            t = cache_type(vllm_config)
             return "processor_only" if t == "lru" else t
 
         _get_cache_type.swift_mk = True
-        MultiModalRegistry._get_cache_type = _get_cache_type
+        mm_cache_factories._get_cache_type = _get_cache_type  # the factories of that module look it up as a global
     # vLLM refuses min_p and logit_bias whenever a speculative config is set (SamplingParams._validate_spec_decode): a limit of ITS rejection sampler, which applies neither to the verify rows
     # (v1/sample/rejection_sampler.py apply_logits_processors).  This engine's cycle applies every supported processor to every verify row, exactly (engine/src/proc.h), so the check goes.
     SamplingParams._validate_spec_decode = lambda self, speculative_config: None

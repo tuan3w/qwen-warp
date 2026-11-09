@@ -77,6 +77,9 @@ class FakeFP:
         self.layer_hook = None
         self.tap = None
 
+    def group_cap(self):
+        return self.seg  # groups of at most one segment's rows (the fake has no memory to size them by)
+
     def _rows(self, ids_seg, pos0):
         e = self.e
         assert int(self.dn_state[0, 0, 1]) == pos0 == e.pos, f"slot {e.idx}: segment at {pos0}, state at {int(self.dn_state[0, 0, 1])}, engine at {e.pos}"

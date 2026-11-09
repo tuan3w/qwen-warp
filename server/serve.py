@@ -109,6 +109,9 @@ def parse_args(argv=None):
         args.num_speculative_tokens = 3
     if args.num_speculative_tokens:  # the engine reads k from the stock config; the draft model is the checkpoint's own MTP head
         args.speculative_config = {"method": "mtp", "num_speculative_tokens": args.num_speculative_tokens}
+    # vLLM >= 0.32 hands the model raw uint8 pixels and normalises on the device (mm_device_do_normalize, on by default); the engine's ViT (engine/vision.py) takes the frontend's
+    # rescaled and normalised floats, as vLLM 0.30 delivered them, so the frontend keeps normalising (a flag value of true would feed it 0..255 and the model would misread images).
+    args.mm_device_do_normalize = False
     return args
 
 
