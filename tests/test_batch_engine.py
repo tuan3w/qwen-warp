@@ -37,7 +37,7 @@ import smk_batch as SB  # noqa: E402
 from smk_runner import GenParams  # noqa: E402
 
 CACHE = Path(os.path.expanduser("~/.cache/qwen-warp/batch_solo"))
-SRC_HASH = hashlib.sha1(b"".join(p.read_bytes() for p in sorted([*(ROOT / "engine").glob("*.py"), *(ROOT / "engine" / "src").glob("*"), *(ROOT / "engine" / "include").glob("*.h"),
+SRC_HASH = hashlib.sha1(b"".join(p.read_bytes() for p in sorted([*(ROOT / "engine").glob("*.py"), *(f for f in (ROOT / "engine" / "src").rglob("*") if f.is_file()), *(ROOT / "engine" / "include").glob("*.h"),
                                                                   ROOT / "server" / "smk_runner.py", ROOT / "server" / "prefix_store.py"]))).hexdigest()[:16]
 EOS = 248046
 MSGS = ["Write a Python function that checks whether a string is a palindrome.", "Describe a rainy afternoon in a small library.", "What is 37 * 41? Show the steps.",

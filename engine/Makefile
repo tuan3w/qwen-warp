@@ -28,6 +28,12 @@ core: $(BUILD)/libswiftmk_core.so
 $(BUILD)/%.o: src/%.cu $(HDRS) | $(BUILD)
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
+# prefill_swiglu.cu: CUTLASS DualGemm (the example's headers are in src/dualgemm/); the CUTLASS include tree comes from the flashinfer wheel of the locked environment
+# (uv sync: ../.venv, /app/.venv in the image; CUTLASS 4.5), or CUTLASS=<a CUTLASS checkout> (tested with 4.8).
+CUTLASS ?= $(firstword $(wildcard $(CURDIR)/../.venv/lib/python3*/site-packages/flashinfer/data/cutlass))
+$(BUILD)/prefill_swiglu.o: NVFLAGS += -I$(CUTLASS)/include -Isrc
+$(BUILD)/prefill_swiglu.o: $(wildcard src/dualgemm/*.h src/dualgemm/*/*.h)
+
 $(BUILD)/libswiftmk.so: $(patsubst src/%.cu,$(BUILD)/%.o,$(SRCS))
 	$(NVCC) $(ARCH) -shared -o $@ $^ -lcudart
 

@@ -4,6 +4,7 @@
 Needs an RTX 3090 (sm_86; no other GPU has been tested).
 """
 import ctypes as C
+import os
 import time
 
 import torch
@@ -110,9 +111,18 @@ def setup_spec_api(lib):
 
 
 class SpecEngine(Engine):
+    # Opt-in (env SMK_DFLASH=1): greedy decode with the prompt-lookup cycles (cycles_pld) drafts with the DFlash2 block drafter (dflash.py, 7 drafts per T = 8 verify, device n-gram
+    # lookup overriding the block on a context match) when tmax = 8, the int4 head is on and the drafter weights exist (env DFLASH_W4); sampling keeps the MTP chain.  Off by default:
+    # it adds ~1.2 GiB + the drafter's KV ring and a device lm_head table, which the server's memory model (server/smk_core_client.py) does not count.
+    auto_dflash = True
+
     def __init__(self, ctx_max=4096, kv_fp8=0, quant="int4clip", head_quant="int4", head_mode=0, nv=None, verbose=True, **kw):
         if head_mode == 1:  # the MTP draft head is the full BF16 lm_head: it must stay on the GPU
             kw["host_tables"] = False
+        # host tables: keep the bf16 lm_head table on the device when the rest of the engine fits (Engine's free-memory check, else pinned host memory as before).  Every cycle
+        # rescores R candidates of 8 verify rows and of the drafter's 7 rows: ~0.2 ms per cycle of PCIe reads with a host table.
+        if self.auto_dflash and kw.get("tmax") == 8 and head_mode == 0 and os.environ.get("SMK_DFLASH", "0") == "1":
+            kw.setdefault("lm_head_host", False)
         super().__init__(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=verbose, **kw)
         setup_spec_api(self.lib)
         t0 = time.time()
@@ -141,13 +151,79 @@ class SpecEngine(Engine):
         self._emitted = 0
         self.sampling = False
         self.pld = False  # K11 hybrid draft (enable_pld)
+        self.dfa = None  # the auto DFlash2 drafter (smk_dflash*), None = MTP only
+        self._df_live = False  # this request's prefill fed the drafter: cycles_pld runs DFlash2 cycles
+        self._dfcap = None
+        if self.auto_dflash and self.tmax == 8 and head_mode == 0 and os.environ.get("SMK_DFLASH", "0") == "1":
+            self._df_init(verbose)
         torch.cuda.synchronize()
+
+    def _df_init(self, verbose):
+        import dflash  # imports this module: deferred
+
+        if getattr(self, "hq_kind", None) != 3 or not os.path.exists(os.path.join(dflash.DF_PATH, "model.safetensors")):  # 3 = HEADQ_I4R (the drafter's head)
+            return
+        dflash.setup_df_api(self.lib)
+        torch.cuda.empty_cache()
+        self._dfP = dflash.load_dflash(codebooks_host=True, verbose=verbose)  # codebooks: 16 row reads per draft, pinned host memory is enough
+        self._dfw = dflash.make_dfw(self._dfP)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        df = self.lib.smk_dflash_create_ring(self.h, C.byref(self._dfw), dflash.SMK_DF_KRING)
+        if not df:
+            del self._dfP, self._dfw
+            torch.cuda.empty_cache()
+            return
+        self.dfa = df
+        # Request vocabulary of the drafter head: the MTP draft vocabulary (68,864 frequent tokens) + every token of the prompt, gathered per request into a 98,304-row int4
+        # sub-table (head GEMV over 7 rows ~0.8 -> ~0.3 ms per drafter cycle).  The MTP vocabulary alone missed tokens of document text (book summary: 3.06 -> 2.82 tokens per
+        # cycle); a prompt's own tokens cover what a summary / rewrite copies.  env SMK_DF_VOCAB=0: full-vocabulary head.
+        self._df_vbase = None
+        if os.environ.get("SMK_DF_VOCAB", "1") == "1" and self.lib.smk_dflash_vocab_init(df) == 0:
+            base = torch.zeros(self.G.lm_head.shape[0], dtype=torch.bool, device="cuda")
+            base[self.M.ids_t.long()] = True
+            self._df_vbase = base
+            self._df_vcap = int(self.lib.smk_dflash_vocab_cap())
+            self._df_vsel = None
+
+    def df_wanted(self):
+        """The next request drafts with DFlash2 (greedy and the drafter is loaded)."""
+        return self.dfa is not None and not self.sampling
+
+    def df_tapcap(self):
+        """The drafter context capture of the fast prefill (the last 2048 prompt rows: the drafter's attention window)."""
+        if self._dfcap is None:
+            import dflash
+
+            self._dfcap = dflash.TapCapture(self, 2048)
+        return self._dfcap
+
+    def df_append(self, T, pos0):
+        """Append dbg rows 0..T-1 (T <= 8: taps of prompt rows pos0 ..) as drafter context (dflash.TapCapture.flush)."""
+        smk.check(self.lib.smk_dflash_prefill_chunk(self.dfa, T, pos0, self.st), "dflash_prefill_chunk")
+
+    def _df_begin(self, ids):
+        """After the prefill (taps of the prompt rows appended, the last row's taps in dbg row 0): request vocabulary, token history + first block d1..d7."""
+        if self._df_vbase is not None:
+            m = self._df_vbase.clone()
+            m[torch.tensor(list(ids), dtype=torch.long, device=m.device)] = True
+            sel = m.nonzero().view(-1).to(torch.int32)[: self._df_vcap].contiguous()  # ascending token ids (over the cap: the lowest ids)
+            torch.cuda.synchronize()
+            smk.check(self.lib.smk_dflash_set_vocab(self.dfa, sel.data_ptr(), sel.numel(), self.st), "dflash_set_vocab")
+            self._df_vsel = sel  # alive until the gather on self.st ran
+        hb = (C.c_int * len(ids))(*ids)
+        smk.check(self.lib.smk_dflash_set_hist(self.dfa, hb, len(ids), self.st), "dflash_set_hist")
+        smk.check(self.lib.smk_dflash_start(self.dfa, self.st), "dflash_start")
+        self._df_live = True
 
     # ---- state / prefill
     def reset(self):
         super().reset()
         smk.check(self.lib.smk_spec_reset(self.sp, self.st), "spec_reset")
         smk.check(self.lib.smk_spec_set_force(self.sp, None, 0, self.st), "set_force")
+        if self.dfa:
+            smk.check(self.lib.smk_dflash_reset(self.dfa, self.st), "dflash_reset")
+        self._df_live = False
         self._emitted = 0
 
     # ---- host prefix cache: rows [a, a + m) of the MTP layer's KV as a packed pinned chunk (include/attn.h)
@@ -174,10 +250,13 @@ class SpecEngine(Engine):
         start=False stops before the drafting stage (tests: snapshot the state, then smk_spec_start)."""
         ids = list(ids)
         n = len(ids) - 1
+        df = start and self.df_wanted()
         i = 0
         while i < n:
             T = min(chunk, n - i)
             self._step(ids[i : i + T], 2)
+            if df:  # drafter context: the taps of these rows (dbg rows 0..T-1)
+                smk.check(self.lib.smk_dflash_prefill_chunk(self.dfa, T, i, self.st), "dflash_prefill_chunk")
             nt = (C.c_int * T)(*ids[i + 1 : i + 1 + T])
             smk.check(self.lib.smk_spec_prefill_chunk(self.sp, T, nt, i, self.st), "spec_prefill_chunk")
             i += T
@@ -186,6 +265,8 @@ class SpecEngine(Engine):
             smk.check(self.lib.smk_spec_sample_first(self.sp, self.st), "spec_sample_first")
         if start:
             smk.check(self.lib.smk_spec_start(self.sp, k, self.st), "spec_start")
+            if df:
+                self._df_begin(ids)
         self._emitted = 0
         return self.read_out_tok()
 
@@ -250,13 +331,18 @@ class SpecEngine(Engine):
         self.pld = False
 
     def pld_begin(self, ctx_ids):
-        """After prefill_spec: ctx_ids = prompt ids + the first generated token (the anchor)."""
+        """After prefill_spec: ctx_ids = prompt ids + the first generated token (the anchor).  A DFlash2 request keeps its token history on the device (set by the prefill)."""
+        if self._df_live:
+            return
         arr = (C.c_int * len(ctx_ids))(*ctx_ids)
         smk.check(self.lib.smk_spec_pld_begin(self.sp, arr, len(ctx_ids), self.st), "pld_begin")
 
     def cycles_pld(self, n):
-        """n hybrid cycles (one host round trip each); same return as cycles()."""
-        smk.check(self.lib.smk_spec_run_pld(self.sp, n, self.st, self._ss, self._ring), "spec_run_pld")
+        """n hybrid cycles (one host round trip each); same return as cycles().  DFlash2 requests: n drafter cycles (verify T = 8), one sync."""
+        if self._df_live:
+            smk.check(self.lib.smk_dflash_run(self.dfa, n, self.st, self._ss, self._ring), "dflash_run")
+        else:
+            smk.check(self.lib.smk_spec_run_pld(self.sp, n, self.st, self._ss, self._ring), "spec_run_pld")
         outn = self._ss[12]
         assert outn - self._emitted <= RING, "output ring overrun"
         new = [self._ring[i % RING] for i in range(self._emitted, outn)]
@@ -264,7 +350,9 @@ class SpecEngine(Engine):
         return new, list(self._ss)
 
     def pld_stats(self):
-        """dict: cycles by verify rows T (k = T - 1), tail tokens proposed, cycles with a tail, host wait / work ns."""
+        """dict: cycles by verify rows T (k = T - 1), tail tokens proposed, cycles with a tail, host wait / work ns.  DFlash2 requests: every cycle verifies 8 rows."""
+        if self._df_live:
+            return dict(cycles_by_k={7: self._ss[13]}, tail_tokens=0, tail_cycles=0, wait_ns=0, work_ns=0, drafter="dflash2")
         out = (C.c_longlong * 16)()
         smk.check(self.lib.smk_spec_pld_stats(self.sp, out), "pld_stats")
         o = list(out)

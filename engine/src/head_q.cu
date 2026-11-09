@@ -238,12 +238,14 @@ __global__ void __launch_bounds__(512) k_rank(int R, int* __restrict__ cnt, cons
 }
 
 // stage 4: exact logits of the candidates (one warp per candidate: fp32 accumulate over exact bf16 products), written over logits[t][cand]; the last CTA of a row
-// takes the argmax over its candidates (value, then lowest index).  grid (ceil(R/4), T), 128 threads.
-__global__ void __launch_bounds__(128) k_rescore(const uint4* __restrict__ w, const uint4* __restrict__ x, int N, int R, float* __restrict__ logits, const int* __restrict__ cand,
-                                                 float* __restrict__ exact, int* __restrict__ done, int* __restrict__ out_tok, float* __restrict__ out_val) {
+// takes the argmax over its candidates (value, then lowest index).  ids != nullptr: the logits rows are a sub-vocabulary (row i = token ids[i], ids ascending): the candidates
+// are turned into token ids here (cand / out_tok hold token ids, logits stay indexed by row).  grid (ceil(R/4), T), 128 threads.
+__global__ void __launch_bounds__(128) k_rescore(const uint4* __restrict__ w, const uint4* __restrict__ x, int N, int R, float* __restrict__ logits, int* __restrict__ cand,
+                                                 float* __restrict__ exact, int* __restrict__ done, int* __restrict__ out_tok, float* __restrict__ out_val, const int* __restrict__ ids) {
   const int t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
   const int r = blockIdx.x * 4 + wp;
-  const int id = r < R ? cand[t * RMAX + r] : -1;
+  const int row = r < R ? cand[t * RMAX + r] : -1;
+  const int id = row >= 0 && ids ? ids[row] : row;
   float v = -INFINITY;
   if (id >= 0) {
     const uint4* wr = w + (size_t)id * (K_HID / 8);
@@ -265,7 +267,8 @@ __global__ void __launch_bounds__(128) k_rescore(const uint4* __restrict__ w, co
     v = warp_sum(a);
     if (lane == 0) {
       exact[t * RMAX + r] = v;
-      logits[(size_t)t * N + id] = v;
+      logits[(size_t)t * N + row] = v;
+      if (ids) cand[t * RMAX + r] = id;
     }
   }
   __syncthreads();
@@ -328,7 +331,7 @@ cudaError_t smk_headq_gemv(int kind, const void* wq, const void* sq, const void*
   return cudaErrorInvalidValue;
 }
 
-cudaError_t smk_headq_select_rescore(float* logits, const void* w_bf16, const void* x, int N, int K, int T, int R, int* out_tok, float* out_val, void* ws, cudaStream_t st) {
+cudaError_t smk_headq_select_rescore_ids(float* logits, const void* w_bf16, const void* x, int N, int K, int T, int R, int* out_tok, float* out_val, void* ws, cudaStream_t st, const int* ids) {
   if (T < 1 || T > ROWS || R < 1 || R > RMAX || (K & 255) || K != K_HID || (N & 3) || N > NCH_MAX * CHUNK || N < 128 * R) return cudaErrorInvalidValue;
   char* b = (char*)ws;
   const int nch = (N + CHUNK - 1) / CHUNK;
@@ -345,8 +348,12 @@ cudaError_t smk_headq_select_rescore(float* logits, const void* w_bf16, const vo
     rank_init = true;
   }
   k_rank<<<T, 512, CAP * sizeof(uint64_t), st>>>(R, cnt, list, cand);
-  k_rescore<<<dim3((R + 3) / 4, T), 128, 0, st>>>((const uint4*)w_bf16, (const uint4*)x, N, R, logits, cand, exact, cnt + ROWS, out_tok, out_val);
+  k_rescore<<<dim3((R + 3) / 4, T), 128, 0, st>>>((const uint4*)w_bf16, (const uint4*)x, N, R, logits, cand, exact, cnt + ROWS, out_tok, out_val, ids);
   return cudaGetLastError();
+}
+
+cudaError_t smk_headq_select_rescore(float* logits, const void* w_bf16, const void* x, int N, int K, int T, int R, int* out_tok, float* out_val, void* ws, cudaStream_t st) {
+  return smk_headq_select_rescore_ids(logits, w_bf16, x, N, K, T, R, out_tok, out_val, ws, st, nullptr);
 }
 
 }  // extern "C"

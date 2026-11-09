@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Decode at 32k context: the int4 attention kernel (`attn_split_i4_kernel`) has a branch-free inner loop (a compile-time sink-tile variant), accumulates Q.K in f16 (q pre-scaled by 1/16), rescales only when a column's maximum grew, overlaps the next tile's scoring with the current tile's softmax and prefetches into L2. 1.019x decode on three 32k prompts (cycle -1.7% to -2.0%), 1.011x on a held-out set; accuracy against an exact-KV reference unchanged (KL 0.994x). [Performance](docs/PERFORMANCE.md#3-speed).
+- Cold prefill: consecutive segments of every prompt run layer-major in groups (`FastPrefill._groups`: each layer's weights are dequantised once per group, up to 65,536 rows and only while 1.5 GiB of device memory stay free), and the MLP's gate|up GEMM and SiLU*mul are one CUTLASS DualGemm (`engine/src/prefill_swiglu.cu`, `k_silu_mul` and its 142 MB buffer are gone). 1.037x on 32k prompts, 1.030x on the held-out set; +644 MiB device memory in use after a 32k prefill. The build needs the CUTLASS headers: it reads them from the flashinfer wheel of the locked environment (`CUTLASS=` overrides). `engine/src/dualgemm/` holds the DualGemm headers of CUTLASS's `examples/45_dual_gemm` ([NOTICE](NOTICE)).
+
+### Added
+
+- `SMK_DFLASH=1` (experimental, engine level, off by default): a `SpecEngine` drafts greedy requests with the DFlash2 block drafter inside `cycles_pld`, with a 4,096-row drafter K/V ring (`smk_dflash_create_ring`), the device n-gram lookup overriding the block on long matches, the drafter skipped on copy steps, a device lm_head table and a per-request 98,304-token drafter vocabulary (`smk_headq_select_rescore_ids`). 1.054x decode on the 32k prompts and 1.043x on the held-out set (one run each); not wired into the server. [Architecture](docs/ARCHITECTURE.md#in-specengine-smk_dflash1-experimental-off-by-default).
+- `MTP_KV_DTYPE` (`engine/src/spec_impl.h`): the KV format of the MTP layer; the 4-bit format (2) gives +1.3% decode at 32k but is off (0) until its exact sink / ring rows are saved with the prefix snapshots ([Ideas](docs/IDEAS.md#the-4-bit-kv-cache-for-the-mtp-layer)).
+
+### Fixed
+
+- `tests/test_batch_engine.py` hashed `engine/src/*` and failed on a subdirectory.
+
 ## 0.8.0 - 2026-11-07
 
 ### Added

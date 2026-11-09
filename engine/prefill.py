@@ -7,12 +7,15 @@
 
 Design (numbers: docs/PERFORMANCE.md):
   * Per layer, W4 weights are dequantised ((nibble-8)*bf16 scale -> bf16, src/prefill.cu) into a 0.5 GB scratch and multiplied with the activations of a
-    whole segment (<= `seg` tokens) by cuBLAS (torch.mm, fp32 accumulate, bf16 out).  The MLP runs in row blocks of `rows` tokens (dequant once per layer).
+    whole segment (<= `seg` tokens) by cuBLAS (torch.mm, fp32 accumulate, bf16 out).  The MLP runs in row blocks of `rows` tokens (dequant once per layer); its
+    gate|up GEMM is fused with SiLU*mul (CUTLASS DualGemm, src/prefill_swiglu.cu: the 2 x I wide gate|up output never reaches DRAM).
   * DeltaNet layers: conv1d+SiLU kernel (src/prefill.cu, same maths as the decode kernel, 3-token conv state in/out of ring slot `cur`), then fla's chunked
     gated delta rule (`chunk_gated_delta_rule`, GVA 16 q/k heads -> 48 v heads, state_v_first = the engine's [V][K] layout) carries the fp32 state in/out of slot `cur`.
   * Attention layers: q/k RMSNorm + rope + KV-cache write (bf16 or fp8 e4m3 with the checkpoint scales) in the engine layout (src/prefill.cu), then
     FlashAttention-2 (vllm_flash_attn) over token-major bf16 K/V (segments after the first read the history back from the cache), * sigmoid(gate).
-  * Segments (> `seg` tokens): state carried exactly as across decode steps (DeltaNet state + conv state in slot cur, KV cache positions).
+  * Segments (> `seg` tokens): state carried exactly as across decode steps (DeltaNet state + conv state in slot cur, KV cache positions).  Consecutive segments run as
+    LAYER-MAJOR groups (_group, <= `grp_rows` rows): each layer's four weight matrices are dequantised once per group into their own scratch, then every segment of
+    the group runs the whole layer in order; only the residual h and the pending down_proj output dn are kept for all rows of the group (20 KiB per row).
   * MTP (SpecEngine): the final-norm hidden of every prompt position + the next prompt token go through the int4 MTP fc / K,V projections; K,V (k_norm + rope) are
     written positionally into the MTP KV cache, exactly what SpecEngine.prefill_spec's smk_spec_prefill_chunk loop does.
   * The last prompt token is run as a normal decode step (head=1): logits, first token, device scalars, and smk_spec_start work unchanged.
@@ -73,7 +76,8 @@ def setup_prefill_api(lib):
         "smkp_attn_prep": [ci, ci, vp, ci, vp, ci, vp, ci, vp, vp, vp, ci, ci, cf, cf, vp, vp, vp, vp, vp],
         "smkp_gather_kv": [vp, ci, ci, ci, cf, cf, vp, vp, vp],
         "smkp_attn_gate": [vp, vp, ci, vp, ci, vp],
-        "smkp_silu_mul": [vp, vp, ci, vp],
+        "smkp_dequant_w4r_gu": [vp, vp, vp, ci, ci, vp],
+        "smkp_swiglu_gemm": [vp, ci, vp, vp, vp, ci, ci, ci, vp],
         "smkp_mtp_cat": [vp, vp, vp, vp, vp, vp, ci, vp],
         "smkp_w4r_gemm": [vp, vp, vp, ci, ci, ci, C.POINTER(smk.Epi), vp],
         "smkp_dn_row": [vp, ci, vp, vp, vp, vp, vp, vp, vp, vp],
@@ -89,15 +93,18 @@ def setup_prefill_api(lib):
     lib.smkp_engine_ptr.restype = vp
     lib.smk_spec_kv_ptr.argtypes = [vp]
     lib.smk_spec_kv_ptr.restype = vp
+    lib.smk_spec_kv_dtype.argtypes = [vp]
+    lib.smk_spec_kv_dtype.restype = ci
 
 
 class FastPrefill:
     DS_RDELTA = 20  # engine_impl.h: the sequence's MRoPE rope offset (decode ropes at KV position + ds[DS_RDELTA]); the Runner sets it per request
 
-    def __init__(self, eng, seg=4096, rows=2048, min_fast=2, w4_max=240, fold=True):
+    def __init__(self, eng, seg=4096, rows=2048, min_fast=2, w4_max=240, fold=True, grp_rows=65536):
         self.e, self.lib = eng, eng.lib
         setup_prefill_api(self.lib)
         self.seg, self.rows = seg, rows
+        self.grp_rows = grp_rows  # memory bound of a layer-major group of segments (h + dn persist for every row of the group: 20 KiB per row); <= seg disables grouping
         self.min_fast = min_fast  # prompts with fewer prefill tokens than this use the engine's own prefill-by-decode
         self.fold = fold  # K10: the last prompt row rides in the final short batch (see _run)
         self.w4_max = w4_max  # segments of <= w4_max tokens run their GEMMs through the W4 mma kernel (src/prefill_w4.cu, 64-row chunks) instead of dequant + cuBLAS
@@ -108,6 +115,7 @@ class FastPrefill:
         self.layer_hook = None  # called with the segment's (group's) row count after every layer of a fast segment: the batched server decodes the other sequences there (a long prefill does not freeze them)
         self.mm = None  # image inputs of the prompt being prefilled (MMRows): MRoPE positions + ViT rows of the placeholder tokens; None = text (the v0.7.0 path, unchanged)
         self.snap_wait = None  # per-layer CUDA events of an asynchronous snapshot copy of the DeltaNet + conv state (server/smk_runner.py _snapshot): layer l's DeltaNet waits for event l before it writes
+        self._df_flush = None  # set by prefill_spec for a DFlash2 request: called by _run after the prompt rows, before the head step
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
         n_ds = lib.smkp_ds_n()  # engine_impl.h DS_N (a library older than the sources lacks the symbol: AttributeError); DS_PEND = 19 pending lazy DeltaNet rows
@@ -120,28 +128,32 @@ class FastPrefill:
         self.dn_conv = _view(lib.smkp_engine_ptr(e, 2), 48 * ncv * 10240 * 3 * 2, torch.bfloat16).view(48, ncv, 10240 * 3)
         self.kv_layer_bytes = lib.smkp_engine_ptr(e, 4)
         self.kv_base = lib.smkp_engine_ptr(e, 3)
-        self.mtp_kv = None
+        self.mtp_kv, self.mtp_kv_dtype = None, 0
         if hasattr(eng, "sp"):
             self.mtp_kv = lib.smk_spec_kv_ptr(eng.sp)
+            self.mtp_kv_dtype = lib.smk_spec_kv_dtype(eng.sp)  # attn.h kv_dtype of the MTP layer cache (spec_impl.h MTP_KV_DTYPE)
         self.dn_idx, self.at_idx = {}, {}
         for i, L in enumerate(eng.Ls):
             (self.dn_idx if L.kind == "linear" else self.at_idx)[i] = len(self.dn_idx if L.kind == "linear" else self.at_idx)
         self.prof = None  # dict name -> ms when profiling is on
 
     # ------------------------------------------------------------------------------------------------ scratch
-    def _scratch(self, S):
+    def _scratch(self, S, P=0):
+        """Scratch of a segment of S rows; P > 0: a layer-major group of P rows (h, dn hold every row of the group; separate dequant buffers for qkvz and o)."""
         box = getattr(self.e, "_fp_holder", self.e)  # shared by every FastPrefill of this engine (and of the batched decoder's sequence slots, engine/batch.py)
         old = getattr(box, "_fp_alloc", None)
-        if old and old["S"] >= S and old["R"] == self.rows:
+        if old and old["S"] >= S and old["P"] >= P and old["R"] == self.rows:
             return old
+        if old:
+            S, P = max(S, old["S"]), max(P, old["P"])
         box._fp_alloc = old = None
         torch.cuda.empty_cache()
         d, bf = "cuda", torch.bfloat16
         R = self.rows
-        a = dict(S=S, R=R)
-        a["h"] = torch.empty(S, H, dtype=bf, device=d)
+        a = dict(S=S, P=P, R=R)
+        a["h"] = torch.empty(max(S, P), H, dtype=bf, device=d)
         a["xn"] = torch.empty(S, H, dtype=bf, device=d)
-        a["dn"] = torch.empty(S, H, dtype=bf, device=d)
+        a["dn"] = torch.empty(max(S, P), H, dtype=bf, device=d)
         a["mix"] = torch.empty(S, H, dtype=bf, device=d)
         a["y6"] = torch.empty(S, 6144, dtype=bf, device=d)
         a["qkvz"] = torch.empty(S * 16384, dtype=bf, device=d)
@@ -149,10 +161,12 @@ class FastPrefill:
         a["ab"] = torch.empty(S, 96, dtype=bf, device=d)
         a["g"] = torch.empty(S, 48, dtype=torch.float32, device=d)
         a["beta"] = torch.empty(S, 48, dtype=torch.float32, device=d)
-        a["gu"] = torch.empty(R, 2 * I, dtype=bf, device=d)
         a["act"] = torch.empty(R, I, dtype=bf, device=d)
         a["W1"] = torch.empty(2 * I * H, dtype=bf, device=d)  # gate|up
         a["W2"] = torch.empty(H * I, dtype=bf, device=d)  # everything else (<= 5120 x 17408)
+        if P:
+            a["Wq"] = torch.empty(16384 * H, dtype=bf, device=d)  # group: qkv(z) weights
+            a["Wo"] = torch.empty(H * 6144, dtype=bf, device=d)  # group: o weights
         a["kall"] = torch.empty(self.ctx_max, 4, 256, dtype=bf, device=d)
         a["vall"] = torch.empty(self.ctx_max, 4, 256, dtype=bf, device=d)
         a["conv_prev"] = torch.empty(10240 * 3, dtype=bf, device=d)
@@ -189,6 +203,14 @@ class FastPrefill:
         with self._t("dequant"):
             smk.check(self.lib.smkp_dequant_w4r(w4.w.data_ptr(), w4.s.data_ptr(), wbuf.data_ptr(), K, row0, nrows, self.e.st), "dequant")
         return wbuf[: nrows * K].view(nrows, K)
+
+    def _deq_gu(self, w4, wbuf):
+        """gate|up weights (rows interleaved per 8) dequantized de-interleaved into wbuf: returns (Wg, Wu), each [I][K] (operands of smkp_swiglu_gemm)."""
+        N, K = w4.w.shape[0], w4.w.shape[1] * 8
+        with self._t("dequant"):
+            smk.check(self.lib.smkp_dequant_w4r_gu(w4.w.data_ptr(), w4.s.data_ptr(), wbuf.data_ptr(), K, N, self.e.st), "dequant_gu")
+        W = wbuf[: N * K].view(2, N // 2, K)
+        return W[0], W[1]
 
     def _mm(self, x, w, out):
         with self._t("gemm"):
@@ -287,23 +309,10 @@ class FastPrefill:
         self._w4mm(a["y6"][:T], L.o, a["W2"], a["mix"][:T])
 
     def _mlp(self, L, a, T):
-        lib, st = self.lib, self.e.st
-        xn, dn, gu, act = a["xn"], a["dn"], a["gu"], a["act"]
         if self._small:
-            for r0 in range(0, T, self.rows):
-                r1 = min(T, r0 + self.rows)
-                self._w4g(xn[r0:r1], L.gu, act[: r1 - r0], silu=True)
-                self._w4g(act[: r1 - r0], L.down, dn[r0:r1])
-            return
-        Wg = self._deq(L.gu, a["W1"])
-        Wd = self._deq(L.down, a["W2"])
-        for r0 in range(0, T, self.rows):
-            r1 = min(T, r0 + self.rows)
-            n = r1 - r0
-            self._mm(xn[r0:r1], Wg, gu[:n])
-            with self._t("silu"):
-                smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
-            self._mm(act[:n], Wd, dn[r0:r1])
+            self._mlp_seg(L, a, T, None, None)
+        else:
+            self._mlp_seg(L, a, T, self._deq_gu(L.gu, a["W1"]), self._deq(L.down, a["W2"]))
 
     def _tap(self, slot, row):
         """Test hook (taps=True): store the last row's residual into the engine's debug tap `slot` row 0 (what a T=1 head step would have written)."""
@@ -374,21 +383,20 @@ class FastPrefill:
 
     # ------------------------------------------------------------------------------------------------ layer-major group of segments
     def _group(self, segs, cur):
-        """Run several consecutive segments LAYER BY LAYER: every layer's weights are dequantized once for the whole group instead of once per segment (a segment of <= w4_max rows
-        needs no dequant, the W4 kernel reads the int4 weights).  segs: list of (ids_seg, pos0, nxt) with pos0 of segment k + len = pos0 of segment k + 1; no head / fold segment.
+        """Run several consecutive segments LAYER BY LAYER: every layer's four weight matrices are dequantized once for the whole group (into W1 / W2 / Wq / Wo) instead of once
+        per segment (a segment of <= w4_max rows needs no dequant, the W4 kernel reads the int4 weights), then each segment runs the whole layer.  segs: list of (ids_seg, pos0, nxt)
+        with pos0 of segment k + len = pos0 of segment k + 1; no head / fold segment.
         Bit-identical to calling _segment on each segment in turn: every segment runs the same kernels on the same row counts, and within a layer the segments run in order (a
-        segment's DeltaNet state and KV rows of this layer are written before the next segment reads them).  The group's rows share the scratch of one segment (sum of rows <= self.seg
-        or the largest segment); the per-layer scratch (qkvz, tmpA, W1, W2, ...) is reused segment after segment, only h / xn / dn / mix / y6 are per-segment slices."""
+        segment's DeltaNet state and KV rows of this layer are written before the next segment reads them).  Only the residual h and the pending down_proj output dn persist across
+        layers (slices of the group's P rows); every other buffer is one segment's transient scratch."""
         e, st = self.e, self.e.st
         Ts = [len(x[0]) for x in segs]
         total = sum(Ts)
-        a = self._scratch(max(self.seg, total))
+        a = self._scratch(max(self.seg, max(Ts)), total)
         views, r0 = [], 0
         for (ids_seg, pos0, nxt), T in zip(segs, Ts):
             av = dict(a)
-            for name in ("h", "xn", "dn", "mix", "y6", "tok"):
-                av[name] = a[name][r0 : r0 + T]
-            av["tok"].copy_(torch.tensor(ids_seg, dtype=torch.int32), non_blocking=False)
+            av["h"], av["dn"] = a["h"][r0 : r0 + T], a["dn"][r0 : r0 + T]
             av["cuq"] = torch.tensor([0, T], dtype=torch.int32, device="cuda")
             av["cuk"] = torch.tensor([0, pos0 + T], dtype=torch.int32, device="cuda")
             views.append(av)
@@ -396,38 +404,40 @@ class FastPrefill:
         poss = [x[1] for x in segs]
         big = any(T > self.w4_max for T in Ts)
         self._fold = False
-        for av, T, pos0 in zip(views, Ts, poss):
+        for av, (ids_seg, pos0, nxt), T in zip(views, segs, Ts):
+            av["tok"][:T].copy_(torch.tensor(ids_seg, dtype=torch.int32), non_blocking=False)
             with self._t("embed"):
                 smk.check(self.lib.smk_embed(e.G.embed.data_ptr(), av["tok"].data_ptr(), av["h"].data_ptr(), T, H, st), "embed")
             self._mm_rows(av, pos0, T)
         for li, L in enumerate(e.Ls):
-            for av, T in zip(views, Ts):
-                self._norm(av["h"], None if li == 0 else av["dn"], L.ln1, av["xn"], T)
-            if self.tap is not None and li in TAP_LI:
-                for av, T, pos0 in zip(views, Ts, poss):
-                    self.tap.take(TAP_LI[li], av["h"], pos0)
-            W = self._deq(L.qkvz, a["W2"]) if big else None  # one dequant of the qkv(z) weights for every segment of the group
+            Wq = Wo = Wg = Wd = None
+            if big:  # one dequant of each weight matrix of this layer for every segment of the group
+                Wq = self._deq(L.qkvz, a["Wq"])
+                Wo = self._deq(L.o, a["Wo"])
+                Wg = self._deq_gu(L.gu, a["W1"])
+                Wd = self._deq(L.down, a["W2"])
             for av, T, pos0 in zip(views, Ts, poss):
+                self._norm(av["h"], None if li == 0 else av["dn"], L.ln1, av["xn"], T)
+                if self.tap is not None and li in TAP_LI:
+                    self.tap.take(TAP_LI[li], av["h"], pos0)
                 if L.kind == "linear":
-                    self._dn_front(li, L, av, T, cur, W)
+                    self._dn_front(li, L, av, T, cur, Wq)
                 else:
-                    self._attn_front(li, L, av, T, pos0, W)
-            W = self._deq(L.o, a["W2"]) if big else None
-            for av, T in zip(views, Ts):
-                self._proj(av["y6"][:T], L.o, W, av["mix"][:T])
-            for av, T in zip(views, Ts):
+                    self._attn_front(li, L, av, T, pos0, Wq)
+                self._proj(av["y6"][:T], L.o, Wo, av["mix"][:T])
                 self._norm(av["h"], av["mix"], L.ln2, av["xn"], T)
-            Wg = self._deq(L.gu, a["W1"]) if big else None
-            Wd = self._deq(L.down, a["W2"]) if big else None
-            for av, T in zip(views, Ts):
                 self._mlp_seg(L, av, T, Wg, Wd)
             if self.layer_hook is not None:
                 self.layer_hook(total)
+        Wm = None
+        if big and self.mtp_kv and any(nxt is not None and len(nxt) for _, _, nxt in segs):
+            M = e.M
+            Wm = (self._deq(M.fc, a["W1"]), self._deq(M.qkv, a["W2"], 12288, 2048))
         for av, (ids_seg, pos0, nxt), T in zip(views, segs, Ts):
             self._norm(av["h"], av["dn"], e.G.final_norm, av["xn"], T)
             if nxt is not None and len(nxt):
                 self._small = T <= self.w4_max
-                self._mtp(av, len(nxt), pos0, nxt)
+                self._mtp(av, len(nxt), pos0, nxt, Wm)
         return a
 
     def _proj(self, x, w4, W, out):
@@ -484,9 +494,10 @@ class FastPrefill:
             smk.check(lib.smkp_attn_gate(ao.data_ptr(), q0, 14336, a["y6"].data_ptr(), T, st), "attn_gate")
 
     def _mlp_seg(self, L, a, T, Wg, Wd):
-        """_mlp for one segment of a group: Wg / Wd = the group's dequantized gate|up / down weights (None when the segment is small: the W4 kernel path)."""
+        """MLP of one segment: Wg = (gate, up) / Wd = down dequantized weights (None when the segment is small: the W4 kernel path).  Big path: the fused gate|up GEMM +
+        SiLU*mul (smkp_swiglu_gemm, act never round-trips the 2 x I wide gate|up output) then cuBLAS down_proj, in row blocks of `rows`."""
         lib, st = self.lib, self.e.st
-        xn, dn, gu, act = a["xn"], a["dn"], a["gu"], a["act"]
+        xn, dn, act = a["xn"], a["dn"], a["act"]
         if T <= self.w4_max:
             for r0 in range(0, T, self.rows):
                 r1 = min(T, r0 + self.rows)
@@ -496,13 +507,13 @@ class FastPrefill:
         for r0 in range(0, T, self.rows):
             r1 = min(T, r0 + self.rows)
             n = r1 - r0
-            self._mm(xn[r0:r1], Wg, gu[:n])
-            with self._t("silu"):
-                smk.check(lib.smkp_silu_mul(gu.data_ptr(), act.data_ptr(), n, st), "silu_mul")
+            with self._t("gemm"):
+                smk.check(lib.smkp_swiglu_gemm(xn[r0:r1].data_ptr(), H, Wg[0].data_ptr(), Wg[1].data_ptr(), act.data_ptr(), n, I, H, st), "swiglu_gemm")
             self._mm(act[:n], Wd, dn[r0:r1])
 
-    def _mtp(self, a, T, pos0, nxt):
-        """MTP KV for pairs (final-norm hidden of position p (a['xn'][t]), token p+1): cat -> fc -> ln1 -> K,V (k_norm + rope) -> MTP KV cache."""
+    def _mtp(self, a, T, pos0, nxt, W=None):
+        """MTP KV for pairs (final-norm hidden of position p (a['xn'][t]), token p+1): cat -> fc -> ln1 -> K,V (k_norm + rope) -> MTP KV cache.
+        W: (fc, K|V rows of qkv) weights already dequantized by a group (None: dequantize here; unused for a small segment)."""
         e, lib, st = self.e, self.lib, self.e.st
         M = e.M
         a["tok"][:T].copy_(torch.tensor(nxt, dtype=torch.int32), non_blocking=False)
@@ -517,16 +528,44 @@ class FastPrefill:
                         smk.check(lib.smkp_mtp_cat(emb.data_ptr() + j0 * H * 2, self.mm.arange(t1 - t0), a["xn"].data_ptr() + t0 * H * 2, M.pre_e.data_ptr(), M.pre_h.data_ptr(),
                                                    cat.data_ptr() + t0 * 2 * H * 2, t1 - t0, st), "mtp_cat_mm")
         fcout = a["mix"][:T]
-        self._w4mm(cat, M.fc, a["W1"], fcout)
+        if W is not None and not self._small:
+            self._mm(cat, W[0], fcout)
+        else:
+            self._w4mm(cat, M.fc, a["W1"], fcout)
         self._norm(fcout, None, M.ln1, a["xn"], T)
         kv = a["qkvz"][: T * 2048].view(T, 2048)
         if self._small:
             self._w4g(a["xn"][:T], M.qkv, kv, row0=12288, nrows=2048)
         else:
-            self._mm(a["xn"][:T], self._deq(M.qkv, a["W2"], 12288, 2048), kv)
+            self._mm(a["xn"][:T], W[1] if W is not None else self._deq(M.qkv, a["W2"], 12288, 2048), kv)
         with self._t("mtp"):
-            smk.check(lib.smkp_attn_prep(T, pos0, None, 0, kv.data_ptr(), 2048, kv.data_ptr() + 1024 * 2, 2048, None, M.k_norm.data_ptr(), self.mtp_kv, self.ctx_max, 0, 1.0, 1.0,
+            smk.check(lib.smkp_attn_prep(T, pos0, None, 0, kv.data_ptr(), 2048, kv.data_ptr() + 1024 * 2, 2048, None, M.k_norm.data_ptr(), self.mtp_kv, self.ctx_max, self.mtp_kv_dtype, 1.0, 1.0,
                                          None, None, None, _ptr(a["pos3"]), st), "mtp_kv")
+
+    GRP_RESERVE = 1536 << 20  # device bytes a group's scratch must leave free (fla / flash-attn temporaries, cuBLAS workspace, the decode graphs)
+
+    def _groups(self, segs):
+        """Split consecutive segments into layer-major groups of near-equal segment counts, each of <= grp_rows rows and small enough that the group's persistent rows (h, dn:
+        20 KiB per row) and its qkvz / o dequant buffers leave GRP_RESERVE of device memory free.  The grouping never changes the numerics (see _group)."""
+        if len(segs) < 2 or self.grp_rows <= self.seg:
+            return [[s] for s in segs]
+        per_row, fixed = 2 * H * 2, (16384 + 6144) * H * 2
+        box = getattr(self.e, "_fp_holder", self.e)
+        old = getattr(box, "_fp_alloc", None)
+        avail = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        if old:  # freed (and reallocated larger) by _scratch
+            avail += sum(old[k].numel() * old[k].element_size() for k in ("h", "dn", "Wq", "Wo") if k in old)
+        cap = min(self.grp_rows, (avail - self.GRP_RESERVE - fixed) // per_row)
+        rows = [len(s[0]) for s in segs]
+        if cap < 2 * min(rows):
+            return [[s] for s in segs]
+        ng = max(1, -(-sum(rows) // cap))
+        while True:
+            k = -(-len(segs) // ng)
+            groups = [segs[j : j + k] for j in range(0, len(segs), k)]
+            if k == 1 or all(sum(len(s[0]) for s in g) <= cap for g in groups):
+                return groups
+            ng += 1
 
     def _run(self, ids, spec):
         """Fast prefill of ids[:-1] from the current engine position (rows at positions pos0..), then ids[-1] as the head=1 decode step.  Returns the first token.
@@ -544,14 +583,23 @@ class FastPrefill:
         self._ev = []
         i = 0
         folded = False
+        segs = []  # (ids_seg, pos0, nxt) of the segments before a folded head
         while i < n:
             if self.fold and 2 <= n + 1 - i <= min(self.seg, self.w4_max):
-                self._segment(ids[i:], pos0 + i, cur, ids[i + 1 :] if spec else None, head=True)
-                folded = True
                 break
             T = min(self.seg, n - i)
-            self._segment(ids[i : i + T], pos0 + i, cur, ids[i + 1 : i + 1 + T] if spec else None)
+            segs.append((ids[i : i + T], pos0 + i, ids[i + 1 : i + 1 + T] if spec else None))
             i += T
+        for grp in self._groups(segs):
+            if len(grp) == 1:
+                self._segment(grp[0][0], grp[0][1], cur, grp[0][2])
+            else:
+                self._group(grp, cur)
+        if i < n:
+            self._segment(ids[i:], pos0 + i, cur, ids[i + 1 :] if spec else None, head=True)
+            folded = True
+        if self._df_flush is not None:  # DFlash2 context: the staged prompt rows -> drafter K/V (before the head step rewrites the debug taps); a folded head left its row in `last`
+            self._df_flush(folded)
         if not folded:
             if n:
                 self.ds[0] = pos0 + n  # engine position scalar (DS_POS); cur is unchanged (state lives in slot cur)
@@ -570,14 +618,35 @@ class FastPrefill:
         return self.e.read_out_tok()
 
     def prefill_spec(self, ids, k=3, start=True):
-        """SpecEngine.prefill_spec replacement (the engine must be freshly reset)."""
+        """SpecEngine.prefill_spec replacement (the engine must be freshly reset).  A greedy SpecEngine with the DFlash2 drafter also gets the drafter context of the last
+        2048 prompt rows (its attention window) and its first block."""
         e = self.e
         if len(ids) - 1 < self.min_fast:
             return e.prefill_spec(ids, k, start=start)
-        self._run(ids, True)
+        df = start and getattr(e, "df_wanted", None) is not None and e.df_wanted()
+        old_tap = self.tap
+        if df:
+            n = len(ids) - 1
+            cap = e.df_tapcap()
+            lo = max(0, n - cap.rows)
+            cap.begin(lo, n)
+            self.tap = cap
+
+            def flush(folded):
+                cap.flush(lo, n)
+                if folded:
+                    cap.put_last()
+
+            self._df_flush = flush
+        try:
+            self._run(ids, True)
+        finally:
+            self.tap, self._df_flush = old_tap, None
         if getattr(e, "sampling", False):  # K7: first token = a sample of the last prompt row's logits
             smk.check(e.lib.smk_spec_sample_first(e.sp, e.st), "spec_sample_first")
         if start:
             smk.check(e.lib.smk_spec_start(e.sp, k, e.st), "spec_start")
+            if df:
+                e._df_begin(ids)
         e._emitted = 0
         return e.read_out_tok()

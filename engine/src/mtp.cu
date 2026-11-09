@@ -88,7 +88,7 @@ static cudaError_t mtp_layer(smk_spec* s, int T, const void* hid_src, const int*
   smk_epi eq = {};
   eq.kind = SMK_EPI_SEGS; eq.end[0] = 12288; eq.end[1] = 13312; eq.end[2] = 14336; eq.out[0] = e->qb; eq.out[1] = e->kb; eq.out[2] = e->vb;
   CKS(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &eq, st));
-  CKS(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, s->kvbuf, e->ctx_max, 0, 1.f, 1.f, pos, e->ds + DS_RDELTA, e->y6, e->ws_attn, st));
+  CKS(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, s->kvbuf, e->ctx_max, MTP_KV_DTYPE, 1.f, 1.f, pos, e->ds + DS_RDELTA, e->y6, e->ws_attn, st));
   if (kv_only) return cudaSuccess;
   smk_epi eo = {};
   eo.kind = SMK_EPI_SEGS; eo.end[0] = eo.end[1] = eo.end[2] = H; eo.out[0] = e->mix;
@@ -187,7 +187,7 @@ smk_spec* smk_spec_create(smk_engine* e, const smk_mtp_w* w, int head_mode) {
   s->ring = (int*)dalloc(e, RING * sizeof(int), true);
   s->cat = (uint16_t*)dalloc(e, (size_t)TM * 2 * H * 2);
   s->hr = (uint16_t*)dalloc(e, (size_t)TM * H * 2, true);
-  s->kvbuf = (uint16_t*)dalloc(e, swiftmk_attn_kv_bytes(e->ctx_max, 0), true);
+  s->kvbuf = (uint16_t*)dalloc(e, swiftmk_attn_kv_bytes(e->ctx_max, MTP_KV_DTYPE), true);
   s->lg = (float*)dalloc(e, (size_t)(head_mode == 1 ? VOC : w->head_nv) * 4);
   s->sp = (SampP*)dalloc(e, sizeof(SampP), true);
   s->pd = (Dist*)dalloc(e, sizeof(Dist) * SK_ROWS, true);
@@ -226,7 +226,7 @@ cudaError_t smk_spec_reset(smk_spec* s, cudaStream_t st) {
   smk_engine* e = s->e;
   cudaMemsetAsync(s->ss, 0, SS_N * sizeof(int), st);
   cudaMemsetAsync(s->ring, 0, RING * sizeof(int), st);
-  cudaMemsetAsync(s->kvbuf, 0, swiftmk_attn_kv_bytes(e->ctx_max, 0), st);
+  cudaMemsetAsync(s->kvbuf, 0, swiftmk_attn_kv_bytes(e->ctx_max, MTP_KV_DTYPE), st);
   return cudaGetLastError();
 }
 
@@ -419,13 +419,15 @@ cudaError_t smk_spec_read(smk_spec* s, int what, void* host, size_t bytes) {
 }
 
 size_t smk_spec_bytes(smk_spec* s) { return s->bytes; }
-// MTP layer KV cache (bf16 [2][4][ctx_max][256]); used by the fast prefill (prefill.cu) to commit prompt pairs.
-// Host prefix cache: the MTP layer's KV (always bf16, one layer) in the same chunk format as the main cache (attn.h).
-size_t smk_spec_mtpkv_range_bytes(smk_spec* s, int m) { return swiftmk_attn_kv_range_bytes(0, m); }
+// MTP layer KV cache (MTP_KV_DTYPE layout, spec_impl.h); used by the fast prefill (prefill.cu) to commit prompt pairs.
+// Host prefix cache: the MTP layer's KV rows in the same chunk format as the main cache (attn.h).  For the int4 format the exact sink / ring rows are fixed state
+// after the per-token region (kvrot.cuh), not part of a chunk, as for the main cache.
+size_t smk_spec_mtpkv_range_bytes(smk_spec* s, int m) { return swiftmk_attn_kv_range_bytes(MTP_KV_DTYPE, m); }
 cudaError_t smk_spec_mtpkv_range_copy(smk_spec* s, void* host, int m, int dev_row0, int r0, int r1, int dir, cudaStream_t st) {
-  return swiftmk_attn_kv_range_copy(s->kvbuf, s->e->ctx_max, 0, host, m, dev_row0, r0, r1, dir, st);
+  return swiftmk_attn_kv_range_copy(s->kvbuf, s->e->ctx_max, MTP_KV_DTYPE, host, m, dev_row0, r0, r1, dir, st);
 }
 void* smk_spec_kv_ptr(smk_spec* s) { return s->kvbuf; }
+int smk_spec_kv_dtype(smk_spec* s) { return MTP_KV_DTYPE; }
 
 // ---------------------------------------------------------------------------------------------- K7 sampling
 cudaError_t smk_spec_set_sampling(smk_spec* s, const smk_sampling* cfg, cudaStream_t st) {
