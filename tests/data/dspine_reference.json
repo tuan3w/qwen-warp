@@ -1,0 +1,18 @@
+{
+ "n": 192,
+ "tokens_per_cycle": {
+  "code_py": 3.696,
+  "code_java": 3.281,
+  "code_sql": 5.025,
+  "en_prose": 3.571,
+  "vi_code": 4.396,
+  "vi_prose": 3.0,
+  "zh_code": 4.271,
+  "fr_prose": 3.438,
+  "tool_weather": 3.153,
+  "tool_search": 5.05,
+  "tool_vi_event": 4.333,
+  "doc_2k": 3.768,
+  "doc_8k": 3.375
+ }
+}

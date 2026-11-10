@@ -1,0 +1,213 @@
+[
+ {
+  "name": "code_py",
+  "lang": "code",
+  "user": "Write a Python implementation of an LRU cache class with get/put in O(1), then unit tests with pytest.",
+  "kind": "chat"
+ },
+ {
+  "name": "code_java",
+  "lang": "code",
+  "user": "Implement a binary search tree in Java with insert, delete and in-order traversal, plus a small demo.",
+  "kind": "chat"
+ },
+ {
+  "name": "code_sql",
+  "lang": "code",
+  "user": "Write a PostgreSQL query that returns the top 3 customers by revenue for every month, and explain how it works.",
+  "kind": "chat"
+ },
+ {
+  "name": "en_prose",
+  "lang": "english",
+  "user": "Explain how a hash map handles collisions and compare separate chaining with open addressing.",
+  "kind": "chat"
+ },
+ {
+  "name": "vi_code",
+  "lang": "vietnamese",
+  "user": "Viết hàm Python kiểm tra số nguyên tố và giải thích độ phức tạp thuật toán.",
+  "kind": "chat"
+ },
+ {
+  "name": "vi_prose",
+  "lang": "vietnamese",
+  "user": "Giải thích sự khác nhau giữa TCP và UDP cho người mới học, kèm ví dụ thực tế trong đời sống.",
+  "kind": "chat"
+ },
+ {
+  "name": "zh_code",
+  "lang": "chinese",
+  "user": "请用Python写一个函数判断字符串是否为回文，并解释它的时间复杂度。",
+  "kind": "chat"
+ },
+ {
+  "name": "fr_prose",
+  "lang": "french",
+  "user": "Expliquez la différence entre un processus et un thread, avec un exemple en Python.",
+  "kind": "chat"
+ },
+ {
+  "name": "tool_weather",
+  "lang": "english",
+  "kind": "tool",
+  "user": "What is the weather in Hanoi right now?",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "expect": {
+   "name": "get_weather",
+   "args": {
+    "city": {
+     "contains": "Hanoi"
+    }
+   }
+  }
+ },
+ {
+  "name": "tool_search",
+  "lang": "english",
+  "kind": "tool",
+  "user": "Find at most 5 files that mention 'rate limit', ignore case.",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Search the repository for a text",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "max_results": {
+        "type": "integer"
+       },
+       "case_sensitive": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read one file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   }
+  ],
+  "expect": {
+   "name": "search_files",
+   "args": {
+    "query": {
+     "contains": "rate limit"
+    },
+    "max_results": {
+     "eq": 5
+    }
+   }
+  }
+ },
+ {
+  "name": "tool_vi_event",
+  "lang": "vietnamese",
+  "kind": "tool",
+  "user": "Tạo sự kiện 'Họp nhóm' vào ngày 2026-11-12 cho An và Bình, cả ngày.",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "title": {
+        "type": "string"
+       },
+       "date": {
+        "type": "string",
+        "description": "ISO date"
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "all_day": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "title",
+       "date"
+      ]
+     }
+    }
+   }
+  ],
+  "expect": {
+   "name": "create_event",
+   "args": {
+    "title": {
+     "contains": "Họp nhóm"
+    },
+    "date": {
+     "eq": "2026-11-12"
+    },
+    "all_day": {
+     "eq": true
+    }
+   }
+  }
+ },
+ {
+  "name": "doc_2k",
+  "lang": "english",
+  "kind": "doc",
+  "doc_tokens": 2000,
+  "user": "Using only the document above, list the three most important design decisions and why they were made."
+ },
+ {
+  "name": "doc_8k",
+  "lang": "english",
+  "kind": "doc",
+  "doc_tokens": 8500,
+  "user": "Using only the document above, list the main performance limits it describes and the number given for each."
+ }
+]
