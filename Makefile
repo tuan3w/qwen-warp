@@ -38,3 +38,12 @@ test:
 	uv run tests/test_batch_engine.py
 	uv run tests/test_batch_vision_engine.py
 	uv run tests/test_server_batch.py
+	$(MAKE) test-dspine
+
+# DSpine block drafter (docs/TESTING.md): quantiser + vocabulary on the CPU, then the GEMV op test and the end-to-end test on the GPU (stop the serving container first).
+test-dspine:
+	uv run tests/test_dspine_quant.py
+	uv run tests/test_toolcall_validator.py
+	uv run tests/test_dspine_vocab.py
+	uv run tests/test_dspine_ops.py
+	uv run tests/test_dspine.py

@@ -18,8 +18,9 @@ SRCS_PLD := $(wildcard src/pld*.cu)
 SRCS_PROC := $(wildcard src/proc*.cu)
 SRCS_DF := $(wildcard src/dflash*.cu)
 SRCS_BATCH := $(wildcard src/batch*.cu)
+SRCS_SP := $(wildcard src/dspine*.cu)
 
-SRCS := $(SRCS_CORE) $(SRCS_K1) $(SRCS_K2) $(SRCS_ENG) $(SRCS_MTP) $(SRCS_PRE) $(SRCS_HQ) $(SRCS_PLD) $(SRCS_PROC) $(SRCS_DF) $(SRCS_BATCH)
+SRCS := $(SRCS_CORE) $(SRCS_K1) $(SRCS_K2) $(SRCS_ENG) $(SRCS_MTP) $(SRCS_PRE) $(SRCS_HQ) $(SRCS_PLD) $(SRCS_PROC) $(SRCS_DF) $(SRCS_BATCH) $(SRCS_SP)
 HDRS := $(wildcard include/*.h) $(wildcard src/*.cuh) $(wildcard src/*.h)
 
 all: $(BUILD)/libswiftmk.so
