@@ -19,10 +19,14 @@ constexpr float E_RES = 12.f;  // scale codes per octave
 constexpr int NSINK = 4;  // positions 0..NSINK-1 keep exact (fp16, rotated basis) K and V rows in a fixed per-layer buffer [2][4 kv heads][NSINK][256] after the meta words (fixed bytes, not per token)
 __host__ __device__ __forceinline__ size_t sink_off(int ctx_max) { return (size_t)2 * 4 * (size_t)ctx_max * (128 + 4); }
 // Exact recent-token ring: the last RING_W positions (before the current step's queries) are attended from fp16 rotated rows in a fixed per-layer ring [2][4][RING_R][256]
-// (slot = pos & (RING_R - 1), RING_R >= 2 RING_W covers the up-to-8 rows of a step), after the sink rows.  The split kernels stop RING_W keys before the end of the context;
+// (slot = pos & (RING_R - 1)), after the sink rows.  The split kernels stop RING_W keys before the end of the context;
 // the reduce kernel attends the ring exactly and merges it as one more split.  Fixed bytes per layer, not per token.
-constexpr int RING_W = 256;
+// A step of T <= 8 rows writes its rows at pos0 .. pos0 + T - 1 and speculative decoding may accept only the first of them, so the next step can start at pos0 + 1: the rows it still
+// needs (back to pos0 + 2 - RING_W) must not have been overwritten by the rejected rows of the earlier step (slots of positions up to pos0 + T - 1 - RING_R).  That holds when
+// RING_R >= RING_W + 8; RING_W is a multiple of 16 (the reader attends it in 16-row tiles).  RING_R is a power of two (slot mask), 512 = 2 MiB per layer for K and V.
+constexpr int RING_W = 496;
 constexpr int RING_R = 512;
+static_assert(RING_W % 16 == 0 && RING_W + 8 <= RING_R && (RING_R & (RING_R - 1)) == 0, "exact ring: RING_W a multiple of 16 and at least 8 rows short of the power-of-two RING_R");
 __host__ __device__ __forceinline__ size_t ring_off(int ctx_max) { return sink_off(ctx_max) + (size_t)2 * 4 * NSINK * 256 * 2; }
 constexpr size_t RING_BYTES = (size_t)2 * 4 * RING_R * 256 * 2;
 

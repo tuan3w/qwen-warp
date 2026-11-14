@@ -12,7 +12,7 @@ Per token and KV head, separately for K and V (256 elements):
 | 1. Rotate | Walsh-Hadamard transform over the 256-vector (`y = H x / 16`, orthonormal, its own inverse). The query is rotated the same way, so scores are unchanged; the attention output is un-rotated once per layer | makes the coordinates near-Gaussian: one outlier channel no longer sets the scale for everything |
 | 2. Quantise | 16 symmetric levels with a slightly stretched ("companded") grid, `L(n) = u (1 + 0.003 u^2)`, `u = 2n - 15`; 4 scales per vector (groups of 64 rotated coefficients), each an 8-bit logarithmic code | the grid fits a Gaussian within about 3% of the optimal 16-level quantiser's error, so there is no gain left in its shape |
 | 3. Keep the first 4 tokens exact | fp16 rows (rotated basis) in a small fixed buffer | the attention sinks carry a large share of the attention mass |
-| 4. Keep the last 256 tokens exact | fp16 rows in a ring buffer; the split kernel stops 256 keys before the end of the context and attends the ring as 16 extra fp16 tiles (no dequantisation); the reduce kernel only merges the splits and un-rotates | the newest tokens are the ones attention uses most |
+| 4. Keep the last 496 tokens exact | fp16 rows in a ring buffer (512 slots); the split kernel stops 496 keys before the end of the context and attends the ring as 31 extra fp16 tiles (no dequantisation); the reduce kernel only merges the splits and un-rotates | the newest tokens are the ones attention uses most |
 | 5. Decoder gain | the reader multiplies every decoded scale by 1.0075 (`1 / 0.9926`) | the writer's error-minimising scale makes each group about 0.74% too short, so quantised keys get logits slightly too small next to the exact ring keys; the constant comes from the quantiser's statistics on Gaussian groups, not from any text |
 
 Bytes per token are unchanged: 16,896 bytes (16.5 KiB, 4.125 bits per element), measured on the device for the old and the new format. The exact sink and ring are fixed
@@ -54,6 +54,24 @@ the gain should not be fitted per text. A logit offset for the Jensen bias of no
 | Needle probe at 64k in chat format (8 depths, passphrase negative log-likelihood vs the fp8 cache) | 0.124 nats vs 0.086 for fp8 (+0.038, 1.6 standard errors) | 0.079 (-0.006, -0.6 s.e.): indistinguishable from fp8 |
 
 bf16 gave 91% on the type-first schema in the earlier measurement (0.3.0). Wilson 95% intervals. The server still sorts tool schemas by default; with this cache the rendering order no longer matters for that schema.
+
+## The exact ring: 256 against 496 rows
+
+The ring has 512 slots (the memory is the same either way), but the first version attended only the newest 256 of them. A step of up to 8 rows writes its rows over the slots of the positions 512 back, and speculative decoding may accept only the first of them, so the next step can start one row later: the ring may be attended for at most `RING_R - 8` rows, rounded down to the reader's 16-row tiles, which is 496 (`RING_W` in `engine/src/kvrot.cuh`, with a `static_assert`).
+
+Measured on the real engine (a 16k-token text of Python files and a 32k-token text of headers, prose and C++/JS/Rust source, both from installed packages and not in the repository; teacher-forced through the decode path against the bf16 cache; one RTX 3090, 2026-11-14; `RING_W` is the only change; the method is `scripts/kv_dkl.py`: `ref` once with the bf16 cache, then `run --ref ref.pt --build <engine build dir>` per build):
+
+| `RING_W` | dKL dev | dKL held-out | p99 per-token KL, dev / held-out |
+|---|---|---|---|
+| 256 (before) | 0.0660% | 0.0509% | 1.142% / 0.992% |
+| 384 | 0.0552% | 0.0448% | 0.913% / 0.833% |
+| **496 (now)** | **0.0504%** | **0.0431%** | **0.884% / 0.747%** |
+
+That is 24% (dev) and 15% (held-out) less dKL and about a quarter less in the p99 tail, at the same bytes per token and the same fixed memory (a build with `RING_W` = 512 gave 0.0504% / 0.0425%, but it is not safe with rejected speculative rows, see above). Decode time per step (T = 1 and T = 8 rows after a fast prefill to the stated context, old and new build back to back, median of 5 x 40 steps; the harness is not in the repository) was equal within 0.1% at 2k, 32k and 190k context. The extra 15 tiles read about 1 MB per layer, which is 0.3% of a step by bandwidth, so this is expected.
+
+Also run with the 496-row ring: `tests/test_tool_call_rate.py --profile long --n 100 --sort off` gave 96/100 (Wilson 95% [0.90, 0.98]), the same as the 96% above for the 256-row ring; a planted-passphrase probe (a sentence inserted into repeated code, one run per cell, greedy, same text for both builds) found it in 4 of 4 depths at 100k and 2 of 2 at 190k with both rings, with identical output. That probe is easy (one needle, one run) and says only that the longer ring did not break retrieval.
+
+Not measured: sampled repetition with the 496-row ring (the result below depends on the ring length: it is the exact ring that made the 61-token loop prompt differ from bf16), coding pass@1, a multi-needle or multi-turn agent benchmark, and the vision, startup-configuration and server-batch tests of `make test` (10 of the test files were run: `test_kv_dtypes`, `test_spec_procs`, `test_prefill_plan`, `test_group_prefill`, `test_prefix_store`, `test_lineage_cache`, `test_batch_engine`, `test_server_smoke` in both profiles, `test_server_seed`, `test_tool_call_rate`; all passed).
 
 ## What it costs
 
