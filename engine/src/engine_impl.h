@@ -51,6 +51,7 @@ struct smk_engine {
   uint16_t* dn_conv;
   char* kv;
   size_t kv_layer_bytes;
+  char* qtap = nullptr;  // optional bf16 [at_idx][8][24][256] tap of every attention layer's query rows of the last step (env SMK_QTAP, off by default)
   cudaStream_t cap = nullptr, side = nullptr;
   cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
   cudaGraphExec_t gexec[smk::TM + 1][smk::NHEAD_MODES][smk::NHEAD_VARIANTS] = {};
