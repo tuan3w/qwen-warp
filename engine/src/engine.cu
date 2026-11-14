@@ -77,6 +77,7 @@ cudaError_t smk_run_step(smk_engine* e, int T, int head, int spec, cudaStream_t 
       CK(smk_w4r_gemv(L.qkv_w, L.qkv_s, e->xn, 14336, H, T, &ep, st));
       CK(swiftmk_attn_step(T, e->qb, e->kb, e->vb, L.q_norm, L.k_norm, e->kv + (size_t)e->at_idx[l] * e->kv_layer_bytes, e->ctx_max, e->kv_dtype,
                            L.k_scale, L.v_scale, ds + DS_POS, ds + DS_RDELTA, e->y6, e->ws_attn, st));
+      if (e->qtap) CK(cudaMemcpyAsync(e->qtap + (size_t)e->at_idx[l] * (8 * 24 * 256 * 2), e->ws_attn, (size_t)T * 24 * 256 * 2, cudaMemcpyDeviceToDevice, st));  // SMK_QTAP=1: post-rope query rows of this layer (analysis / calibration, bf16 cache only)
     }
     {
       smk_epi ep = {};
@@ -179,6 +180,7 @@ smk_engine* smk_engine_create_slot(const smk_model_w* w, int ctx_max, int kv_fp8
   e->dn_dbuf = (float*)dalloc(e, (size_t)nd * swiftmk_deltanet_dbuf_floats() * 4, true);
   e->kv_layer_bytes = swiftmk_attn_kv_bytes(ctx_max, kv_fp8);
   e->kv = (char*)dalloc(e, (size_t)na * e->kv_layer_bytes, true);
+  if (getenv("SMK_QTAP")) e->qtap = (char*)dalloc(e, (size_t)na * 8 * 24 * 256 * 2, true);
   // the processor state is allocated last: the addresses of every buffer the decode path reads stay what they were
   e->pb.dev = (ProcP*)dalloc(e, sizeof(ProcP), true);
   e->pb.counts = (int*)dalloc(e, (size_t)VOC * 4, true);

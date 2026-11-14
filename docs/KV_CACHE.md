@@ -97,6 +97,25 @@ In short: level with the previous format on short prompts, at 32k (tail off) and
 - The speed result is for one model and one card, two runs per cell; the remaining 3% at 32k with the tail on may be real or the old tree's high draw.
 - One model, one card, one set of prompts; dKL was measured on two 32k texts. Needle tests: 4 runs and 8 depths.
 
+## Scheme lab: trying other 4-bit formats without kernel work
+
+`scripts/kv_emu.py` runs the real engine with a bf16 cache and passes every row that has left the exact window through a Python scheme (`encode` to payload tensors, `decode`), writing the decoded rows back. The model then sees what a cache holding that payload would give it, so a vector quantiser, a learned basis or a different bit split can be measured as dKL without touching CUDA (contract and accounting: the script's docstring; the bytes are counted from the payload tensors). `scripts/kv_schemes/shipped.py` is a torch port of the shipped format: on the 16k dev text it gives dKL 0.04818% against 0.05037% for the real kernels (4% apart; the same port gave 0.0931% against 0.0905% on 6.4k tokens). The cost of the query tap (`SMK_QTAP=1`, a copy of each layer's post-rope query rows for `calibrate()`) is zero when the variable is not set: dKL on the dev text is bit-identical with and without the patch.
+
+An autonomous search (four agents, about 90 minutes each, 2026-11-14) used it with four directions. Every number is dKL-based score (1 / dKL) against the shipped format **at the same exact window (496 rows)** and the same byte budget, deterministic, one calibration text of 4k tokens:
+
+| Idea | Result |
+|---|---|
+| Static means of K (stored before rope) and V, per-chunk mean of the 60 busiest K channels, 6-bit scale codes (`kv_schemes/chunk_means.py`) | **1.029x** on the 16k dev text, **1.139x** on the 32k held-out text; 1.12x and 1.05x on two 64k texts; p99 KL 12% to 17% lower at 64k |
+| Calibrated Q-weighted PCA basis per head, water-filled bits, Lloyd-Max grids | 0.91x: fitted on one half of the calibration text it is 3x to 10x worse on the other half; with K un-rotated by position first (rope moves the first 64 dims) the cross-fit key logit error is 0.5x to 0.7x of Hadamard, but its 0.56 MB of tables displace window rows |
+| Trellis-coded quantisation (10-bit trellis, Viterbi encoder) on the shipped rotation | 0.997x: 25% less MSE, but the reconstruction shrinks the norm by 0.6% and the logit-scale bias is first order in KL; needs the decoder gain |
+| Per-channel prescale of K by (query power / key power)^(1/4) | 1.056x at window 256 on dev; not tested at a matched window (0.92x dev, 1.16x held-out against the window-496 control with a 480-row window) |
+| Retraining the 16-level grid (Lloyd-Max) | 0.3% change: the shipped grid is at its fixed point |
+| Per-token precision by predicted attention importance; mean subtraction of K alone | worse (the second by 14%) |
+
+What carried over from the proxies and what did not: offline Q-weighted error predicted the mean subtraction of K wrongly (+5% to 19% predicted, -14% measured), and an in-sample basis gain of 3x to 18x did not survive a half-split of the calibration text. Treat offline proxies as hypotheses; the end-to-end dKL is the check. The exact window is the largest single lever found (previous section).
+
+Not done: a kernel for any of these schemes (so no speed or memory claim beyond the emulator's byte count), tool-call rate, needle retrieval or repetition with a scheme, and 200k context (the emulator keeps a bf16 cache, so it stops at about 64k to 90k tokens on a 24 GB card). `chunk_means.py` needs a rope un-rotation of K with exact rope numerics in the kernel and a per-chunk side state.
+
 ## Where the ideas come from
 
 None of the pieces is new, and the measurements are the contribution here. Rotating before quantising the KV cache: QuaRot ([2404.00456](https://arxiv.org/abs/2404.00456); its ablation gives 5.51 against 5.47 perplexity for 4-bit K and V). An exact recent window: KIVI ([2402.02750](https://arxiv.org/abs/2402.02750), a full-precision window of 128 recent tokens). First token(s) in full precision: KVQuant ([2401.18079](https://arxiv.org/abs/2401.18079)); StreamingLLM ([2309.17453](https://arxiv.org/abs/2309.17453)) shows four initial tokens are needed. Bias in quantised keys and how to correct it: TurboQuant ([2504.19874](https://arxiv.org/abs/2504.19874), the MSE-optimal quantiser is biased for inner products) and HyperQuant ([2606.23406](https://arxiv.org/abs/2606.23406), random rotation plus subtractive dither; it reports all variants within 0.014 perplexity at 4 bits). A decoder-side constant gain derived from the quantiser's own shrink is not in HyperQuant's paper (its calibration sets an SNR-targeting scale, appendix B), but this was only checked in that paper, and no novelty is claimed.

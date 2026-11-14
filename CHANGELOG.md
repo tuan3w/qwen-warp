@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `scripts/kv_emu.py` and `scripts/kv_schemes/`: measure a Python/torch KV quantisation scheme on the real model as dKL against the bf16 cache, without kernel work ([KV cache](docs/KV_CACHE.md#scheme-lab-trying-other-4-bit-formats-without-kernel-work)); `SMK_QTAP=1` (engine level, off by default, bit-identical results when unset) copies each attention layer's post-rope query rows for calibration.
+
 ### Changed
 
 - The 4-bit KV cache attends its newest 496 rows exactly instead of 256 (`RING_W` in `engine/src/kvrot.cuh`; the 512-slot ring and every byte count are unchanged, and a `static_assert` ties `RING_W` to the ring size and the 8-row step). dKL from the bf16 cache: 0.0660% to 0.0504% (16k dev text), 0.0509% to 0.0431% (32k held-out text), p99 per-token KL about 24% lower; decode step time unchanged within 0.1% at 2k, 32k and 190k ([KV cache](docs/KV_CACHE.md#the-exact-ring-256-against-496-rows)).

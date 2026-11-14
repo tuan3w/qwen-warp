@@ -38,8 +38,9 @@ def tokens(files, n):
     return ids[:n]
 
 
-def sweep(kv, ids, ref):
-    """8-row teacher-forced steps; ref None: return the top-64 (ids, log-probs) per position, else the per-position KL against ref."""
+def sweep(kv, ids, ref, setup=None):
+    """8-row teacher-forced steps; ref None: return the top-64 (ids, log-probs) per position, else the per-position KL against ref.
+    setup(engine) -> hook or None: called once after the engine is built (scripts/kv_emu.py); hook(rows_in_cache) runs after every step."""
     import torch
 
     sys.path.insert(0, str(ENG))
@@ -47,6 +48,7 @@ def sweep(kv, ids, ref):
 
     e = Engine(ctx_max=len(ids) + 64, kv_fp8=kv, tmax=8, verbose=False)
     e.reset()
+    hook = setup(e) if setup else None
     out_i, out_v, kls, nll = [], [], [], []
     i = 0
     while i < len(ids) - 1:
@@ -66,6 +68,8 @@ def sweep(kv, ids, ref):
             lpn = torch.log_softmax(rlp, -1)
             kls.append((lpn.exp() * (lpn - lq)).sum(-1))
         i += T
+        if hook:
+            hook(i)
     nll = torch.cat(nll)
     assert torch.isfinite(nll).all(), "non-finite NLL"
     if ref is None:

@@ -383,6 +383,7 @@ void* smkp_engine_ptr(smk_engine* e, int what) {
     case 2: return e->dn_conv;
     case 3: return e->kv;
     case 4: return (void*)e->kv_layer_bytes;
+    case 8: return e->qtap;  // bf16 [16][8][24][256] query tap (nullptr unless SMK_QTAP=1 at engine creation)
     case 5: return e->h;   // bf16 [TMAX][5120] residual stream
     case 6: return e->dn;  // bf16 [TMAX][5120] last layer's down_proj output
     case 7: return e->dbg; // bf16 [66][TMAX][5120] debug taps
