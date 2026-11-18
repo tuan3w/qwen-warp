@@ -42,7 +42,7 @@ make room for a 262,144-token context.
 
 | Layer | File | Role |
 |---|---|---|
-| Server | `server/serve.py` | vLLM 0.30 OpenAI frontend (`run_server`) with our engine-core client |
+| Server | `server/serve.py` | vLLM OpenAI frontend (`run_server`, 0.34.0) with our engine-core client |
 | | `server/smk_core_client.py` | in-process vLLM `EngineCoreClient`: maps the vLLM config to engine settings, checks the length against the free GPU memory (`vram_need_mib`), rejects unsupported parameters, FIFO queue, abort, streaming |
 | | `server/smk_runner.py` | engine driver: fast prefill (a plan that depends on the prompt only), MTP cycles, sampling, DeltaNet snapshots for multi-turn prefix reuse |
 | | `server/smk_batch.py` | `BatchRunner` (`--max-num-seqs > 1`): continuous batching over sequence slots: admission, prefills interleaved with decode groups, batched or single-sequence cycles per step |

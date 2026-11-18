@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- `dnspython` 2.9.1 to 2.9.2 (Dependabot #27, high: excessive memory and CPU use). `setuptools` 80.10.2 to 84.2.1 through `override-dependencies` (Dependabot #13 and #16: sdist `MANIFEST.in` exclusion bypass, Windows path escape while installing a legacy wheel; both are build / install paths, not the running server): vLLM declares `setuptools<81`, the server and the tests were run with 84.2.1.
+
+### Changed
+
+- vLLM 0.32.0 to 0.34.0, torch 2.13.0 to 2.14.0, torchvision 0.28.0 to 0.29.0 (flashinfer 0.7.3, `uv.lock`). One vLLM internal moved: `make_arg_parser` and `validate_parsed_serve_args` come from `vllm.entrypoints.common.cli_args` now (`server/serve.py`). The seeded sampled request of `tests/data/text_ids_v070.json` draws other tokens under torch 2.14 (the greedy ids are unchanged), so that reference was re-pinned; see the test docstrings.
+- The chain-extension graphs are captured only for the widths a cycle uses (k = 3 and 3 + x for the one extension width x): the memory of the single-sequence MTP engine with the tail grows by 142 MiB over 0.10.x instead of 224 MiB, `VRAM_WIDE_MIB` is 150 (was 232 in 0.11.0), and the default `--max-model-len` of the tail-on profile keeps the tail on a 23,228 MiB card (`tests/test_vision_logic.py`).
+
 ## 0.11.1 - 2026-11-18
 
 ### Fixed

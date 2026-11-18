@@ -9,6 +9,7 @@ Tier: 1
 Exact oracles, no tolerances:
   text-only greedy ids (3 chat prompts), a seeded sampled request and a two-turn conversation (turn 2 resumed from the cache) == 0.7.0's Runner on the same configuration,
   before AND after the image requests (an image request leaves no state behind: the rope offset, the lineage key);
+  (the seeded sampled stream is the one reference that is not 0.7.0's: it was re-pinned for torch 2.14 / vLLM 0.34, see `repinned` in tests/data/text_ids_v070.json);
   an image request twice -> the same ids (the second resumed from the prefix cache past the image); turn 2 of a conversation about an image, resumed vs cold -> the same ids;
   the same text with another image resumes nowhere past the image.  Sanity: the model reads the word in the image.
 Engine construction goes through tests/_engine.py (make_engine).
