@@ -414,6 +414,12 @@ cudaError_t smk_spec_run_pld(smk_spec* s, int n, cudaStream_t st, int* host_ss, 
     s->pld_pe = ext;
     s->pld_stat[k]++;
     CKS(smk_graph_launch(e, ext ? &s->g_pldx[ext][k] : &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp, ext, c); }, st));
+    {
+      // Under WDDM (Windows, WSL2) the driver batches submitted work until something flushes it, and the spin below polls a host mailbox, which does not flush: the cycle would wait
+      // for the periodic cudaStreamQuery. Query once now so the cycle is submitted at once (a cheap call where there is no batching).
+      const cudaError_t q = cudaStreamQuery(st);
+      if (q != cudaSuccess && q != cudaErrorNotReady) return q;
+    }
     const long long t1 = now_ns();
     const int want = ++s->pld_seq;
     uint64_t spins = 0;
