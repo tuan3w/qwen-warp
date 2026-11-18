@@ -25,8 +25,8 @@
 
 namespace {
 
-constexpr int HD = 256, NKV = 4, NH = 24, GRP = 6, QG_STRIDE = 12288, TMAX = 8;
-constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T <= TMAX rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX)
+constexpr int HD = 256, NKV = 4, NH = 24, GRP = 6, QG_STRIDE = 12288, TMAX = 16;
+constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T <= TMAX rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX); T = 9..16: single sequence, bf16 or int4 KV
 // Optional KV-cache pointer indirection and the fused multi-sequence launch (swiftmk_attn_step_multi): blockIdx.z = sequence bz; with pp set its layer cache is pp[bz * pp_str] + off bytes,
 // read at launch (batched decode: one graph serves any set of sequences), else kv.  Sequence bz takes position pos0p[bz * pos_str], rope offset rdelta[bz * rd_str], rows
 // bz * T .. bz * T + T - 1 of q_proj / k / v / out and its own slices of the workspace (T <= TMAX, B * T <= RMAX rows in total); bz = 0 is the single-sequence launch.
@@ -1437,7 +1437,29 @@ cudaError_t run(int B, int T, const void* q_proj, const void* k, const void* v, 
     case 5: e = launch_multi<FP8, I4, 4, ATTN_KS5, ATTN_VC5>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
     case 6: e = launch_multi<FP8, I4, 5, ATTN_KS6, ATTN_VC6>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
     case 7: e = launch_multi<FP8, I4, 6, ATTN_KS7, ATTN_VC7>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
-    default: e = launch_multi<FP8, I4, 6, ATTN_KS8, ATTN_VC8>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    case 8: e = launch_multi<FP8, I4, 6, ATTN_KS8, ATTN_VC8>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+    default:  // wide verify (T = 9..16, NT = ceil(6T/8) = 7 .. 12 n-tiles): bf16 cache: one key-parallel warp per n-tile; int4: the d-split kernel with NG groups of NTG n-tiles, one team each
+              // (the fp8 kernels are not instantiated for them)
+      if constexpr (I4) {
+        switch (T) {
+          case 9: e = launch_multi<false, true, 7, 1, 2, 4, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 10: e = launch_multi<false, true, 8, 1, 2, 4, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 11: case 12: e = launch_multi<false, true, 9, 1, 3, 3, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 13: e = launch_multi<false, true, 10, 1, 3, 4, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 14: e = launch_multi<false, true, 11, 1, 3, 4, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          default: e = launch_multi<false, true, 12, 1, 3, 4, 2, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+        }
+      } else if constexpr (!FP8) {
+        switch (T) {
+          case 9: e = launch_multi<false, false, 7, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 10: e = launch_multi<false, false, 8, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 11: case 12: e = launch_multi<false, false, 9, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 13: e = launch_multi<false, false, 10, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          case 14: e = launch_multi<false, false, 11, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+          default: e = launch_multi<false, false, 12, 1, 1, 0, 1, 1>(B, T, kv, ctx_max, k_scale, v_scale, pos0, qbuf, ml, part, ki, st); break;
+        }
+      } else e = cudaErrorInvalidValue;
+      break;
   }
   if (e != cudaSuccess) return e;
   attn_reduce_kernel<I4><<<dim3(GRP * T, NKV, B), HD, 0, st>>>(T, (const __nv_bfloat16*)q_proj, FP8 ? v_scale * 256.f : 1.f, pos0, ml, part,

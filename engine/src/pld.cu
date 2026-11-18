@@ -78,7 +78,8 @@ void smk_pld_append(smk_pld* p, const int* toks, int n) {
 
 int smk_pld_len(const smk_pld* p) { return (int)p->S.size(); }
 
-int smk_pld_propose(smk_pld* p, const int* drafts, int nd, int* out, int* l_out) {
+// Same as smk_pld_propose with the tail length / agreement gate given per call.  Candidates must have a continuation inside K (j < end), so nd = 0 never matches the anchor's own n-gram.
+int smk_pld_propose_ex(smk_pld* p, const int* drafts, int nd, int max_tail, int min_len, int* out, int* l_out) {
   const smk_pld_cfg& c = p->c;
   if (l_out) *l_out = 0;
   const int pa = (int)p->S.size() - 1;  // anchor position
@@ -95,10 +96,12 @@ int smk_pld_propose(smk_pld* p, const int* drafts, int nd, int* out, int* l_out)
   if (it == p->idx.end() || it->second.empty()) return 0;
   const std::vector<int>& occ = it->second;  // ascending, all <= pa
   const int hi = (int)occ.size();
-  const int ncand = c.longest ? std::min(hi, c.cap) : 1;
-  int best_j = -1, best_l = -1;
-  for (int ci = 0; ci < ncand; ci++) {
+  int best_j = -1, best_l = -1, seen = 0;
+  for (int ci = 0; ci < hi; ci++) {
     const int j = occ[hi - 1 - ci];
+    if (j >= end) continue;
+    if (seen >= (c.longest ? c.cap : 1)) break;
+    seen++;
     int l = n;
     while (l < c.back && j - l >= 0 && K(j - l) == K(end - l)) l++;
     if (l > best_l) {
@@ -107,12 +110,14 @@ int smk_pld_propose(smk_pld* p, const int* drafts, int nd, int* out, int* l_out)
       if (l >= c.back) break;  // cannot be exceeded; ties keep the most recent
     }
   }
-  if (l_out) *l_out = best_l;
-  if (best_l < c.min_len) return 0;
-  const int hiK = std::min(best_j + 1 + c.max_tail, end + 1);
+  if (l_out) *l_out = best_l < 0 ? 0 : best_l;
+  if (best_l < min_len) return 0;
+  const int hiK = std::min(best_j + 1 + max_tail, end + 1);
   int ln = 0;
   for (int i = best_j + 1; i < hiK; i++) out[ln++] = K(i);
   return ln;
 }
+
+int smk_pld_propose(smk_pld* p, const int* drafts, int nd, int* out, int* l_out) { return smk_pld_propose_ex(p, drafts, nd, p->c.max_tail, p->c.min_len, out, l_out); }
 
 }  // extern "C"

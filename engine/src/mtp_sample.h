@@ -6,9 +6,11 @@
 
 namespace smk {
 // ---- device state ints (smk_spec::ss)
-// K11: SS_MTOK moved 8 -> 48 (8 catch-up tokens; 8..11 collided with SS_OUTN once rows > 4), SS_HIST holds m = 0..7 accepted drafts, SS_FORCE up to 8 values.
+// K11: SS_MTOK moved 8 -> 48 (catch-up tokens; 8..11 collided with SS_OUTN once rows > 4), SS_HIST holds m = 0..7 accepted drafts (m >= 7: last bin), SS_FORCE up to 8 values.
+// Wide cycles: up to 16 catch-up tokens (SS_MTOK .. SS_MTOK + 15), SS_PLDSEQ moved 56 -> 64.
 constexpr int SS_A = 0, SS_AM1 = 1, SS_ZERO = 2, SS_DPOS = 3, SS_OUTN = 12, SS_NCYC = 13, SS_FORCE_N = 14, SS_HIST = 16, SS_FORCE = 24,
-              SS_IDX = 32, SS_MTOK = 48, SS_PLDSEQ = 56, SS_N = SMK_SPEC_SS_N;
+              SS_IDX = 32, SS_MTOK = 48, SS_PLDSEQ = 64, SS_N = SMK_SPEC_SS_N;
+static_assert(SS_MTOK + SMK_TMAX <= SS_PLDSEQ && SS_PLDSEQ < SS_N, "ss layout");
 constexpr int RING = SMK_SPEC_RING;
 
 // ---- sampling
@@ -16,7 +18,7 @@ constexpr int SK_KMAX = 64;                                        // max top_k
 constexpr int SK_CHUNK = 2048;                                     // logits per stage-1 block (256 threads x 8)
 constexpr int SK_NCH_T = (SMK_VOCAB + SK_CHUNK - 1) / SK_CHUNK;    // 122 stage-1 chunks per target row
 constexpr int SK_NCH_D = 40;                                       // draft rows: up to 40 chunks (81920 logits)
-constexpr int SK_ROWS = SMK_TMAX;                                  // verify rows 1 + k, k <= SMK_SPEC_PMAX = 7
+constexpr int SK_ROWS = SMK_TMAX;                                  // verify rows 1 + k (the sampling graphs verify <= 8 rows)
 constexpr size_t SK_WS_ENTRIES = (size_t)SK_ROWS * SK_NCH_T * (SK_KMAX + 1);  // uint64 workspace of sk_topk: stage-1 lists + per-chunk maxima
 
 // A processed distribution: <= top_k tokens sorted by probability (descending), probabilities after temperature / top-k / top-p and renormalised.
@@ -76,13 +78,14 @@ __device__ __forceinline__ void spec_finish(int* ds, int* ss, int* ring, int m, 
   }
   ss[SS_OUTN] = outn + a;
   ss[SS_NCYC] = ci + 1;
-  ss[SS_HIST + m] += 1;
+  ss[SS_HIST + (m < 7 ? m : 7)] += 1;
   ds[DS_TOK] = ds[DS_OUT + a - 1];
   ss[SS_A] = a;
   ss[SS_AM1] = a - 1;
   ss[SS_DPOS] = P;
   ss[SS_DPOS + 1] = P + a;
   ss[SS_DPOS + 2] = P + a + 1;
+  for (int j = 3; j <= 7; j++) ss[SS_DPOS + j] = P + a + j - 1;  // chain extension (pld ext): position of draft j's MTP row (ss[3..10], below SS_OUTN)
   ds[DS_POS] = P + a;
   dn_pend_after(ds, a, T);
   ds[DS_CUR] = (ds[DS_CUR] + a) % ds[DS_SLOTS];

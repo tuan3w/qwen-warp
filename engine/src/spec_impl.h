@@ -59,7 +59,7 @@ __device__ __forceinline__ void mtp_final_row(const uint4* __restrict__ h, const
 struct PldRes {
   volatile int seq;
   int a;
-  int y[8];
+  int y[16];
   int d[SMK_SPEC_KMAX];
   int pad[2];
 };
@@ -81,16 +81,17 @@ struct smk_spec {
   // cycle graphs, index [samp][k]
   // K11: k = 1..7 (chain k <= 3 + prompt-lookup tail k - 3 tokens), verify rows 1 + k
   cudaGraphExec_t g_cycle[2][SMK_SPEC_PMAX + 1] = {}, g_verify[2][SMK_SPEC_PMAX + 1] = {}, g_stage[2][SMK_SPEC_PMAX + 1] = {}, g_cu[2][SMK_SPEC_PMAX + 1] = {};
-  cudaGraphExec_t g_start[2][SMK_SPEC_PMAX + 1] = {}, g_prefill[smk::TM + 1] = {}, g_pld[2][SMK_SPEC_PMAX + 1] = {};
+  cudaGraphExec_t g_start[2][SMK_SPEC_PMAX + 1] = {}, g_prefill[smk::TM + 1] = {}, g_pld[2][SMK_SPEC_PMAX + 1] = {}, g_pldx[5][SMK_SPEC_PMAX + 1] = {};  // g_pldx[e][k]: greedy cycle whose MTP stage drafts 3 + e chain tokens
   cudaGraphExec_t g_first = nullptr, g_plain = nullptr, g_smp_t[SMK_SPEC_PMAX + 1] = {}, g_smp_d[SMK_SPEC_KMAX + 1] = {};
   // K11 hybrid draft: host proposer + per-cycle result mailbox (mapped pinned memory written by the last kernel of the cycle graph)
   PldRes* res = nullptr;   // host pointer of the mapped mailbox
   PldRes* res_dev = nullptr;
-  int* pin_tail = nullptr;        // pinned staging of the tail tokens [8]
+  int* pin_tail = nullptr;        // pinned staging of the tail tokens [16]
   smk_pld* pld = nullptr;
-  int pld_on = 0, pld_seq = 0,  pld_d[SMK_SPEC_KMAX] = {};
+  int pld_on = 0, pld_seq = 0, pld_pe = 0, pld_pa = 99,  pld_d[SMK_SPEC_KMAX] = {};
+  int pld_wide = 0;               // the previous cycle verified >= 8 rows and accepted all of them: a long match may continue (wide tail)
   smk_pld_opts opts = {};
-  long long pld_stat[16] = {};    // [0..7] cycles by k (index k), [8] tail tokens proposed, [9] tail cycles, [10] host wait ns, [11] host work ns (lookup + launch)
+  long long pld_stat[32] = {};    // [0..15] cycles by k (index k), [16] tail tokens proposed, [17] tail cycles, [18] host wait ns, [19] host work ns (lookup + launch), [20] ext cycles, [21] ext accepted, [22] wide cycles, [23] wide tokens
   // test snapshot (smk_spec_snapshot / restore)
   float* snap_dn = nullptr;
   uint16_t *snap_conv = nullptr, *snap_tap = nullptr;

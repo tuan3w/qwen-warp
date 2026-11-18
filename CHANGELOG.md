@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Chain extension and wide verify for greedy single-sequence decoding (`make_pld(ext=2, wide=12, wide_len=8, wide_alt=24)`, `engine/src/mtp.cu`, [Architecture](docs/ARCHITECTURE.md#speculative-decoding)). A cycle with no prompt-lookup tail now drafts 2 more MTP tokens when the previous cycle accepted at least 4, and a long prompt-lookup match is verified in one cycle of up to 16 rows (the W4 GEMV already ran 16 rows as two n8 tiles). Verification is unchanged, so the output stays the target's greedy output. Engine level, `scripts/bench_decode.py`, same session, interleaved with the previous cycle: dev set 178.3 to 189.9 tok/s (1.065x), copy-heavy prompts 1.20x to 1.27x, held-out set 1.022x; short chat prompts range from 0.97x to 1.19x ([Performance](docs/PERFORMANCE.md#3-speed)). `ext=0, wide=0` restores the previous cycle.
+- `scripts/bench_decode.py`: the interleaved A/B above (`--set dev|held`, `--ngram`).
+- `tests/test_spec_wide.py` (tier 1, in `make test`): both features engage, the emitted stream agrees with plain 8-row verify at >= 0.98 teacher-forced (with a negative control), and the same request twice gives identical ids.
+
+### Changed
+
+- The single-sequence MTP engine (`SpecEngine(tmax=16)`, `engine.TMAX_WIDE`) has 16-row step buffers (`SMK_TMAX` 16) and 9 physical DeltaNet state slots (`state_slots=9`); the device state `ds` grew to 37 ints (`FastPrefill.DS_PEND` 35, `DS_RDELTA` 36), the debug taps to 16 rows. `tmax = 8` engines (batched decode, DFlash2, DSpine) keep their behaviour and memory; the server gives them `make_pld(ext=0, wide=0)`.
+- +220 MiB of GPU memory on the single-sequence MTP engine with the tail (conv ring and cycle graphs, measured with `--profile long`: 22,186 against 21,966 MiB after the warm-up); `VRAM_WIDE_MIB` (232) adds it to the memory model, so `--prompt-lookup auto` drops the tail slightly earlier at lengths near the limit.
+- `Runner.slack` and `SpecEngine.generate` leave room for `group` cycles of 16 rows past the stop (was 8).
+
 ## 0.10.1 - 2026-11-14
 
 ### Added

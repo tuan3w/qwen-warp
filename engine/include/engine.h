@@ -8,9 +8,10 @@
 extern "C" {
 #endif
 
-// K11: rows per step buffer = 8 (T = 1..8).  The DeltaNet ring has tmax+1 slots, tmax chosen at engine creation (4 = the K4..K10 behaviour, 8 = hybrid MTP + prompt-lookup tail).
+// K11: rows per step buffer = 16 (T = 1..16).  The DeltaNet ring has tmax+1 slots, tmax chosen at engine creation (4 = the K4..K10 behaviour, 8 = hybrid MTP + prompt-lookup tail,
+// 16 = the same plus wide verify cycles (T = 9..16) on long confident prompt-lookup matches: bf16 or int4 KV cache, quantised head).
 #ifndef SMK_TMAX
-#define SMK_TMAX 8
+#define SMK_TMAX 16
 #endif
 // Rows of one batched weight pass (include/batch.h: B sequences x (drafts + 1)): the owner engine's activation buffers hold this many rows; a single-sequence step keeps T <= SMK_TMAX.
 #define SMK_RMAX 16
@@ -103,7 +104,7 @@ typedef struct smk_model_w {
 
 typedef struct smk_engine smk_engine;
 // Allocates state (DeltaNet state ring of tmax+1 slots per layer, conv state, KV cache for ctx_max positions, activations, graph workspaces).
-// smk_engine_create = smk_engine_create_ex with tmax = env SMK_TMAX (default 4: 5 slots, steps of T <= 4 rows); tmax in 4..SMK_TMAX (8: 9 slots, +0.62 GiB, steps of T <= 8).
+// smk_engine_create = smk_engine_create_ex with tmax = env SMK_TMAX (default 4: 5 slots, steps of T <= 4 rows); tmax in 4..SMK_TMAX (8: 9 slots, +0.62 GiB, steps of T <= 8; 16: steps of T <= 16, T > 8 only with the bf16 KV cache).
 smk_engine* smk_engine_create(const smk_model_w* w, int ctx_max, int kv_fp8);
 smk_engine* smk_engine_create_ex(const smk_model_w* w, int ctx_max, int kv_fp8, int tmax);
 int smk_engine_tmax(smk_engine* e);

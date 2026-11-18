@@ -16,6 +16,7 @@ test:
 	uv run tests/test_host_tables.py
 	uv run tests/test_logit_procs.py
 	uv run tests/test_spec_procs.py
+	uv run tests/test_spec_wide.py
 	uv run tests/test_tool_schema.py
 	uv run tests/test_sampler_dist.py
 	uv run tests/test_tool_call_rate.py

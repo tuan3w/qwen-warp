@@ -514,7 +514,7 @@ cudaError_t smk_test_trials(const float* tl, int NT, const float* dl, int ND, co
 // K11: nchain chain drafts (from the draft logits) + ntail delta tail tokens; y[ntrials][8]
 cudaError_t smk_test_trials_pld(const float* tl, int NT, const float* dl, int ND, const int* idmap, const smk_sampling* cfg, int nchain, const int* tail, int ntail, int ntrials, unsigned ctr0, int* y, int* a) {
   const int k = nchain + ntail;
-  if (!valid(cfg) || nchain < 1 || nchain > SMK_SPEC_KMAX || ntail < 0 || k > SMK_SPEC_PMAX || ntrials < 1) return cudaErrorInvalidValue;
+  if (!valid(cfg) || nchain < 1 || nchain > SMK_SPEC_KMAX || ntail < 0 || k > 7 || ntrials < 1) return cudaErrorInvalidValue;
   TestBufs b;
   int* dtail = nullptr;
   const SampP sp = make_sampp(cfg);
@@ -550,7 +550,7 @@ cudaError_t smk_test_trials_procs(const float* tl, int N, const float* dl, int n
                                   int ignore_drafts, int ntrials, unsigned ctr0, int* y, int* a) {
   const int k = nchain + ntail;
   const int top_k = cfg->top_k, d_top_k = cfg->draft_sample ? (cfg->draft_top_k > 0 ? cfg->draft_top_k : cfg->top_k) : 1;
-  if (!valid(cfg) || N < 1 || N > SMK_HEADQ_RMAX || top_k > N || d_top_k > N || nchain < 1 || nchain > SMK_SPEC_KMAX || ntail < 0 || k > SMK_SPEC_PMAX || ntrials < 1 || !procs) return cudaErrorInvalidValue;
+  if (!valid(cfg) || N < 1 || N > SMK_HEADQ_RMAX || top_k > N || d_top_k > N || nchain < 1 || nchain > SMK_SPEC_KMAX || ntail < 0 || k > 7 || ntrials < 1 || !procs) return cudaErrorInvalidValue;
   constexpr int R = SMK_HEADQ_RMAX, B = 4096;
   ProcScratch ps;
   SMK_CK(ps.init(procs, gen, n_gen));

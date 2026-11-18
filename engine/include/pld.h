@@ -33,6 +33,8 @@ int smk_pld_len(const smk_pld* p);
 // Returns the tail length Ln (0 when there is no candidate OR best l < min_len), writes tokens to out[0..Ln-1] (room for max_tail ints)
 // and the agreement length to *l_out (0 if no candidate; also set when gated off; l_out may be NULL).
 int smk_pld_propose(smk_pld* p, const int* drafts, int nd, int* out, int* l_out);
+// As smk_pld_propose with max_tail (<= 8 ints of room in out) and the agreement gate min_len given per call; candidates need a continuation inside K (j < end), so nd = 0 is valid.
+int smk_pld_propose_ex(smk_pld* p, const int* drafts, int nd, int max_tail, int min_len, int* out, int* l_out);
 
 #ifdef __cplusplus
 }

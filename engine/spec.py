@@ -13,8 +13,8 @@ from engine import Engine, smk, pack  # noqa: F401
 import pack_mtp
 
 RING = 4096
-SS_N = 64
-PMAX = 7  # K11: chain k <= 3 + prompt-lookup tail <= 4 (verify rows <= 8; needs Engine(tmax=8))
+SS_N = 72  # include/mtp.h SMK_SPEC_SS_N
+PMAX = 15  # K11: chain k <= 3 + prompt-lookup tail <= 4 (verify rows <= 8; needs Engine(tmax=8)), wide tail <= 12 (verify rows <= 16: bf16 or int4 KV (not fp8), quantised head, greedy)
 
 
 class MtpW(C.Structure):
@@ -29,10 +29,12 @@ class PldOpts(C.Structure):
     _fields_ = [("cfg", PldCfg), ("force_n", C.c_int), ("force_tok", C.c_int * 4), ("reserved", C.c_int * 6)]
 
 
-def make_pld(n=2, min_len=3, max_tail=4, cap=64, back=64, longest=1, force_tail=()):
-    """E6's best cell (n=2 longest suffix match of the chain's last two drafts, agreement >= 3, tail <= 4)."""
+def make_pld(n=2, min_len=3, max_tail=4, cap=64, back=64, longest=1, force_tail=(), ext=2, wide=12, wide_len=8, wide_alt=24):
+    """E6's best cell (n=2 longest suffix match of the chain's last two drafts, agreement >= 3, tail <= 4).
+    wide / wide_len / wide_alt: after a fully accepted cycle of >= 8 rows, a match of agreement >= wide_len proposes up to `wide` (<= 12) tail tokens (verify rows up to 16); after any other cycle
+    the same needs an agreement >= wide_alt (0: never); wide = 0: off."""
     ft = list(force_tail)[:4]  # TEST ONLY: every cycle carries exactly these tail tokens
-    return PldOpts(PldCfg(n, min_len, max_tail, cap, back, longest), len(ft), (C.c_int * 4)(*(ft + [0] * (4 - len(ft)))))
+    return PldOpts(PldCfg(n, min_len, max_tail, cap, back, longest), len(ft), (C.c_int * 4)(*(ft + [0] * (4 - len(ft)))), (C.c_int * 6)(0, ext, wide, wide_len, wide_alt))
 
 
 class Sampling(C.Structure):
@@ -353,15 +355,15 @@ class SpecEngine(Engine):
         """dict: cycles by verify rows T (k = T - 1), tail tokens proposed, cycles with a tail, host wait / work ns.  DFlash2 requests: every cycle verifies 8 rows."""
         if self._df_live:
             return dict(cycles_by_k={7: self._ss[13]}, tail_tokens=0, tail_cycles=0, wait_ns=0, work_ns=0, drafter="dflash2")
-        out = (C.c_longlong * 16)()
+        out = (C.c_longlong * 32)()
         smk.check(self.lib.smk_spec_pld_stats(self.sp, out), "pld_stats")
         o = list(out)
-        return dict(cycles_by_k={k: o[k] for k in range(1, 8) if o[k]}, tail_tokens=o[8], tail_cycles=o[9], wait_ns=o[10], work_ns=o[11])
+        return dict(cycles_by_k={k: o[k] for k in range(1, 16) if o[k]}, tail_tokens=o[16], tail_cycles=o[17], wait_ns=o[18], work_ns=o[19], ext_cycles=o[20], ext_acc=o[21], wide_cycles=o[22], wide_tokens=o[23])
 
     def generate(self, ids, n_new, k=3, group=8, eos=None, force=None):
         """Greedy speculative generation: returns (tokens incl. the first one: n_new tokens, or fewer ending with the first EOS token), stats dict).
         `group` cycles are launched per host sync (4..16 hides the latency)."""
-        assert len(ids) + n_new + group * (8 if self.pld else k + 1) + 8 <= self.ctx_max, "ctx_max too small"
+        assert len(ids) + n_new + group * (16 if self.pld else k + 1) + 8 <= self.ctx_max, "ctx_max too small"
         self.reset()
         self.set_force(force)
         first = self.prefill_spec(ids, k)

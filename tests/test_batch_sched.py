@@ -70,7 +70,7 @@ class FakeFP:
     def __init__(self, e):
         self.e = e
         self.seg, self.w4_max, self.fold, self.min_fast, self.nss = 64, 16, True, 2, 1
-        self.ds = torch.zeros(21, dtype=torch.int32)  # engine_impl.h DS_N (DS_RDELTA = 20)
+        self.ds = torch.zeros(37, dtype=torch.int32)  # engine_impl.h DS_N (DS_RDELTA = 36)
         self.mm = None
         self.dn_state = torch.zeros(48, 1, 2, dtype=torch.int64)  # [0, 0] = (hash, tokens) of the sequence state
         self.dn_conv = torch.zeros(48, 9, 2, dtype=torch.int64)
