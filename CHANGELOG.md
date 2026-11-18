@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Docs: upgrading an existing environment in place from 0.11.x to 0.12.0 leaves `openai_harmony` missing (`oss-harmony` replaces `openai-harmony` and the two share a package directory); the fix is `uv sync --group dev --reinstall-package oss-harmony` ([Getting started](docs/GETTING_STARTED.md#troubleshooting)).
+
 ## 0.12.0 - 2026-11-18
 
 ### Security
