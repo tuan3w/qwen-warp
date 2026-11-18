@@ -98,7 +98,8 @@ def setup_prefill_api(lib):
 
 
 class FastPrefill:
-    DS_RDELTA = 20  # engine_impl.h: the sequence's MRoPE rope offset (decode ropes at KV position + ds[DS_RDELTA]); the Runner sets it per request
+    DS_PEND = 35  # engine_impl.h: pending lazy DeltaNet rows (a restored state clears it)
+    DS_RDELTA = 36  # engine_impl.h: the sequence's MRoPE rope offset (decode ropes at KV position + ds[DS_RDELTA]); the Runner sets it per request
 
     def __init__(self, eng, seg=4096, rows=2048, min_fast=2, w4_max=240, fold=True, grp_rows=65536):
         self.e, self.lib = eng, eng.lib
@@ -118,8 +119,8 @@ class FastPrefill:
         self._df_flush = None  # set by prefill_spec for a DFlash2 request: called by _run after the prompt rows, before the head step
         self.ctx_max, self.fp8 = eng.ctx_max, eng.kv_fp8
         e, lib = eng.h, self.lib
-        n_ds = lib.smkp_ds_n()  # engine_impl.h DS_N (a library older than the sources lacks the symbol: AttributeError); DS_PEND = 19 pending lazy DeltaNet rows
-        assert n_ds == self.DS_RDELTA + 1, n_ds
+        n_ds = lib.smkp_ds_n()  # engine_impl.h DS_N (a library older than the sources lacks the symbol: AttributeError); DS_PEND = 35 pending lazy DeltaNet rows
+        assert n_ds == self.DS_RDELTA + 1 and self.DS_PEND == self.DS_RDELTA - 1, n_ds
         self.ds = _view(lib.smkp_engine_ptr(e, 0), n_ds * 4, torch.int32)
         nsl = lib.smk_engine_sslots(e)  # physical DeltaNet state slots (tmax + 1, or 1 for a batched-decode sequence slot: ring slot cur lives in state slot cur % nsl)
         self.nss = nsl
@@ -316,7 +317,7 @@ class FastPrefill:
 
     def _tap(self, slot, row):
         """Test hook (taps=True): store the last row's residual into the engine's debug tap `slot` row 0 (what a T=1 head step would have written)."""
-        _view(self.lib.smkp_engine_ptr(self.e.h, 7) + slot * 8 * H * 2, H * 2, torch.bfloat16).copy_(row)
+        _view(self.lib.smkp_engine_ptr(self.e.h, 7) + slot * 16 * H * 2, H * 2, torch.bfloat16).copy_(row)
 
     def _mm_rows(self, a, pos0, T):
         """Image inputs of the rows pos0 .. pos0 + T - 1 (after their token embedding): the segment's MRoPE table a['pos3'] (None for a text prompt) and the ViT rows of placeholder tokens."""

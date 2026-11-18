@@ -30,8 +30,8 @@
 #endif
 
 namespace {
-constexpr int NV = 48, DV = 128, DK = 128, CONVD = 10240, KEYD = 2048, VALD = 6144, TMAX = 8;
-constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T <= TMAX rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX)
+constexpr int NV = 48, DV = 128, DK = 128, CONVD = 10240, KEYD = 2048, VALD = 6144, TMAX = 16;
+constexpr int RMAX = 16;  // rows of one fused multi-sequence launch (B sequences x T rows, B * T <= RMAX: the 16-row batched weight pass, engine.h SMK_RMAX; B > 1: T <= 8)
 constexpr int NT = 128;  // threads per block (4 warps)
 constexpr size_t STATE_SLOT = (size_t)NV * DV * DK;
 constexpr size_t CONV_SLOT = (size_t)CONVD * 3;
@@ -40,7 +40,7 @@ static_assert(WS_CNT_BYTES >= (size_t)RMAX * NV * sizeof(unsigned), "counter reg
 constexpr size_t WS_BYTES = WS_CNT_BYTES + (size_t)RMAX * NV * DV * sizeof(float);
 // Lazy snapshot mode (engine only; MODE 1/2).  A spec step does not write its T per-row state snapshots; it appends the rank-1 updates of its rows to a delta buffer:
 //   S_t = ge_t * S_{t-1} + d_t (x) k_t,  stored per row as ge[48], k[16][128], d[48][128] (fp32, exactly the values the recurrence used), LROWS rows per layer.
-// Device scalar *pend = p | base << 8 | half << 12 (delta buffer half holding the pending rows): the state at ring slot `cur` is NOT materialised; it is ring slot `base` (a full state) with the first p rows of the delta buffer
+// Device scalar *pend = p | base << 8 | half << 13 (delta buffer half holding the pending rows; base: 5 bits, ring slots 0..16): the state at ring slot `cur` is NOT materialised; it is ring slot `base` (a full state) with the first p rows of the delta buffer
 // replayed (same fp32 ops => bitwise the state the full-snapshot kernel would have stored).  p == 0: slot cur is the state.  A MODE 2 step replays the p pending rows
 // while its own state load is in flight; if p + T would overflow the buffer it first writes the replayed state to slot cur (new base) and appends its rows at 0, otherwise it
 // appends after the pending rows and writes no state at all.  The accept step then does p += a (dn_pend_after in engine_impl.h mirrors this decision).
@@ -61,7 +61,7 @@ struct Params {
   unsigned* cnt;
   float* o_ws;
   float* dbuf;       // this layer's delta buffer (MODE > 0)
-  const int* pend;   // device scalar p | base << 8 | half << 12 (MODE > 0)
+  const int* pend;   // device scalar p | base << 8 | half << 13 (MODE > 0)
   swiftmk_dn_ind ind;  // optional: the state / conv / delta-buffer base pointers are read from device memory (batched decode, one graph for any set of sequences)
 };
 
@@ -197,10 +197,10 @@ __global__ void __launch_bounds__(NT) dn_kernel(const __grid_constant__ ParamsN<
   if constexpr (MODE > 0) {
     const int pv = *p.pend;
     pc = pv & 255;
-    if (pc > 0) base = (pv >> 8) & 15;
+    if (pc > 0) base = (pv >> 8) & 31;
     flush = MODE == 2 && pc > 0 && pc + T > LROWS;
     row0 = MODE == 2 && !flush ? pc : 0;
-    rh = (pv >> 12) & 1;
+    rh = (pv >> 13) & 1;
     wh = flush ? rh ^ 1 : rh;
   }
 
@@ -419,8 +419,22 @@ cudaError_t launch_lazy(const ParamsN<NB>& pb, int T, int B, cudaStream_t s) {
     case 6: return launch_t<6, 2>(pb, s, B);
     case 7: return launch_t<7, 2>(pb, s, B);
     case 8: return launch_t<8, 2>(pb, s, B);
-    default: return cudaErrorInvalidValue;
+    default: break;
   }
+  if constexpr (NB == 1) {  // wide verify steps (single sequence): 9..16 rows
+    switch (T) {
+      case 9: return launch_t<9, 2>(pb, s, B);
+      case 10: return launch_t<10, 2>(pb, s, B);
+      case 11: return launch_t<11, 2>(pb, s, B);
+      case 12: return launch_t<12, 2>(pb, s, B);
+      case 13: return launch_t<13, 2>(pb, s, B);
+      case 14: return launch_t<14, 2>(pb, s, B);
+      case 15: return launch_t<15, 2>(pb, s, B);
+      case 16: return launch_t<16, 2>(pb, s, B);
+      default: break;
+    }
+  }
+  return cudaErrorInvalidValue;
 }
 
 // materialise the pending rows of every layer into ring slot cur (state: [layers][sslots][48][128][128], dbuf: [layers][DB_FLOATS]; ring slot i lives in state slot i % sslots)
@@ -428,10 +442,10 @@ __global__ void dn_materialize_k(float4* __restrict__ state, const float* __rest
   constexpr int SF4 = (int)(STATE_SLOT / 4);
   const int pv = *pend, pc = pv & 255;
   if (pc == 0) return;
-  const int li = blockIdx.y, cur = *cur_p % sslots, base = ((pv >> 8) & 15) % sslots;
+  const int li = blockIdx.y, cur = *cur_p % sslots, base = ((pv >> 8) & 31) % sslots;
   const float4* in = state + ((size_t)li * sslots + base) * SF4;  // in == out when sslots == 1: every element is read and written by the same thread
   float4* out = state + ((size_t)li * sslots + cur) * SF4;
-  const float* rb = dbuf + (size_t)li * DB_FLOATS + (size_t)((pv >> 12) & 1) * LROWS * DB_ROW;
+  const float* rb = dbuf + (size_t)li * DB_FLOATS + (size_t)((pv >> 13) & 1) * LROWS * DB_ROW;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < SF4; i += gridDim.x * blockDim.x) {
     const int h = i / (DV * DK / 4), v = (i / (DK / 4)) % DV, k4i = i % (DK / 4);
     float4 sv = in[i];
@@ -453,7 +467,7 @@ extern "C" size_t swiftmk_deltanet_ws_bytes(void) { return WS_BYTES; }
 extern "C" cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
                                              const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                              void* conv_state, const int* cur, int slots, void* y, void* ws, cudaStream_t stream) {
-  if (slots <= T || slots > 16) return cudaErrorInvalidValue;
+  if (slots <= T || slots > 17) return cudaErrorInvalidValue;
   Params p = {};
   p.qkv = (const __nv_bfloat16*)qkv; p.z = (const __nv_bfloat16*)z; p.a = (const __nv_bfloat16*)a; p.b = (const __nv_bfloat16*)b;
   p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;
@@ -476,7 +490,7 @@ extern "C" cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void*
 
 extern "C" size_t swiftmk_deltanet_dbuf_floats(void) { return DB_FLOATS; }
 
-// Engine entry (lazy snapshots, see MODE above).  dbuf: this layer's delta buffer (swiftmk_deltanet_dbuf_floats() floats); pend: device scalar p | base << 8 | half << 12.
+// Engine entry (lazy snapshots, see MODE above).  dbuf: this layer's delta buffer (swiftmk_deltanet_dbuf_floats() floats); pend: device scalar p | base << 8 | half << 13.
 // T == 1 behaves like swiftmk_deltanet_step after replaying the pending rows (the caller zeroes *pend afterwards); T >= 2 leaves the T row snapshots unwritten:
 // the caller's accept kernel must update *pend (dn_pend_after).
 extern "C" cudaError_t swiftmk_deltanet_step_lazy(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
@@ -497,7 +511,7 @@ extern "C" cudaError_t swiftmk_deltanet_step_multi(int B, int T, const void* qkv
                                                    const void* A_log, const void* dt_bias, const void* norm_w, float* state, void* conv_state, const int* cur,
                                                    int seq_stride, int slots, int sslots, void* y, void* ws, float* dbuf, const int* pend,
                                                    const swiftmk_dn_ind* ind, int pp_stride, cudaStream_t stream) {
-  if (slots <= T || slots > 16 || sslots < 1 || sslots > slots || B < 1 || T > TMAX || B * T > RMAX || (B > 1 && !ind)) return cudaErrorInvalidValue;
+  if (slots <= T || slots > 17 || sslots < 1 || sslots > slots || B < 1 || T > TMAX || B * T > RMAX || (B > 1 && (T > 8 || !ind))) return cudaErrorInvalidValue;
   Params p = {};
   p.qkv = (const __nv_bfloat16*)qkv; p.z = (const __nv_bfloat16*)z; p.a = (const __nv_bfloat16*)a; p.b = (const __nv_bfloat16*)b;
   p.conv_w = (const __nv_bfloat16*)conv_w; p.A_log = (const __nv_bfloat16*)A_log; p.dt_bias = (const __nv_bfloat16*)dt_bias;

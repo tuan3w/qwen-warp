@@ -20,6 +20,10 @@ import pack  # noqa: E402
 from weights import Checkpoint  # noqa: E402
 
 
+DS_OUT = 18  # include/engine_impl.h: device scalars ds[DS_TOK = 2 .. 17] tokens, ds[DS_OUT = 18 .. 33] argmax rows (TM = SMK_TMAX = 16 each)
+TMAX_WIDE = 16  # SMK_TMAX: Engine(tmax=TMAX_WIDE) steps up to 16 rows (wide verify, SpecEngine); tmax = 8 engines (batched decode, DFlash2, DSpine) are unchanged
+
+
 class Engine:
     def __init__(self, ctx_max=4096, kv_fp8=0, layers=pack.NL, lib="libswiftmk.so", verbose=True, head=None, tmax=None, host_tables=None, lm_head_host=None, state_slots=None):
         """state_slots: physical DeltaNet state slots (None = tmax + 1, the full ring; 1 = one in-place state, 151 MiB instead of (tmax + 1) x 151 MiB, bit-identical decode:
@@ -86,7 +90,9 @@ class Engine:
         if G.hq is not None:  # K9: quantised head + exact BF16 rescoring (the BF16 head above stays resident for the rescoring)
             m.head_q_kind, m.head_q, m.head_qs = self.hq_kind, p(G.hq.w), p(G.hq.s)
         self.m = m
-        self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet ring has tmax + 1 slots (8: +0.56 GiB, needed for the prompt-lookup tail)
+        self.tmax = int(tmax or os.environ.get("SMK_TMAX", 4))  # K11: largest step in rows; the DeltaNet conv ring has tmax + 1 slots (8: the prompt-lookup tail)
+        if state_slots is None and self.tmax > 8:
+            state_slots = 9  # tmax 16 (wide verify cycles, spec.py): physical DeltaNet state slots (include/deltanet.h swiftmk_deltanet_step_lazy2: any 1..tmax + 1 is exact): the 9 of a tmax = 8 engine, not 17 (+1.2 GiB)
         if state_slots is None:
             self.h = self.lib.smk_engine_create_ex(C.byref(m), ctx_max, kv_fp8, self.tmax)
         else:
@@ -155,14 +161,14 @@ class Engine:
         return self.read_out_tok()
 
     def _read(self, what, n, dtype):
-        """Copy n elements of the engine's debug buffer `what` (0 device state int[20], 1 dbg taps bf16 [66][8][5120], 2 logits fp32 [8][V]) to a host tensor."""
+        """Copy n elements of the engine's debug buffer `what` (0 device state int[20], 1 dbg taps bf16 [66][16][5120], 2 logits fp32 [8][V]) to a host tensor."""
         out = torch.empty(n, dtype=dtype)
         torch.cuda.synchronize()
         smk.check(self.lib.smk_engine_read(self.h, what, C.c_void_p(out.data_ptr()), out.numel() * out.element_size()), "read")
         return out
 
     def read_out_tok(self):
-        return int(self._read(0, 18, torch.int32)[10])
+        return int(self._read(0, DS_OUT + 1, torch.int32)[DS_OUT])
 
     def decode(self, n):
         out = (C.c_int * n)()
@@ -177,7 +183,7 @@ class Engine:
         arr = (C.c_int * T)(*toks)
         smk.check(self.lib.smk_engine_set_tokens(self.h, arr, T, self.st), "set_tokens")
         smk.check(self.lib.smk_engine_verify(self.h, T, self.st), "verify")
-        return [int(x) for x in self._read(0, 18, torch.int32)[10 : 10 + T]]
+        return [int(x) for x in self._read(0, DS_OUT + TMAX_WIDE, torch.int32)[DS_OUT : DS_OUT + T]]
 
     def commit(self, a, T):
         """Keep the first `a` rows of the last verify of T rows (pos += a, DeltaNet ring slot += a); rows a..T-1 are rolled back."""
@@ -194,7 +200,7 @@ class Engine:
 
     def dbg_hidden(self, T=1):
         """bf16 -> fp32 [66][T][5120] debug taps of the last step: slot 0 embedding, l+1 = after layer l, 65 = final norm out."""
-        x = self._read(1, 66 * 8 * 5120, torch.bfloat16).view(66, 8, 5120)
+        x = self._read(1, 66 * TMAX_WIDE * 5120, torch.bfloat16).view(66, TMAX_WIDE, 5120)
         return x[:, :T].float()
 
     def logits(self, T=1):

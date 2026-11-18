@@ -37,6 +37,7 @@ import torch
 
 ENGINE = Path(__file__).resolve().parent.parent / "engine"
 sys.path.insert(0, str(ENGINE))
+from engine import TMAX_WIDE  # noqa: E402
 from spec import SpecEngine, make_pld, smk  # noqa: E402
 from prefill import FastPrefill, MMRows  # noqa: E402
 from vision import IMAGE_TOKEN, VISION_END, VISION_START, ImageInput, cache_key, mrope_positions  # noqa: E402
@@ -146,7 +147,8 @@ class Runner:
         self.max_num_seqs = max_num_seqs
         self.bd = None  # engine/batch.py BatchDecoder (max_num_seqs > 1)
         self.k, self.group, self.max_snaps, self.log = k, group, max_snaps, log
-        self.pld = (make_pld() if pld is True else pld) or None
+        # chain extension + wide verify (make_pld defaults) are for the single-sequence MTP engine (tmax = 16); the batched decoder and the DFlash2 engine (tmax = 8) keep the plain tail: their captured graphs would cost device memory per slot
+        self.pld = ((make_pld() if max_num_seqs == 1 and drafter == "mtp" else make_pld(ext=0, wide=0)) if pld is True else pld) or None
         self.drafter = drafter
         self.df = drafter == "dflash2"
         self.df_lo = self.df_hi = 0  # drafter K/V rows [df_lo, df_hi) of the device lineage's prompt are valid (see _df_note); empty when equal
@@ -176,7 +178,7 @@ class Runner:
                 self.bd = BatchDecoder(slots=max_num_seqs, ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, host_tables=host_tables)
                 engines = self.bd.slots
             else:
-                engines = [SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=8 if self.pld else 4, host_tables=host_tables)]
+                engines = [SpecEngine(ctx_max=ctx_max, kv_fp8=kv_fp8, verbose=False, tmax=TMAX_WIDE if self.pld else 4, host_tables=host_tables)]
         except AttributeError as ex:  # ctypes: symbol missing in an old libswiftmk.so
             raise RuntimeError(f"libswiftmk.so is older than the sources ({ex}): run `make -C engine` (or point SMK_BUILD at a current build dir)") from ex
         self.seqs = [Seq(i, x, FastPrefill(x, seg=seg, **({} if min_fast is None else {"min_fast": min_fast}))) for i, x in enumerate(engines)]
@@ -200,8 +202,8 @@ class Runner:
     # ------------------------------------------------------------------------------------------------ helpers
     @staticmethod
     def slack(group, k, pld=False):
-        """Positions above max-model-len the engine needs: a sync launches `group` cycles of up to k+1 tokens (8 with the prompt-lookup tail) past the stop, plus the verify rows."""
-        return group * (8 if pld else k + 1) + 16
+        """Positions above max-model-len the engine needs: a sync launches `group` cycles of up to k+1 tokens (16 with the prompt-lookup tail: a wide verify cycle) past the stop, plus the verify rows."""
+        return group * (16 if pld else k + 1) + 16
 
     def _cur(self):
         torch.cuda.current_stream().synchronize()  # the engine stream only: an asynchronous snapshot copy on the side stream keeps running (see _snapshot)
@@ -268,7 +270,7 @@ class Runner:
         fp.dn_conv[:, cur].copy_(s.conv)
         if s.aux is not None:
             e.kv_aux_restore(s.aux)
-        fp.ds[19] = 0  # DS_PEND (engine_impl.h): the restored state replaces what the lazy DeltaNet ring still held pending from the previous request (the prefill's materialize would replay it on top)
+        fp.ds[FastPrefill.DS_PEND] = 0  # DS_PEND (engine_impl.h): the restored state replaces what the lazy DeltaNet ring still held pending from the previous request (the prefill's materialize would replay it on top)
         fp.ds[0] = s.pos
         e.pos = s.pos
         torch.cuda.synchronize()

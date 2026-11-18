@@ -321,7 +321,7 @@ class TapCapture:
         self.e, self.rows = eng, rows
         self.buf = torch.empty(5, rows, H, dtype=torch.bfloat16, device="cuda")
         self.last = torch.empty(5, H, dtype=torch.bfloat16, device="cuda")
-        self.dbg = _view(eng.lib.smkp_engine_ptr(eng.h, 7), 66 * 8 * H * 2, torch.bfloat16).view(66, 8, H)[TAP_SLOTS[0] : TAP_SLOTS[-1] + 1 : 14]  # [5][8][H] strided view of the 5 slots
+        self.dbg = _view(eng.lib.smkp_engine_ptr(eng.h, 7), 66 * 16 * H * 2, torch.bfloat16).view(66, 16, H)[TAP_SLOTS[0] : TAP_SLOTS[-1] + 1 : 14]  # [5][8][H] strided view of the 5 slots
         self.lo = self.hi = 0
         self.nbytes = (self.buf.numel() + self.last.numel()) * 2
 

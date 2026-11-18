@@ -1,4 +1,4 @@
-// swift-mk K1: gated DeltaNet decode (T = 1..8 rows) for one linear-attention layer.  See docs/ARCHITECTURE.md for the contract.
+// swift-mk K1: gated DeltaNet decode (T = 1..8 rows; the lazy single-sequence entry T = 1..16) for one linear-attention layer.  See docs/ARCHITECTURE.md for the contract.
 //
 // One launch fuses: causal conv1d(k=4) + SiLU on q|k|v, L2-norm q,k (eps 1e-6 inside rsqrt), q *= 128^-0.5,
 // g = -exp(A_log)*softplus(a+dt_bias), beta = sigmoid(b), delta-rule update S = exp(g) S; d = (v - S k) beta; S += d (x) k; o = S q,
@@ -25,20 +25,20 @@ extern "C" {
 #define SWIFTMK_DN_DV 128
 #define SWIFTMK_DN_DK 128
 #define SWIFTMK_DN_CONVD 10240
-#define SWIFTMK_DN_MAX_SLOTS 9  // ring slots at tmax = 8; the engine allocates tmax + 1 (smk_engine_create_ex)
+#define SWIFTMK_DN_MAX_SLOTS 17  // ring slots at tmax = 16; the engine allocates tmax + 1 (smk_engine_create_ex)
 #define SWIFTMK_DN_STATE_SLOT_FLOATS (48 * 128 * 128)
 #define SWIFTMK_DN_CONV_SLOT_ELEMS (10240 * 3)
 #define SWIFTMK_DN_LAZY_ROWS 16  // rows of the per-layer delta buffer of the lazy engine entry
 
 size_t swiftmk_deltanet_ws_bytes(void);
 
-// Returns cudaSuccess or the launch error; T must be 1..8 and < slots.
+// Returns cudaSuccess or the launch error; T must be 1..8 and < slots (lazy entries: 1..16, B > 1: 1..8).
 cudaError_t swiftmk_deltanet_step(int T, const void* qkv, const void* z, const void* a, const void* b, const void* conv_w,
                                   const void* A_log, const void* dt_bias, const void* norm_w, float* state,
                                   void* conv_state, const int* cur, int slots, void* y, void* ws, cudaStream_t stream);
 
 // ---- Engine entry with lazy ring snapshots (K12).  A step with T >= 2 does not write its T per-row state snapshots to the ring; it appends the rank-1 updates of its rows to a
-// per-layer delta buffer (swiftmk_deltanet_dbuf_floats() floats, SWIFTMK_DN_LAZY_ROWS rows).  Device scalar *pend = p | base << 8 | half << 12 (p = pending rows, base = ring slot of a full
+// per-layer delta buffer (swiftmk_deltanet_dbuf_floats() floats, SWIFTMK_DN_LAZY_ROWS rows).  Device scalar *pend = p | base << 8 | half << 13 (p = pending rows, base = ring slot of a full
 // state, p == 0: slot cur itself is the state): the state at slot cur is "slot base + the first p delta rows".  Whoever advances cur by `a` accepted rows after a T >= 2
 // step does *pend = dn_pend_after(...) (engine_impl.h); after a T == 1 step (full snapshot written to slot cur+1) *pend = 0.  A step replays the pending rows bitwise like the
 // recurrence did.  Anything that reads or writes the state ring from outside (snapshot, prefill) calls swiftmk_deltanet_materialize first: it writes the pending state of

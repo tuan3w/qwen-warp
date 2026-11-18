@@ -1,5 +1,6 @@
 // swift-mk K4: MTP speculative decoding on the device (draft stage, accept kernel, cycle graphs).  See include/mtp.h.
 // K7: sampling graphs (temperature / top-k / top-p, exact speculative sampling) share the structure; kernels in mtp_sample.cu.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <immintrin.h>
@@ -37,7 +38,7 @@ __global__ void k_map_draft(const int* __restrict__ idx, const int* __restrict__
 __global__ void k_pld_report(const int* ds, int* ss, PldRes* res) {
   const int l = threadIdx.x;
   const int a = ss[SS_A];
-  if (l < 8) res->y[l] = l < a ? ss[SS_MTOK + l] : -1;
+  if (l < 16) res->y[l] = l < a ? ss[SS_MTOK + l] : -1;
   if (l < SMK_SPEC_KMAX) res->d[l] = ds[DS_TOK + 1 + l];
   if (l == 0) res->a = a;
   __threadfence_system();
@@ -154,6 +155,8 @@ static void drop_graphs(smk_spec* s) {
   for (int m = 0; m < 2; m++)
     for (auto* arr : {s->g_cycle[m], s->g_verify[m], s->g_stage[m], s->g_cu[m], s->g_start[m], s->g_pld[m]})
       for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
+  for (auto& arr : s->g_pldx)
+    for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (arr[i]) { cudaGraphExecDestroy(arr[i]); arr[i] = nullptr; }
   for (int i = 0; i <= SMK_SPEC_PMAX; i++) if (s->g_smp_t[i]) { cudaGraphExecDestroy(s->g_smp_t[i]); s->g_smp_t[i] = nullptr; }
   for (int i = 0; i <= SMK_SPEC_KMAX; i++) if (s->g_smp_d[i]) { cudaGraphExecDestroy(s->g_smp_d[i]); s->g_smp_d[i] = nullptr; }  // g_smp_d has KMAX + 1 entries (the old shared PMAX loop ran past it into res / res_dev / pin_tail / pld)
   for (int i = 0; i <= TM; i++) if (s->g_prefill[i]) { cudaGraphExecDestroy(s->g_prefill[i]); s->g_prefill[i] = nullptr; }
@@ -196,7 +199,7 @@ smk_spec* smk_spec_create(smk_engine* e, const smk_mtp_w* w, int head_mode) {
   s->ws_d = (uint64_t*)dalloc(e, sizeof(uint64_t) * SK_WS_ENTRIES, true);
   if (cudaHostAlloc((void**)&s->res, sizeof(PldRes), cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer((void**)&s->res_dev, s->res, 0) != cudaSuccess) { smk_spec_destroy(s); return nullptr; }
   memset((void*)s->res, 0, sizeof(PldRes));
-  cudaMallocHost((void**)&s->pin_tail, 8 * sizeof(int));
+  cudaMallocHost((void**)&s->pin_tail, 16 * sizeof(int));
   cudaMallocHost((void**)&s->pinned_ss, SS_N * sizeof(int));
   cudaMallocHost((void**)&s->pinned_ring, RING * sizeof(int));
   s->bytes = e->bytes - b0;
@@ -333,15 +336,28 @@ cudaError_t smk_spec_pld_begin(smk_spec* s, const int* ctx, int n, cudaStream_t 
   CKS(cudaMemcpy(s->ss + SS_PLDSEQ, &zero, sizeof(int), cudaMemcpyHostToDevice));
   s->res->seq = 0;
   s->pld_seq = 0;
+  s->pld_pe = 0;
+  s->pld_pa = 99;
+  s->pld_wide = 0;
   return cudaSuccess;
 }
 
+#define PA_MIN 4
 static inline long long now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // the hybrid cycle graph of k drafts: verify T = k + 1 rows + accept + MTP catch-up (k + 1 rows) + 3 chain drafts + the result mailbox write
-static cudaError_t pld_cycle(smk_spec* s, int k, bool samp, cudaStream_t c) {
+// wide verify cycles (T = 9..16): the engine step needs tmax = 16, the bf16 or int4 KV cache (attn.cu) and the quantised head (the BF16 head's mma is T <= 8); greedy only.  Returns the
+// longest tail the proposer may propose when a long match is confident (0 = wide cycles off).
+static int wide_tail_of(const smk_spec* s) {
+  const smk_engine* e = s->e;
+  if (e->tmax < 16 || e->kv_dtype == 1 || !e->hq_on) return 0;
+  const int t = s->opts.reserved[2];
+  return t < 0 ? 0 : (t > 12 ? 12 : t);
+}
+
+static cudaError_t pld_cycle(smk_spec* s, int k, bool samp, int ext, cudaStream_t c) {
   CKS(verify_accept(s, k, samp, c));
-  CKS(mtp_stage(s, k + 1, SMK_SPEC_KMAX, false, samp, c));
+  CKS(mtp_stage(s, k + 1, SMK_SPEC_KMAX + ext, false, samp, c));
   k_pld_report<<<1, 32, 0, c>>>(s->e->ds, s->ss, s->res_dev);
   return cudaGetLastError();
 }
@@ -352,8 +368,13 @@ cudaError_t smk_spec_pld_prewarm(smk_spec* s) {
   for (int samp = 0; samp < 2; samp++) {
     if (samp && (s->head_mode == 1 || s->w.head_nv > SK_NCH_D * SK_CHUNK)) continue;  // sampling graphs are not available (smk_spec_set_sampling refuses them too)
     for (int k = SMK_SPEC_KMAX; k <= SMK_SPEC_KMAX + s->opts.cfg.max_tail; k++)
-      CKS(smk_graph_capture(s->e, &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp != 0, c); }));
+      CKS(smk_graph_capture(s->e, &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp != 0, 0, c); }));
   }
+  for (int k = SMK_SPEC_KMAX + 5; k <= SMK_SPEC_KMAX + wide_tail_of(s); k++)  // wide cycles (greedy only): T = 9 .. 4 + wide tail
+    CKS(smk_graph_capture(s->e, &s->g_pld[0][k], [&](cudaStream_t c) { return pld_cycle(s, k, false, 0, c); }));
+  for (int x = 1; x <= s->opts.reserved[1] && x <= 4; x++)  // greedy only
+    for (int k = SMK_SPEC_KMAX; k <= std::min(SMK_SPEC_KMAX + std::max(s->opts.cfg.max_tail, x), s->e->tmax - 1); k++)
+      CKS(smk_graph_capture(s->e, &s->g_pldx[x][k], [&](cudaStream_t c) { return pld_cycle(s, k, false, x, c); }));
   return cudaSuccess;
 }
 
@@ -363,20 +384,36 @@ cudaError_t smk_spec_run_pld(smk_spec* s, int n, cudaStream_t st, int* host_ss, 
   sync_epoch(s);
   const bool samp = s->samp;
   const smk_pld_opts& o = s->opts;
+  const int narrow = s->opts.cfg.max_tail, wide = samp ? 0 : wide_tail_of(s);
   for (int i = 0; i < n; i++) {
     const long long t0 = now_ns();
-    int tail[8] = {}, l = 0;
-    int ln = smk_pld_propose(s->pld, s->pld_d, SMK_SPEC_KMAX, tail, &l);
+    int tail[16] = {}, l = 0;
+    // wide tail (rare path): right after a cycle of >= 8 rows that accepted every row for a match of agreement >= reserved[3]; after any other cycle only for a match of agreement
+    // >= reserved[4] (0: off: a long copy that was just re-synchronised after a break); with room in the caches for 16 + 4 more positions
+    const bool wide_ok = wide > narrow && smk_pld_len(s->pld) + 24 <= e->ctx_max;
+    int ln = smk_pld_propose_ex(s->pld, s->pld_d, SMK_SPEC_KMAX, wide_ok ? wide : narrow, s->opts.cfg.min_len, tail, &l);
+    if (ln > narrow) {
+      const int need = s->pld_wide ? o.reserved[3] : (o.reserved[4] > 0 ? o.reserved[4] : 1 << 30);
+      if (l < need) ln = narrow;
+    }
     if (o.force_n > 0) { ln = o.force_n < 4 ? o.force_n : 4; for (int j = 0; j < ln; j++) tail[j] = o.force_tok[j]; }
-    const int k = SMK_SPEC_KMAX + ln;
+    int k = SMK_SPEC_KMAX + ln;
+    bool used_ext = false;
     if (ln > 0) {
       memcpy(s->pin_tail, tail, ln * sizeof(int));
       CKS(cudaMemcpyAsync(e->ds + DS_TOK + 1 + SMK_SPEC_KMAX, s->pin_tail, ln * sizeof(int), cudaMemcpyHostToDevice, st));
-      s->pld_stat[8] += ln;
-      s->pld_stat[9]++;
+      s->pld_stat[16] += ln;
+      s->pld_stat[17]++;
+    } else if (s->pld_pe > 0) {  // no prompt-lookup tail: the extra chain drafts the previous cycle left in ds[TOK + 4 ..] are verified instead (greedy only)
+      k = SMK_SPEC_KMAX + s->pld_pe;
+      used_ext = true;
+      s->pld_stat[20]++;
     }
+    // chain extension for the NEXT cycle (only worth its MTP layer + head passes when that cycle will have no tail: predicted from this one)
+    const int ext = (!samp && ln == 0 && o.force_n == 0 && s->pld_pa >= PA_MIN) ? std::min(o.reserved[1], std::min(4, e->tmax - 1 - SMK_SPEC_KMAX)) : 0;
+    s->pld_pe = ext;
     s->pld_stat[k]++;
-    CKS(smk_graph_launch(e, &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp, c); }, st));
+    CKS(smk_graph_launch(e, ext ? &s->g_pldx[ext][k] : &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp, ext, c); }, st));
     const long long t1 = now_ns();
     const int want = ++s->pld_seq;
     uint64_t spins = 0;
@@ -391,12 +428,16 @@ cudaError_t smk_spec_run_pld(smk_spec* s, int n, cudaStream_t st, int* host_ss, 
     std::atomic_thread_fence(std::memory_order_acquire);
     const long long t2 = now_ns();
     const int a = s->res->a;
-    int y[8];
-    for (int j = 0; j < 8; j++) y[j] = s->res->y[j];
+    s->pld_pa = a;
+    if (used_ext) s->pld_stat[21] += a;
+    s->pld_wide = a == k + 1 && k >= 7;
+    if (k >= 8) { s->pld_stat[22]++; s->pld_stat[23] += a; }
+    int y[16];
+    for (int j = 0; j < 16; j++) y[j] = s->res->y[j];
     for (int j = 0; j < SMK_SPEC_KMAX; j++) s->pld_d[j] = s->res->d[j];
     smk_pld_append(s->pld, y, a);
-    s->pld_stat[10] += t2 - t1;
-    s->pld_stat[11] += (t1 - t0) + (now_ns() - t2);
+    s->pld_stat[18] += t2 - t1;
+    s->pld_stat[19] += (t1 - t0) + (now_ns() - t2);
   }
   CKS(cudaMemcpyAsync(s->pinned_ss, s->ss, SS_N * sizeof(int), cudaMemcpyDeviceToHost, st));
   CKS(cudaMemcpyAsync(s->pinned_ring, s->ring, RING * sizeof(int), cudaMemcpyDeviceToHost, st));

@@ -14,7 +14,7 @@
 
 namespace smk {
 constexpr int H = SMK_HIDDEN, I = SMK_INTER, VOC = SMK_VOCAB, NLAYER = SMK_NLAYERS, TM = SMK_TMAX, TR = SMK_RMAX;
-constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = 10, DS_SLOTS = 18, DS_PEND = 19, DS_RDELTA = 20, DS_N = 21;  // DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | delta-buffer parity << 8 (deltanet.h);
+constexpr int DS_POS = 0, DS_CUR = 1, DS_TOK = 2, DS_OUT = DS_TOK + TM, DS_SLOTS = DS_OUT + TM, DS_PEND = DS_SLOTS + 1, DS_RDELTA = DS_PEND + 1, DS_N = DS_RDELTA + 1;  // TM tokens, TM argmax rows; DS_SLOTS: DeltaNet ring slots (tmax + 1); DS_PEND: pending lazy DeltaNet rows | base slot << 8 | delta-buffer half << 13 (deltanet.h);
 // DS_RDELTA: MRoPE rope offset of the sequence (rope position = KV position + delta; set per request by the host, 0 for text-only prompts; include/attn.h)
 constexpr int DBG_SLOTS = NLAYER + 2;  // 0 embed, 1..64 layer outputs, 65 final norm out
 constexpr int NHEAD_MODES = 3;         // head 0: none, 1: final norm + lm_head + argmax, 2: final norm only (MTP prefill chunks)
@@ -26,10 +26,10 @@ constexpr int HEAD_R_GREEDY = 16, HEAD_R_SAMPLING = 64;
 __device__ __forceinline__ void dn_pend_after(int* ds, int a, int T) {
   if (T < 2) { ds[DS_PEND] = 0; return; }
   const int pv = ds[DS_PEND];
-  int pc = pv & 255, base = (pv >> 8) & 15, half = (pv >> 12) & 1;
+  int pc = pv & 255, base = (pv >> 8) & 31, half = (pv >> 13) & 1;
   if (pc == 0) base = ds[DS_CUR];
   else if (pc + T > SWIFTMK_DN_LAZY_ROWS) { pc = 0; base = ds[DS_CUR]; half ^= 1; }
-  ds[DS_PEND] = (pc + a) | (base << 8) | (half << 12);
+  ds[DS_PEND] = (pc + a) | (base << 8) | (half << 13);
 }
 }  // namespace smk
 

@@ -8,6 +8,7 @@ each idea comes from.
 
 | Test | Needs | Time | Catches |
 |---|---|---|---|
+| `tests/test_spec_wide.py` | GPU | 1 min | chain extension and wide verify: both engage, teacher-forced agreement with plain 8-row verify >= 0.98 (negative control below 0.9), deterministic ids |
 | `tests/test_dspine_quant.py` | CPU | 3 s | quantiser error, layout, NaN / inf scales on extreme inputs |
 | `tests/test_toolcall_validator.py` | CPU | 1 s | the tool-call validator itself: 16 good / broken calls (a validator that accepts everything checks nothing) |
 | `tests/test_dspine_vocab.py` | CPU + tokenizer files | 10 s | draft-vocabulary coverage per language, structural facts of the list |

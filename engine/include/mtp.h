@@ -17,9 +17,9 @@ extern "C" {
 #endif
 
 #define SMK_SPEC_KMAX 3     // MTP chain drafts
-#define SMK_SPEC_PMAX 7     // K11: chain + prompt-lookup tail: verify rows 1 + k <= 8 (needs an engine with tmax = 8 for k > 3)
+#define SMK_SPEC_PMAX 15    // K11: chain + prompt-lookup tail: verify rows 1 + k <= 16 (needs an engine with tmax = 8 for k > 3, tmax = 16, a bf16 or int4 KV cache (not fp8) for k > 7)
 #define SMK_SPEC_RING 4096   // device output ring (tokens); the host must fetch at least every RING/2 tokens
-#define SMK_SPEC_SS_N 64     // host-visible device state ints (see smk_spec_run)
+#define SMK_SPEC_SS_N 72     // host-visible device state ints (see smk_spec_run)
 
 // MTP weights in engine layouts (python packer: pack_mtp.py).  W4 = uint32 [N][K/8] + bf16 scale [N][K/128].
 typedef struct smk_mtp_w {
@@ -70,7 +70,9 @@ typedef struct smk_pld_opts {
   smk_pld_cfg cfg;      // proposer (smk_pld_default_cfg: n = 2 longest suffix, agreement >= 3, tail <= 4 = E6's E3 cell)
   int force_n;          // TEST ONLY: > 0: every cycle carries exactly these force_n tail tokens (force_tok) instead of the proposer's
   int force_tok[4];
-  int reserved[6];
+  int reserved[6];      // [1]: chain extension (greedy, tail-less cycles) = extra MTP drafts; [2]: wide tail (0 = off): after a fully accepted cycle of >= 8 rows a prompt-lookup match of agreement
+                        // >= reserved[3] proposes up to reserved[2] (<= 12) tail tokens, i.e. verify steps of up to 16 rows (engine tmax = 16, bf16 or int4 KV cache (not fp8), quantised head, greedy only); [4]: the same after
+                        // any other cycle for a match of agreement >= reserved[4] (0: off)
 } smk_pld_opts;
 // opts == NULL: disable (smk_spec_run_pld then behaves like smk_spec_run with k = 3 but host-driven).  Resets the statistics.
 cudaError_t smk_spec_pld_config(smk_spec* s, const smk_pld_opts* opts);
@@ -81,8 +83,8 @@ cudaError_t smk_spec_pld_prewarm(smk_spec* s);
 cudaError_t smk_spec_pld_begin(smk_spec* s, const int* ctx, int n, cudaStream_t st);
 // n cycles, one host round trip each (width chosen per cycle); then copies the device state ints and the output ring to the host exactly like smk_spec_run.
 cudaError_t smk_spec_run_pld(smk_spec* s, int n, cudaStream_t st, int* host_ss, int* host_ring);
-// out[16] int64: [1..7] cycles launched with k drafts (T = k + 1 rows), [8] tail tokens proposed, [9] cycles with a tail, [10] host wait for the result (ns), [11] host proposer + launch work (ns),
-// [12] unused.  ss[16 + m] (smk_spec_run's histogram) counts cycles by accepted drafts m = 0..7.
+// out[32] int64: [1..15] cycles launched with k drafts (T = k + 1 rows), [16] tail tokens proposed, [17] cycles with a tail, [18] host wait for the result (ns), [19] host proposer + launch work (ns),
+// [20] chain-extension cycles, [21] tokens accepted by them, [22] wide cycles (T > 8), [23] tokens emitted by them.  ss[16 + m] (smk_spec_run's histogram) counts cycles by accepted drafts m = 0..7 (m >= 7 in the last bin).
 cudaError_t smk_spec_pld_stats(smk_spec* s, long long* out);
 // ------------------------------------------------------------------------------------------------ K7: sampling with exact speculative verification
 // temperature > 0 switches the spec cycle (and smk_spec_start / smk_spec_sample_first / smk_spec_plain_run) to the sampling graphs; temperature == 0 = the greedy graphs above.
