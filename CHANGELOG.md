@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The prompt-lookup cycle loop (`smk_spec_run_pld`) queries the stream once right after each cycle launch. Under WDDM (Windows, WSL2) the driver batches submitted work until something flushes it, and the loop polls a host-mapped mailbox, which does not flush, so each cycle waited for the periodic `cudaStreamQuery` (every 1,048,576 spins): on WSL2 the tail halved decode speed (88 against 172 tok/s with `--prompt-lookup 0`; 194 tok/s with the query). Reported with the patch and measurements by @ManetteBE in #20; the effect is not reproduced here (no Windows machine): on Linux the query costs nothing measurable (`scripts/bench_decode.py --set dev`, patched against unpatched, two interleaved runs each: new-cycle geomean 189.8 / 190.0 against 190.2 / 189.9 tok/s). `cudaStreamQuery` as a flush is a driver behaviour that NVIDIA does not document as a guarantee.
+
 ## 0.11.0 - 2026-11-18
 
 ### Added
