@@ -94,7 +94,7 @@ KV_NAMES = ("bf16", "fp8", "int4")
 # buffers; --host-tables moves the 4.7 GiB bf16 embedding + lm_head to pinned host memory; the tail adds the 9-slot ring and its cycle graphs.
 # The server compares it with the memory that is free at start instead of trusting lengths measured next to some other desktop.
 VRAM_FIXED_MIB = {(False, False): 20740, (False, True): 21312, (True, False): 15800, (True, True): 16488}
-VRAM_WIDE_MIB = 232  # the single-sequence MTP engine with the tail is a tmax = 16 engine (chain extension + wide verify, include/mtp.h): its 17-slot conv ring and the extra cycle graphs; measured with `--profile long`: 22,186 against 21,966 MiB in use after the warm-up (+220), and +224 MiB in an engine-level run
+VRAM_WIDE_MIB = 150  # the single-sequence MTP engine with the tail is a tmax = 16 engine (chain extension + wide verify, include/mtp.h): its 17-slot conv ring (+30 MiB) and the extra cycle graphs (+112 MiB: the wide widths and the two extension widths); engine level, 16,264 against 16,122 MiB after enable_pld
 VRAM_KIB_PER_TOKEN = (72.0, 40.0, 24.5)
 VRAM_KV_FIXED_MIB = (0, 0, 34)  # per kv dtype: the int4 cache's exact fp16 sink rows and recent-token ring (engine/src/kvrot.cuh) are a fixed device allocation, not per token (torch.cuda.mem_get_info: +34 MiB at 8 K and 64 K tokens)
 MIN_HEADROOM_MIB = 64  # refuse to start with less than this predicted to be left after a request at --max-model-len (the prediction is good to +-40 MiB)

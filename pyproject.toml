@@ -8,10 +8,10 @@ requires-python = "==3.12.*"
 # Versions the engine and server were built and measured with (CUDA 13.0 toolkit, driver >= 580).
 # torch / torchvision / torchaudio come from PyTorch's own cu130 index (see [tool.uv.sources]) so the CUDA runtime matches the nvcc 13.0 the engine is built with.
 dependencies = [
-    "torch==2.13.0",
-    "torchvision==0.28.0",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
     "torchaudio==2.11.0",
-    "vllm==0.32.0",
+    "vllm==0.34.0",
     "flash-linear-attention==0.5.2",
     "transformers==5.18.0",
     "numpy==2.3.5",
@@ -28,6 +28,9 @@ dev = [
 
 [tool.uv]
 package = false             # not a Python package: engine/ and server/ are run in place
+# vLLM declares setuptools<81; the open advisories (sdist MANIFEST.in bypass, Windows path escape while installing a legacy wheel) are fixed in 83.0.0 / 84.1.0.
+# The server and the tests were run with 84.2.1 (see CHANGELOG).
+override-dependencies = ["setuptools>=84.1.0"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }

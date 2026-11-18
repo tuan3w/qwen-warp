@@ -20,7 +20,7 @@ open an issue so others know. Back to the [README](../README.md).
 | [bad_words and structured output](#bad_words-and-structured-output) | HTTP 400; each needs device-side state per verify row | a matcher or a grammar automaton in the cycle |
 | [Processors on the draft head](#logit-processors-on-the-draft-head) | the draft proposals ignore them; -15% tok/s with five of them together at T 0.7 | apply them to the draft logits, keep the exactness test green |
 | [Why bf16 KV is below a reference service on tool calls](#why-bf16-kv-is-below-a-reference-service-on-tool-calls) | 93% against 98%, cause not isolated | a controlled comparison on identical contexts |
-| [Upgrading vLLM](#upgrading-vllm) | pinned to 0.32.0 (0.30.0 before: 24 security advisories fixed); 0.33.0 needs torch 2.14 | a scratch environment and `make test` |
+| [Upgrading vLLM](#upgrading-vllm) | pinned to 0.34.0 with torch 2.14 (0.32.0 before; 0.30.0 before that: 24 security advisories fixed); one internal moved | a scratch environment and `make test` |
 
 Out of scope: other models, other GPUs, batching. (If you try another GPU, the build takes `ARCH=-arch=sm_XX`, but nothing outside sm_86 has been tried.)
 
@@ -117,8 +117,8 @@ The sampler is exact ([Performance](PERFORMANCE.md#tool-calls)), so the gap is u
 
 ## Upgrading vLLM
 
-The environment pins `vllm==0.32.0` (`pyproject.toml`, `uv.lock`); 0.33.0 exists (PyPI, 2026-11-04) but needs `torchvision==0.29.0`, so torch 2.14 and a new Triton (it resolves with the torch pins relaxed; it was not installed or run). Moving 0.30.0 to 0.32.0 broke two things that no test of the old pin could show: the server patched `MultiModalRegistry._get_cache_type` (now `vllm.multimodal.cache.factories._get_cache_type`), and 0.32 hands the model raw uint8 pixels (`mm_device_do_normalize`, on by default) where this engine's ViT takes normalised floats, so images were misread until `serve.py` switched it off. The engine-core client (`server/smk_core_client.py`: `EngineCoreClient.make_async_mp_client`, `SamplingParams._validate_spec_decode`) and the
-tool-schema hook (`server/tool_schema.py`: `vllm.renderers.hf.safe_apply_chat_template`) depend on vLLM internals of 0.32.0; no other version was run since. **To settle it.** In a scratch environment, bump vLLM (and whatever torch it needs), run `make test`, and
+The environment pins `vllm==0.34.0` with `torch==2.14.0` and `torchvision==0.29.0` (`pyproject.toml`, `uv.lock`; 0.34.0 itself needs `setuptools<81`, which `override-dependencies` lifts for the open setuptools advisories). Moving 0.30.0 to 0.32.0 broke two things that no test of the old pin could show: the server patched `MultiModalRegistry._get_cache_type` (now `vllm.multimodal.cache.factories._get_cache_type`), and 0.32 hands the model raw uint8 pixels (`mm_device_do_normalize`, on by default) where this engine's ViT takes normalised floats, so images were misread until `serve.py` switched it off. Moving 0.32.0 to 0.34.0 moved one import (`make_arg_parser` and `validate_parsed_serve_args` are in `vllm.entrypoints.common.cli_args`) and changed the numerics of the prefill enough that the seeded sampled stream of `tests/data/text_ids_v070.json` draws other tokens (all greedy ids are unchanged; the reference was re-pinned). The engine-core client (`server/smk_core_client.py`: `EngineCoreClient.make_async_mp_client`, `SamplingParams._validate_spec_decode`) and the
+tool-schema hook (`server/tool_schema.py`: `vllm.renderers.hf.safe_apply_chat_template`) depend on vLLM internals of 0.34.0; no other version was run since. **To settle it.** In a scratch environment, bump vLLM (and whatever torch it needs), run `make test`, and
 fix what breaks.
 
 ## How to help

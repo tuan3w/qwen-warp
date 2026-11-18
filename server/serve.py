@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""qwen-warp server: vLLM 0.30's own OpenAI frontend (run_server) on top of the swift-mk CUDA-graph decode engine (RTX 3090, Swift-1.5-Qwen3.8-27B INT4).
+"""qwen-warp server: vLLM's own OpenAI frontend (run_server) on top of the swift-mk CUDA-graph decode engine (RTX 3090, Swift-1.5-Qwen3.8-27B INT4).
 
   python server/serve.py --port 8000                          # default: bf16 KV, 20k context, MTP k=3 + prompt lookup, one request at a time
   python server/serve.py --profile long --port 8000           # int4 KV + host-pinned tables: 196k context (up to 262144 with --max-model-len 262144)
@@ -30,7 +30,7 @@ MAX_IMAGES = 4  # default --limit-mm-per-prompt image count
 
 
 def parse_args(argv=None):
-    from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+    from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     parser = make_arg_parser(FlexibleArgumentParser(description=__doc__, formatter_class=__import__("argparse").RawDescriptionHelpFormatter))
