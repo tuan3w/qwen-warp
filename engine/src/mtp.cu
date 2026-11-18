@@ -355,6 +355,9 @@ static int wide_tail_of(const smk_spec* s) {
   return t < 0 ? 0 : (t > 12 ? 12 : t);
 }
 
+// extra chain drafts of a tail-less cycle (0 = chain extension off)
+static int ext_of(const smk_spec* s) { return std::max(0, std::min(s->opts.reserved[1], std::min(4, s->e->tmax - 1 - SMK_SPEC_KMAX))); }
+
 static cudaError_t pld_cycle(smk_spec* s, int k, bool samp, int ext, cudaStream_t c) {
   CKS(verify_accept(s, k, samp, c));
   CKS(mtp_stage(s, k + 1, SMK_SPEC_KMAX + ext, false, samp, c));
@@ -372,8 +375,9 @@ cudaError_t smk_spec_pld_prewarm(smk_spec* s) {
   }
   for (int k = SMK_SPEC_KMAX + 5; k <= SMK_SPEC_KMAX + wide_tail_of(s); k++)  // wide cycles (greedy only): T = 9 .. 4 + wide tail
     CKS(smk_graph_capture(s->e, &s->g_pld[0][k], [&](cudaStream_t c) { return pld_cycle(s, k, false, 0, c); }));
-  for (int x = 1; x <= s->opts.reserved[1] && x <= 4; x++)  // greedy only
-    for (int k = SMK_SPEC_KMAX; k <= std::min(SMK_SPEC_KMAX + std::max(s->opts.cfg.max_tail, x), s->e->tmax - 1); k++)
+  // chain extension graphs (greedy only): a cycle with extension drafts has no tail, so it verifies k = 3 (nothing staged) or k = 3 + x (the previous cycle's x extra drafts), x = ext_of(s)
+  if (const int x = ext_of(s); x > 0)
+    for (int k : {SMK_SPEC_KMAX, SMK_SPEC_KMAX + x})
       CKS(smk_graph_capture(s->e, &s->g_pldx[x][k], [&](cudaStream_t c) { return pld_cycle(s, k, false, x, c); }));
   return cudaSuccess;
 }
@@ -410,7 +414,7 @@ cudaError_t smk_spec_run_pld(smk_spec* s, int n, cudaStream_t st, int* host_ss, 
       s->pld_stat[20]++;
     }
     // chain extension for the NEXT cycle (only worth its MTP layer + head passes when that cycle will have no tail: predicted from this one)
-    const int ext = (!samp && ln == 0 && o.force_n == 0 && s->pld_pa >= PA_MIN) ? std::min(o.reserved[1], std::min(4, e->tmax - 1 - SMK_SPEC_KMAX)) : 0;
+    const int ext = (!samp && ln == 0 && o.force_n == 0 && s->pld_pa >= PA_MIN) ? ext_of(s) : 0;
     s->pld_pe = ext;
     s->pld_stat[k]++;
     CKS(smk_graph_launch(e, ext ? &s->g_pldx[ext][k] : &s->g_pld[samp][k], [&](cudaStream_t c) { return pld_cycle(s, k, samp, ext, c); }, st));
