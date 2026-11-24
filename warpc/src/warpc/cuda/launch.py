@@ -75,9 +75,10 @@ def _q4gemv(L: C.CDLL, mem: Memory, t: Task, T: int, st: int, mode: int) -> None
         a["K"],
         T,
         mode,
+        a["fmt"],
         ends,
         outs,
-        schedule.gemv_rows_per_warp(a["N"], a["K"], mode),
+        schedule.q4_rows_per_warp(a["N"], a["K"], mode),
         st,
     )
     _check(L, rc, t.kernel)
@@ -192,7 +193,19 @@ def _attention(L: C.CDLL, mem: Memory, t: Task, T: int, st: int) -> None:
 
 def _head(L: C.CDLL, mem: Memory, t: Task, T: int, st: int) -> None:
     n, k = t.attrs["N"], t.attrs["K"]
-    if T == 1 and n % 4 == 0 and k % 256 == 0:
+    if t.kernel == "g_head_q6k":
+        rc = L.warpc_q6_gemv(
+            mem.packs[t.weights["w"]],
+            mem.buffer(t.ins["x"]),
+            n,
+            k,
+            T,
+            mem.buffer(t.outs["logits"]),
+            schedule.q6_unroll(k),
+            st,
+        )
+        _check(L, rc, t.kernel)
+    elif T == 1 and n % 4 == 0 and k % 256 == 0:
         # one row: the CUDA-core head GEMV whose fp32 order is libswiftmk's (smk_bf16_gemv_f32), bit-identical logits
         rc = L.warpc_head_gemv(
             mem.packs[t.weights["w"]], mem.buffer(t.ins["x"]), n, k, mem.buffer(t.outs["logits"]), st
@@ -220,6 +233,7 @@ LAUNCHERS: dict[str, Callable[[C.CDLL, Memory, Task, int, int], None]] = {
     "g_attn": _attention,
     "g_attn_read": _attention,
     "g_head": _head,
+    "g_head_q6k": _head,
     "g_ple": _ple,
 }
 for _family in (inkling, hybrid, w4, attn_gated, deltanet, head_refine, move):

@@ -212,8 +212,9 @@ def test_graph_shape():
         assert [s.shape for s in graph.states.values()] == [(2, 64, 2, 32)] * 3
         quantized = frontend.build(Quantized(source), ctx_max=64)
         schemes = {name: w.scheme for name, w in quantized.weights.items()}
-        assert schemes["L0.q"] == schemes["L2.down"] == "q4_0" and schemes["embed"] == schemes["L0.ln1"] == "dense"
-        assert schemes["lm_head"] == "dense"
+        # the linears are 64 columns wide: below the fused kernels' 512, so they are widened to bf16 (test_compiler
+        # lowers real widths to the q4_0 / q4_1 / q6_k schemes)
+        assert set(schemes.values()) == {"dense"}, schemes
         for bad in ("fp8", "k3v3"):
             try:
                 frontend.build(source, ctx_max=64, kv=bad)

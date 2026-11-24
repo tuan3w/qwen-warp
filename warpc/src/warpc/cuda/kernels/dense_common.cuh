@@ -16,8 +16,10 @@
 //                         for bit; dense_dec_gemv_body.cuh + dense_dec_gemv_m<mode>.cu: its launchers, one per mode
 //   dense_ks_gemv.cuh     k_ks: the K-split GEMV (KS warps share a row, K = 2048 KS; a different reduction order) of the
 //                         segmented GEMVs k_dg cannot hold in registers (dense_ks_gemv_inst.cu: instantiations)
-//   dense_q4_gemv.cuh     k_q4_gemv: k_gemv over GGUF Q4_0 weights dequantised in registers (dense_q4_gemv.cu: entry
-//                         point, dense_q4_gemv_inst.cu: instantiations)
+//   dense_q4_gemv.cuh     k_q4_gemv: k_gemv's lane map and reduction over GGUF Q4_0 / Q4_1 weights repacked at load time and
+//                         dequantised in registers (dense_q4_gemv.cu: entry point, dense_q4_gemv_inst.cu: instantiations)
+//   dense_q6_gemv.cuh     k_q6_gemv: the fp32-logits head over a repacked GGUF Q6_K matrix, bit-identical to k_gemv over the
+//                         bf16-widened matrix (dense_q6_gemv.cu: entry point and instantiations)
 //   dense_norm.cu         embed (optionally scaled), rmsnorm, rmsnorm_post (the norm folded into its residual add),
 //                         argmax, the CUDA error string
 //   gemma_rows.cu         k_ple: Gemma's per-layer-embedding prelude in one launch

@@ -3,6 +3,7 @@ constants mirror #defines of kernels/dense_common.cuh and kernels/dense_attn_com
 
 from __future__ import annotations
 
+from ..ir import BLOCK_FORMATS
 from ..kvcache import Fp8Format, KVFormat, RotatedInt4Format
 
 STEP_ROWS = 8  # rows one launch handles at most: the decode row or a prompt chunk
@@ -13,11 +14,19 @@ ATTN_MAX_SPLITS = 128  # split blocks per head of the single-chunk bf16 kernels 
 ATTN_MAX_SPLITS_CHUNKED = 1024  # of the chunked bf16 and every quantised kernel (MAX_SPLITS2)
 ATTN_HEAD_DIMS = (64, 128, 256, 512)  # head dims the bf16 attention kernels are instantiated for
 ATTN_QUANT_HEAD_DIMS = (64, 128, 256)  # the quantised-KV kernels': no head dim 512
+PACKED_ROW_ALIGN = 16  # bytes: repacked Q4_0 / Q4_1 / Q6_K rows start 16-byte aligned
 KV_META_SECTIONS = ("kc", "vc", "ks", "vs", "kr", "vr", "kx", "vx")
 
 
+def packed_row_bytes(scheme: str, K: int) -> int:
+    """Bytes of one row of a repacked block-format matrix (q4_0, q4_1, q6_k) of K columns: the planes of
+    kernels/dense_q4_gemv.cuh / dense_q6_gemv.cuh, rounded up to PACKED_ROW_ALIGN."""
+    elems, nbytes = BLOCK_FORMATS[scheme]
+    return -(-(K // elems * nbytes) // PACKED_ROW_ALIGN) * PACKED_ROW_ALIGN
+
+
 def gemv_rows_per_warp(N: int, K: int, mode: int) -> int:
-    """Rows per warp of k_gemv / k_q4_gemv. In-flight 16-byte loads per lane = rows per warp x K iterations: the gate|up
+    """Rows per warp of k_gemv. In-flight 16-byte loads per lane = rows per warp x K iterations: the gate|up
     pair (mode 1) already streams two rows, a small K needs more rows to hide the DRAM latency, a wide N has the CTAs to
     spare."""
     if mode == 1:
@@ -27,6 +36,28 @@ def gemv_rows_per_warp(N: int, K: int, mode: int) -> int:
 
 def gemv_ctas(N: int, K: int, mode: int) -> int:
     return -(-N // (GEMV_WARPS * gemv_rows_per_warp(N, K, mode)))
+
+
+def q4_rows_per_warp(N: int, K: int, mode: int) -> int:
+    """Rows per warp of k_q4_gemv (1 or 2). Measured on an RTX 3090 at T = 1 over the Llama-3.1-8B, Qwen3-4B and
+    Qwen3-1.7B shapes: one row per warp is the fastest for the qkv and gate|up kernels (up to 846 GB/s against a 850
+    GB/s read-only ceiling), two for the wide residual-add kernels (down 787 against 688 GB/s, o 691 against 644)."""
+    return 2 if mode == 3 and N >= 4096 else 1
+
+
+def q4_gemv_ctas(N: int, K: int, mode: int) -> int:
+    return -(-N // (GEMV_WARPS * q4_rows_per_warp(N, K, mode)))
+
+
+def q6_unroll(K: int) -> int:
+    """Blocks of 256 columns a lane of k_q6_gemv loads before using them (1 or 2). Measured on an RTX 3090 over the
+    heads of Llama-3.1-8B, Qwen3-4B, Qwen3-1.7B and Mistral-7B: two at K >= 4096 (at 2048 / 2560 the second block costs
+    4 to 15%)."""
+    return 2 if K >= 4096 else 1
+
+
+def q6_gemv_ctas(N: int) -> int:
+    return -(-N // GEMV_WARPS)
 
 
 KS_SPLITS = (3, 4, 6, 8)  # K-split kernel's warps per row: K = 2048 x ks (kernels/dense_ks_gemv.cuh)
