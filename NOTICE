@@ -75,6 +75,14 @@ Third-party projects: credits and what was taken
     (msaroufim), tpu-megakernels (Inferact, Apache-2.0), pdl-megakernel-reconstruction (MIT),
     MegaQwen (Infatoshi, MIT), Megakernels (HazyResearch, MIT).
 
+  llama.cpp / ggml (MIT) and its gguf Python package (MIT): warpc/src/warpc/sources/gguf.py
+    reads GGUF files with the gguf package at run time and decodes the Q8_0, Q4_0 and Q4_1
+    blocks itself, following ggml's block layouts (ggml-quants.h); the decoders are written
+    independently and checked bit for bit against ggml's dequantize_row_* functions by
+    warpc/tests/test_sources.py, which compiles ggml-quants.c from a llama.cpp checkout the
+    tester provides. No ggml or llama.cpp file is included. llama.cpp's llama-server was the
+    baseline for the GGUF token and speed comparisons.
+
 KV-cache format: the 4-bit per-token, per-head asymmetric (scale + minimum) layout and its
 attention kernels are our own design; asymmetric integer KV quantisation is a standard technique.
 

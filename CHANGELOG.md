@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- `warpc/`: an experimental compiler, separate from the engine, for dense decoder-only models (Llama, Mistral, Qwen3) from Hugging Face safetensors or GGUF files to fused CUDA kernels replayed as CUDA graphs; GGUF Q4_0 weights run through a fused dequantising GEMV. On the RTX 3090, Qwen3-0.6B Q4_0 decodes at 706 tok/s against 568 tok/s for llama.cpp's `llama-server` on the same file ([warpc/README.md](warpc/README.md)). It is a uv workspace member: `uv sync --all-packages`.
+- `scripts/check_repo.sh` also compiles and lints `warpc/`, and its personal-path check also covers shared-memory scratch paths.
+
 ### Fixed
 
 - Docs: upgrading an existing environment in place from 0.11.x to 0.12.0 leaves `openai_harmony` missing (`oss-harmony` replaces `openai-harmony` and the two share a package directory); the fix is `uv sync --group dev --reinstall-package oss-harmony` ([Getting started](docs/GETTING_STARTED.md#troubleshooting)).
