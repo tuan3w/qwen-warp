@@ -20,7 +20,7 @@
 //   dense_attn.cuh        bf16 attention kernel templates (split, reduce, chunked split_x, and k_attn_fused = prep +
 //                         split of one row)
 //   dense_attn.cu         k_attn_prep and the bf16 attention entry points
-//   dense_attn_q.cuh      quantised-KV kernel templates (prep_q, split_q)
+//   dense_attn_q.cuh      quantised-KV kernel templates (prep_q, split_q; r4:: the hand engine's int4_rot writer)
 //   dense_attn_q.cu       the quantised-KV entry points
 //   dense_attn_inst.cu    the attention launchers run_* and their instantiations per head dim and part (-DATTN_HD= /
 //                         -DATTN_PARTS=)

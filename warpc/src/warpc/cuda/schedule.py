@@ -3,7 +3,7 @@ constants mirror #defines of kernels/dense_common.cuh and kernels/dense_attn_com
 
 from __future__ import annotations
 
-from ..kvcache import KVFormat
+from ..kvcache import KVFormat, RotatedInt4Format
 
 STEP_ROWS = 8  # rows one launch handles at most: the decode row or a prompt chunk
 GEMV_WARPS = 4  # warps per GEMV CTA (128 threads)
@@ -53,7 +53,8 @@ def kv_kernel_reason(fmt: KVFormat, hd: int) -> str | None:
 
 
 def kv_meta(fmt: KVFormat, ctx: int, nkv: int, hd: int, rows_max: int) -> tuple[int, ...]:
-    """The 12 int64s the quantised attention kernels take: section byte offsets (0 if absent), sink, window, ring
-    slots, V bits."""
+    """The 13 int64s the quantised attention kernels take: section byte offsets (0 if absent), sink, window, ring
+    slots, V bits, 1 for int4_rot."""
     sections = fmt.layout(ctx, nkv, hd, rows_max)
-    return (*(sections.get(n, 0) for n in KV_META_SECTIONS), fmt.sink, fmt.window, fmt.ring(rows_max), fmt.v_bits)
+    r4 = int(isinstance(fmt, RotatedInt4Format))
+    return (*(sections.get(n, 0) for n in KV_META_SECTIONS), fmt.sink, fmt.window, fmt.ring(rows_max), fmt.v_bits, r4)

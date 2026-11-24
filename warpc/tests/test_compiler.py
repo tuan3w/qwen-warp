@@ -313,6 +313,19 @@ def test_unknown_kv_format_and_lone_cast_are_lowering_errors():
         raise AssertionError("a cast alone has no kernel")
 
 
+def test_int4_rot_lowers_at_the_kernel_head_dims_only():
+    plan = lower(build({**QWEN3_06B, "num_layers": 1}, kv="int4_rot"), BACKEND, rows_max=8)
+    attn = next(t for t in plan.tasks if t.kernel == "g_attn")
+    assert attn.attrs["cache"] == "int4_rot", attn.attrs
+    g = build({**QWEN3_06B, "num_layers": 1, "head_dim": 96}, kv="int4_rot")
+    try:
+        lower(g, BACKEND, rows_max=8)
+    except LoweringError as e:
+        assert "attention x1: g_attn: hd=96 not in (64, 128, 256)" in str(e), str(e)
+    else:
+        raise AssertionError("int4_rot has no kernel for head dim 96")
+
+
 def test_attention_split_chunks_and_their_limit():
     assert [schedule.attn_chunks(c) for c in (64, 2048, 8192, 8193, 32768, 65536)] == [1, 1, 1, 2, 4, 8]
     g = build({**QWEN3_06B, "num_layers": 1}, ctx=32768)
@@ -704,7 +717,11 @@ def test_kv_bytes_follow_the_cache_format_and_the_step_rows():
     assert 4096 * 8 * (128 + 64 + 4) < CudaBackend.kv_bytes(q, 8) < CudaBackend.kv_bytes(s, 8)
     assert CudaBackend.kv_bytes(q, 8) - CudaBackend.kv_bytes(q, 1) == 2 * 8 * 7 * 128 * 2  # the ring's extra rows
     meta = schedule.kv_meta(FORMATS["k8v4w"], 4096, 8, 128, 3)
-    assert meta[8:] == (4, 256, 259, 4), meta
+    assert meta[8:] == (4, 256, 259, 4, 0), meta
+    r = replace(s, cache="int4_rot")
+    assert CudaBackend.kv_bytes(r, 8) == CudaBackend.kv_bytes(r, 1)  # a fixed 512-slot ring
+    meta = schedule.kv_meta(FORMATS["int4_rot"], 4096, 8, 128, 8)
+    assert meta[8:] == (4, 496, 512, 4, 1), meta
 
 
 def test_glue_signatures_and_constants_match_the_kernel_sources():

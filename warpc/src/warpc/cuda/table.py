@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
 from ..ir import Q4_0_BLOCK_ELEMS
-from ..kvcache import FORMATS
+from ..kvcache import FORMATS, RotatedInt4Format
 from . import schedule
 
 # GeForce RTX 3090 (sm_86): measured launch cost inside a CUDA graph, DRAM bandwidth, SM count. The cost model uses
@@ -329,7 +329,13 @@ def _emit_attn(m, A):
     numerics = (
         "prep (qk norm, rope, KV write) + split-K flash decode + reduce; fp32 softmax, one bf16 rounding of the output"
     )
-    if fmt.quantized:
+    if isinstance(fmt, RotatedInt4Format):
+        numerics += (
+            f"; KV cache {st.cache}: the hand engine's rotated int4 (WHT, 16-level companded grid, 8-bit log2 scale per"
+            " 64 rotated coefficients, the engine's writer bit for bit), fp16 query, levels decoded in fp16,"
+            f" first {fmt.sink} positions and the {fmt.window} before the step's last row exact (fp16)"
+        )
+    elif fmt.quantized:
         numerics += (
             f"; KV cache {st.cache}: rotated (WHT) int{fmt.k_bits} K and int{fmt.v_bits} V"
             " with one fp16 scale per (token, head), quantised on write in prep"

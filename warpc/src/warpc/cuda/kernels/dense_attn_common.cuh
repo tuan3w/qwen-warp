@@ -31,8 +31,8 @@ __device__ __forceinline__ float wht_blk(float x, float* xs) {  // orthonormal W
 }
 
 // merge of the split partials (kpb keys per split, partial stride HD + 4 floats so the rows are 16-byte aligned); ROT: the output is in the rotated basis of V and is
-// un-rotated here (WHT, fp32) before the bf16 rounding. All 128 threads weigh the splits, then each thread merges one float4 of the head dim over every SG-th split
-// (SG = 128 / (HD / 4) groups), the groups are added in a fixed order.
+// un-rotated here (WHT in fp32, strides 1, 2, 4 ..; ROT 2 (int4_rot): the hand engine's order 32 .. HD / 2, then 1 .. 16) before the bf16 rounding. All 128 threads
+// weigh the splits, then each thread merges one float4 of the head dim over every SG-th split (SG = 128 / (HD / 4) groups), the groups are added in a fixed order.
 template <int HD, int ROT>
 __global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const int* pos0, bf16* out, int Hq, int nsplit, int kpb) {
   constexpr int PS = HD + 4, NSLOT = HD / 4, SG = 128 / NSLOT;
@@ -89,7 +89,9 @@ __global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const i
     }
   }
   if (ROT) {
-    for (int h = 1; h < HD; h <<= 1) {
+    constexpr int LG = HD == 64 ? 6 : (HD == 128 ? 7 : 8);
+    for (int k = 0; k < LG; k++) {
+      const int h = ROT == 2 ? (k < LG - 5 ? 32 << k : 1 << (k - (LG - 5))) : 1 << k;
       __syncthreads();
       float v0[2], v1[2];
       int ii[2];
@@ -123,11 +125,12 @@ void run_decode(dim3 grid, dim3 g2, size_t smem, const bf16* q, const bf16* kv, 
                 cudaStream_t st);
 template <int HD>
 int run_decode_x(int T, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st);
-template <int HD, int VB, int EX>
+// R4: KV format int4_rot (VB 4, EX 1).
+template <int HD, int VB, int EX, int R4>
 int run_prep_q(int T, const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, const QKV& L, const int* pos0, int Hq, int Hkv,
                int rd, const float* inv_freq, float eps, int ctx, int qk_norm, cudaStream_t st);
-// run_split_q: the checks (nsplit, shared memory, G variants) and the split launch of the quantised decode; run_merge_q: the merge launch (un-rotates V).
-template <int HD, int VB, int EX>
+// run_split_q: the checks (nsplit, shared memory, G variants) and the split launch of the quantised decode; run_merge_q: the merge launch (un-rotates V, k_attn_reduce2's ROT).
+template <int HD, int VB, int EX, int R4>
 int run_split_q(int T, const bf16* q, const uint8_t* kvb, const QKV& L, const int* pos0, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st);
-template <int HD>
+template <int HD, int ROT>
 void run_merge_q(int T, const int* pos0, bf16* o, float* ws, int Hq, int nsplit, int kpb, cudaStream_t st);

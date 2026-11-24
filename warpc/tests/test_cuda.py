@@ -23,7 +23,7 @@ from transformers.utils import logging as transformers_logging
 import warpc
 from harness import Skip, run
 from warpc import frontend, sources
-from warpc.cuda import glue
+from warpc.cuda import glue, schedule
 from warpc.reference import Interpreter
 
 transformers_logging.disable_progress_bar()
@@ -90,6 +90,17 @@ MODELS = {
             tie_word_embeddings=False,
         )
     ),
+    # head dim 256, the hand engine's: KV format int4_rot is its cache byte for byte
+    "qwen3_hd256": lambda: Qwen3ForCausalLM(
+        Qwen3Config(
+            **SIZES,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=256,
+            rope_parameters={"rope_type": "default", "rope_theta": 1e6},
+            tie_word_embeddings=True,
+        )
+    ),
 }
 _CHECKPOINTS = tempfile.TemporaryDirectory()
 
@@ -115,6 +126,23 @@ def tiny_source(family: str):
 def reference_tokens(source, ids, n: int, kv: str = "bf16") -> list[int]:
     graph = frontend.build(source, ctx_max=len(ids) + n, kv=kv)
     return Interpreter(graph, source, dtype=torch.float32).generate(ids, n)
+
+
+def stepwise_reference(source, ids, n: int, kv: str, ctx: int) -> tuple[list[int], torch.Tensor]:
+    """Greedy tokens and the logits after the prompt from the reference interpreter in bf16 on the GPU, fed the prompt
+    in the runtime's steps of STEP_ROWS rows: int4_rot's exact window is counted from a step's last row, so the steps
+    are part of the result past 496 positions, and bf16 activations give the cache the kernels' K and V rows."""
+    it = Interpreter(frontend.build(source, ctx_max=ctx, kv=kv), source, device="cuda", dtype=torch.bfloat16)
+    rows = schedule.STEP_ROWS
+    for s in range(0, len(ids), rows):
+        chunk = ids[s : s + rows]
+        pos = torch.arange(s, s + len(chunk), dtype=torch.int32)
+        out = it.run({"tokens": torch.tensor(chunk, dtype=torch.int32), "pos": pos})
+    tokens, logits = [int(out["ids"][-1])], out["logits"][-1].float().cpu()
+    while len(tokens) < n:
+        pos = torch.tensor([len(ids) + len(tokens) - 1], dtype=torch.int32)
+        tokens.append(int(it.run({"tokens": torch.tensor(tokens[-1:], dtype=torch.int32), "pos": pos})["ids"][-1]))
+    return tokens, logits
 
 
 def expect(error: type[Exception], fn, *args) -> str:
@@ -149,6 +177,7 @@ def test_tiny_models_decode_like_the_reference():
     cases += [("qwen3", kv, 256) for kv in ("k8v8", "k8v8w", "k8v4w")] + [("llama", "k8v4w", 512)]
     cases += [("llama_rope_llama3", "bf16", 256), ("llama_rope_llama3", "k8v4w", 512)]
     cases += [("qwen3", "bf16", 16384), ("llama", "bf16", 16384)]  # more than 8192 positions: the chunked kernels
+    cases += [(family, "int4_rot", 256) for family in ("llama", "mistral", "qwen3", "qwen3_hd256")]
     for family, kv, ctx in cases:
         source = tiny_source(family)
         model = warpc.compile(source, ctx_max=ctx, kv=kv)
@@ -157,6 +186,26 @@ def test_tiny_models_decode_like_the_reference():
         assert got == want, (family, kv, ctx, got, want)
         assert model.generate(TINY_PROMPT, 16) == got, "generate must start from an empty cache"
         print(f"  {family} kv={kv} ctx={ctx}: {got}")
+
+
+def test_int4_rot_past_the_exact_window_and_16k_positions():
+    """A 16,500-token prompt: past 496 positions the 4-bit codes carry the attention, past 8192 the chunked split
+    kernel runs; head dims 64, 128 and 256."""
+    require_gpu()
+    prompt = torch.randint(0, SIZES["vocab_size"], (16500,), generator=torch.Generator().manual_seed(5)).tolist()
+    ctx = len(prompt) + 8
+    for family in ("llama", "qwen3", "qwen3_hd256"):
+        source = tiny_source(family)
+        model = warpc.compile(source, ctx_max=ctx, kv="int4_rot")
+        want, want_logits = stepwise_reference(source, prompt, 8, "int4_rot", ctx)
+        model.prefill(prompt)
+        err = float((model.logits.float().cpu() - want_logits).abs().max())
+        # measured 0.0055 (llama) and 0.0040 (hd 256), as close as the bf16 cache's 0.0050 and 0.0040; the same
+        # kernels against the fp32 reference: 0.014 and 0.019; int4_rot against the bf16 cache: 0.036 and 0.043
+        assert err < 0.01, (family, err)
+        got = model.generate(prompt, 8)
+        assert got == want, (family, got, want)
+        print(f"  {family}: {got}, logits within {err:.4f}")
 
 
 def test_dropped_runtimes_are_freed_by_refcount():

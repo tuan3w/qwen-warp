@@ -146,7 +146,7 @@ def _attention(mem: Memory, t: Task, T: int, st: int) -> None:
             check(L.warpc_attn_decode_x(T, qbuf, kv, pos, y, ws, hq, hkv, hd, ctx, scale, nc, st))
         return
     # read on the host during the call: need not outlive it
-    meta = (C.c_longlong * 12)(*schedule.kv_meta(fmt, ctx, hkv, hd, mem.rows_max))
+    meta = (C.c_longlong * 13)(*schedule.kv_meta(fmt, ctx, hkv, hd, mem.rows_max))
     check(L.warpc_attn_prep_q(T, q, k, v, qn, kn, qbuf, kv, meta, pos, hq, hkv, hd, rd, inv_freq, eps, ctx, qk, st))
     check(L.warpc_attn_decode_q(T, qbuf, kv, meta, pos, y, ws, hq, hkv, hd, ctx, scale, nc, st))
 

@@ -1,5 +1,6 @@
 // The attention launchers and their instantiations. The Makefile compiles this file once per (head dim, part): -DATTN_HD=64|128|256 -DATTN_PARTS=<mask>,
-// 1 = bf16 split + reduce (warpc_attn_decode), 2 = chunked bf16 (warpc_attn_decode_x), 4 = quantised prep + merge (un-rotate), 8 / 16 = quantised split with 8-bit / 4-bit V.
+// 1 = bf16 split + reduce (warpc_attn_decode), 2 = chunked bf16 (warpc_attn_decode_x), 4 = quantised prep + merge (un-rotate), 8 / 16 = quantised split with 8-bit / 4-bit V,
+// 32 = int4_rot prep + split.
 // Every kernel template is instantiated in exactly one of these objects (the instantiations are explicit; the entry points in dense_attn.cu / dense_attn_q.cu only declare the
 // launchers). A part includes only the kernel header it needs, so an edit of a bf16 kernel does not recompile the quantised objects (the cache key is the preprocessed text) and vice versa.
 #ifndef ATTN_HD
@@ -12,7 +13,7 @@
 #if ATTN_PARTS & 3
 #include "dense_attn.cuh"
 #endif
-#if ATTN_PARTS & 28
+#if ATTN_PARTS & 60
 #include "dense_attn_q.cuh"
 #endif
 
@@ -57,45 +58,56 @@ int run_decode_x(int T, const bf16* q, const bf16* kv, const int* pos0, bf16* o,
 template int run_decode_x<ATTN_HD>(int, const bf16*, const bf16*, const int*, bf16*, float*, int, int, int, float, int, cudaStream_t);
 #endif
 
-#if ATTN_PARTS & 4
-template <int HD, int VB, int EX>
+#if ATTN_PARTS & 36
+template <int HD, int VB, int EX, int R4>
 int run_prep_q(int T, const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, const QKV& L, const int* pos0, int Hq, int Hkv,
                       int rd, const float* inv_freq, float eps, int ctx, int qk_norm, cudaStream_t st) {
-  k_attn_prep_q<HD, VB, EX><<<dim3(Hq + 2 * Hkv, T), HD, 0, st>>>(q, k, v, qn, kn, qout, kvb, L, pos0, Hq, Hkv, rd, inv_freq, eps, ctx, qk_norm);
+  k_attn_prep_q<HD, VB, EX, R4><<<dim3(Hq + 2 * Hkv, T), HD, 0, st>>>(q, k, v, qn, kn, qout, kvb, L, pos0, Hq, Hkv, rd, inv_freq, eps, ctx, qk_norm);
   return cudaGetLastError();
 }
-#define PQ_INST(VB, EX)                                                                                                                                              \
-  template int run_prep_q<ATTN_HD, VB, EX>(int, const bf16*, const bf16*, const bf16*, const bf16*, const bf16*, bf16*, uint8_t*, const QKV&, const int*, int, int, int,           \
-                                           const float*, float, int, int, cudaStream_t);
-PQ_INST(8, 0) PQ_INST(8, 1) PQ_INST(4, 0) PQ_INST(4, 1)
+#define PQ_INST(VB, EX, R4)                                                                                                                                          \
+  template int run_prep_q<ATTN_HD, VB, EX, R4>(int, const bf16*, const bf16*, const bf16*, const bf16*, const bf16*, bf16*, uint8_t*, const QKV&, const int*, int, int, int,       \
+                                               const float*, float, int, int, cudaStream_t);
+#if ATTN_PARTS & 4
+PQ_INST(8, 0, 0) PQ_INST(8, 1, 0) PQ_INST(4, 0, 0) PQ_INST(4, 1, 0)
+#endif
+#if ATTN_PARTS & 32
+PQ_INST(4, 1, 1)
+#endif
 #undef PQ_INST
-
-template <int HD>
-void run_merge_q(int T, const int* pos0, bf16* o, float* ws, int Hq, int nsplit, int kpb, cudaStream_t st) {
-  k_attn_reduce2<HD, 1><<<dim3(Hq, T), 128, 0, st>>>(ws, pos0, o, Hq, nsplit, kpb);
-}
-template void run_merge_q<ATTN_HD>(int, const int*, bf16*, float*, int, int, int, cudaStream_t);
 #endif
 
-#if ATTN_PARTS & 24
-template <int HD, int VB, int EX>
+#if ATTN_PARTS & 4
+template <int HD, int ROT>
+void run_merge_q(int T, const int* pos0, bf16* o, float* ws, int Hq, int nsplit, int kpb, cudaStream_t st) {
+  k_attn_reduce2<HD, ROT><<<dim3(Hq, T), 128, 0, st>>>(ws, pos0, o, Hq, nsplit, kpb);
+}
+template void run_merge_q<ATTN_HD, 1>(int, const int*, bf16*, float*, int, int, int, cudaStream_t);
+template void run_merge_q<ATTN_HD, 2>(int, const int*, bf16*, float*, int, int, int, cudaStream_t);
+#endif
+
+#if ATTN_PARTS & 56
+template <int HD, int VB, int EX, int R4>
 int run_split_q(int T, const bf16* q, const uint8_t* kvb, const QKV& L, const int* pos0, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st) {
   const int nsplit = (ctx + CH * nc - 1) / (CH * nc), G = Hq / Hkv;
   if (nsplit > MAX_SPLITS2) return cudaErrorInvalidValue;
-  const size_t smem = ((size_t)G * HD + (size_t)G * CH + 4 * (size_t)G * HD + 24 + CH) * sizeof(float);
+  const size_t smem = ((size_t)G * HD + (size_t)G * CH + 4 * (size_t)G * HD + 24 + (size_t)CH * (R4 ? HD / 64 : 1)) * sizeof(float);
   if (smem > 48 * 1024) return cudaErrorInvalidValue;
   dim3 grid(Hkv, nsplit, T);
-  if (G <= 2) k_attn_split_q<HD, VB, EX, 2><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
-  else if (G <= 4) k_attn_split_q<HD, VB, EX, 4><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
-  else k_attn_split_q<HD, VB, EX, 8><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
+  if (G <= 2) k_attn_split_q<HD, VB, EX, 2, R4><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
+  else if (G <= 4) k_attn_split_q<HD, VB, EX, 4, R4><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
+  else k_attn_split_q<HD, VB, EX, 8, R4><<<grid, 128, smem, st>>>(q, kvb, L, pos0, ws, Hq, Hkv, ctx, nsplit, nc, scale);
   return cudaSuccess;
 }
-#define SQ_INST(VB, EX) template int run_split_q<ATTN_HD, VB, EX>(int, const bf16*, const uint8_t*, const QKV&, const int*, float*, int, int, int, float, int, cudaStream_t);
+#define SQ_INST(VB, EX, R4) template int run_split_q<ATTN_HD, VB, EX, R4>(int, const bf16*, const uint8_t*, const QKV&, const int*, float*, int, int, int, float, int, cudaStream_t);
 #if ATTN_PARTS & 8
-SQ_INST(8, 0) SQ_INST(8, 1)
+SQ_INST(8, 0, 0) SQ_INST(8, 1, 0)
 #endif
 #if ATTN_PARTS & 16
-SQ_INST(4, 0) SQ_INST(4, 1)
+SQ_INST(4, 0, 0) SQ_INST(4, 1, 0)
+#endif
+#if ATTN_PARTS & 32
+SQ_INST(4, 1, 1)
 #endif
 #undef SQ_INST
 #endif
