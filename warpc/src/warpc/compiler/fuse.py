@@ -41,6 +41,7 @@ class Region:
     outs: dict[str, str]
     weights: dict[str, str] = field(default_factory=dict)  # role -> pack name
     states: dict[str, str] = field(default_factory=dict)
+    constants: dict[str, tuple[float, ...]] = field(default_factory=dict)  # role -> fp32 values (e.g. a rope table)
     attrs: dict = field(default_factory=dict)
     packs: list[Pack] = field(default_factory=list)
     numerics: str = ""  # prose

@@ -1,9 +1,9 @@
 """The plan: what lowering a graph onto a backend produces, torch-free.
 
-A Plan is a list of Tasks (one backend kernel launch each, in a valid order), the Buffers they read and write and the
-weight Packs the kernels need (layouts decided by the kernel choice, not by the checkpoint). Row counts stay symbolic: a
-buffer holds `rows_max` rows of `dim` elements and a task runs on the first T rows of its `[T][dim]` row-major
-activations.
+A Plan is a list of Tasks (one backend kernel launch each, in a valid order), the Buffers they read and write, the
+weight Packs the kernels need (layouts decided by the kernel choice, not by the checkpoint) and the constant fp32 tables
+they read (rope inverse frequencies), which a runtime places on the device once. Row counts stay symbolic: a buffer
+holds `rows_max` rows of `dim` elements and a task runs on the first T rows of its `[T][dim]` row-major activations.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ class Task:
     outs: dict[str, str]  # role -> buffer name
     weights: dict[str, str] = field(default_factory=dict)  # role -> pack name
     states: dict[str, str] = field(default_factory=dict)  # role -> graph state name
+    constants: dict[str, str] = field(default_factory=dict)  # role -> plan constant name
     attrs: dict = field(default_factory=dict)
     covers: list[int] = field(default_factory=list)  # graph nodes this task implements
     numerics: str = ""  # the kernel's numerics, prose
@@ -66,6 +67,7 @@ class Plan:
     buffers: dict[str, Buffer] = field(default_factory=dict)
     buffer_of: dict[str, str] = field(default_factory=dict)  # graph value -> the buffer holding it
     packs: dict[str, Pack] = field(default_factory=dict)
+    constants: dict[str, tuple[float, ...]] = field(default_factory=dict)  # name -> fp32 values
     tasks: list[Task] = field(default_factory=list)
 
     def summary(self) -> str:

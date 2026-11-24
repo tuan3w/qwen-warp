@@ -34,6 +34,12 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
     def buffer(v: str) -> str:
         return v if v.startswith("@") else plan.buffer_of[v]
 
+    def constant(role: str, values: tuple[float, ...]) -> str:
+        """The plan constant holding `values`: one per distinct table, shared by every task that reads it."""
+        name = next((n for n, v in plan.constants.items() if v == values), f"{role}.{len(plan.constants)}")
+        plan.constants[name] = values
+        return name
+
     for ri in order:
         r = regions[ri]
         for p in r.packs:
@@ -45,6 +51,7 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
                 outs={k: buffer(v) for k, v in r.outs.items()},
                 weights=dict(r.weights),
                 states=dict(r.states),
+                constants={role: constant(role, values) for role, values in r.constants.items()},
                 attrs=dict(r.attrs),
                 covers=sorted(r.covers),
                 numerics=r.numerics,

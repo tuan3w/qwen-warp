@@ -27,6 +27,7 @@ class Memory:
     buffers: dict[str, int]
     packs: dict[str, int]
     states: dict[str, int]
+    constants: dict[str, int]  # fp32 tables, placed once at construction
     scratch: Callable[[str, int], int]  # (name, bytes) -> a persistent device scratch of at least that size
 
     def buffer(self, name: str) -> int:
@@ -118,7 +119,8 @@ def _rmsnorm(mem: Memory, t: Task, T: int, st: int) -> None:
 def _attention(mem: Memory, t: Task, T: int, st: int) -> None:
     a, L = t.attrs, mem.glue
     hq, hkv, hd, rd, ctx, nc = a["Hq"], a["Hkv"], a["hd"], a["rd"], a["ctx"], a["nc"]
-    theta, scale, qk = C.c_float(a["theta"]), C.c_float(a["scale"]), int(a["qk_norm"])
+    scale, qk = C.c_float(a["scale"]), int(a["qk_norm"])
+    inv_freq = mem.constants[t.constants["inv_freq"]]
     eps = C.c_float(a.get("eps", 0.0))  # read only with qk-norm
     q, k, v, y = mem.buffer(t.ins["q"]), mem.buffer(t.ins["k"]), mem.buffer(t.ins["v"]), mem.buffer(t.outs["y"])
     qn = mem.packs[t.weights["q_norm"]] if qk else None
@@ -132,12 +134,12 @@ def _attention(mem: Memory, t: Task, T: int, st: int) -> None:
 
     if not fmt.quantized and T == 1 and nc == 1 and hd == 128 and rd == 128:
         # one row: the prep folded into the split kernel, then the merge (two launches instead of three, the same bits)
-        rope = (rd, theta, eps, ctx, qk)
+        rope = (rd, inv_freq, eps, ctx, qk)
         check(L.warpc_attn_decode_fused(q, k, v, qn, kn, kv, pos, y, ws, hq, hkv, hd, *rope, scale, st))
         return
     qbuf = mem.scratch("attn_q", mem.rows_max * hq * hd * 2)
     if not fmt.quantized:
-        check(L.warpc_attn_prep(T, q, k, v, qn, kn, qbuf, kv, pos, hq, hkv, hd, rd, theta, eps, ctx, qk, st))
+        check(L.warpc_attn_prep(T, q, k, v, qn, kn, qbuf, kv, pos, hq, hkv, hd, rd, inv_freq, eps, ctx, qk, st))
         if nc == 1:
             check(L.warpc_attn_decode(T, qbuf, kv, pos, y, ws, hq, hkv, hd, ctx, scale, st))
         else:
@@ -145,7 +147,7 @@ def _attention(mem: Memory, t: Task, T: int, st: int) -> None:
         return
     # read on the host during the call: need not outlive it
     meta = (C.c_longlong * 12)(*schedule.kv_meta(fmt, ctx, hkv, hd, mem.rows_max))
-    check(L.warpc_attn_prep_q(T, q, k, v, qn, kn, qbuf, kv, meta, pos, hq, hkv, hd, rd, theta, eps, ctx, qk, st))
+    check(L.warpc_attn_prep_q(T, q, k, v, qn, kn, qbuf, kv, meta, pos, hq, hkv, hd, rd, inv_freq, eps, ctx, qk, st))
     check(L.warpc_attn_decode_q(T, qbuf, kv, meta, pos, y, ws, hq, hkv, hd, ctx, scale, nc, st))
 
 

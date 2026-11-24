@@ -9,9 +9,11 @@ file) enables the real-file check: the compiled tokens equal the reference inter
 known 24 tokens.
 """
 
+import gc
 import os
 import subprocess
 import tempfile
+import weakref
 from pathlib import Path
 
 import torch
@@ -68,6 +70,24 @@ MODELS = {
             head_dim=128,
             rope_parameters={"rope_type": "default", "rope_theta": 1e6},
             tie_word_embeddings=True,
+        )
+    ),
+    # head dim 128: the one-row decode runs the fused prep + split kernel; pairs 17 ... 63 are divided by 8, e.g.
+    # pair 17 turns 0.28 instead of 2.25 radians at position 26
+    "llama_rope_llama3": lambda: LlamaForCausalLM(
+        LlamaConfig(
+            **SIZES,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_parameters={
+                "rope_type": "llama3",
+                "rope_theta": 10000.0,
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 64,
+            },
+            tie_word_embeddings=False,
         )
     ),
 }
@@ -127,6 +147,7 @@ def test_tiny_models_decode_like_the_reference():
     # 11 tokens: an 8-row and a 2-row prompt step, then the head step
     cases = [("llama", "bf16", 256), ("mistral", "bf16", 256), ("qwen3", "bf16", 256)]
     cases += [("qwen3", kv, 256) for kv in ("k8v8", "k8v8w", "k8v4w")] + [("llama", "k8v4w", 512)]
+    cases += [("llama_rope_llama3", "bf16", 256), ("llama_rope_llama3", "k8v4w", 512)]
     cases += [("qwen3", "bf16", 16384), ("llama", "bf16", 16384)]  # more than 8192 positions: the chunked kernels
     for family, kv, ctx in cases:
         source = tiny_source(family)
@@ -136,6 +157,26 @@ def test_tiny_models_decode_like_the_reference():
         assert got == want, (family, kv, ctx, got, want)
         assert model.generate(TINY_PROMPT, 16) == got, "generate must start from an empty cache"
         print(f"  {family} kv={kv} ctx={ctx}: {got}")
+
+
+def test_dropped_runtimes_are_freed_by_refcount():
+    """A dropped model frees its runtime (device memory, CUDA graphs) at once: a runtime left to the cyclic collector
+    can be torn down inside another runtime's capture, which invalidates that capture. The failing sequence was models
+    compiled and dropped back to back, then a new one."""
+    require_gpu()
+    source = tiny_source("qwen3")
+    gc.disable()  # only refcounting may free them
+    try:
+        for kv in ("bf16", "k8v8", "bf16", "k8v4w"):
+            model = warpc.compile(source, ctx_max=256, kv=kv)
+            runtime = weakref.ref(model._runtime)
+            model.generate(TINY_PROMPT, 4)
+            del model
+            assert runtime() is None, f"kv={kv}: a dropped runtime outlives its model (a reference cycle)"
+    finally:
+        gc.enable()
+    model = warpc.compile(source, ctx_max=256, kv="k8v8")
+    assert model.generate(TINY_PROMPT, 16) == reference_tokens(source, TINY_PROMPT, 16, "k8v8")
 
 
 def test_prompt_chunks_follow_rows_max():

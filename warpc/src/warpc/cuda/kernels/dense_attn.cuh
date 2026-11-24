@@ -177,7 +177,7 @@ __global__ void __launch_bounds__(128) k_attn_reduce(const float* part, const in
 // sums with a shuffle (parity 0 + parity 1, k_attn_split's order).
 template <int HD, int GM>
 __global__ void __launch_bounds__(128) k_attn_fused(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* kv, const int* pos0, float* part, int Hq, int Hkv,
-                                                   int ctx, int nsplit, float scale, float theta, float eps, int qk_norm) {
+                                                   int ctx, int nsplit, float scale, const float* __restrict__ inv_freq, float eps, int qk_norm) {
   static_assert(HD == 128 && CH == 64, "fused attention: head dim 128, chunk 64");
   extern __shared__ float smem[];
   const int G = Hq / Hkv;
@@ -188,6 +188,7 @@ __global__ void __launch_bounds__(128) k_attn_fused(const bf16* q, const bf16* k
   float* vs = ks + HD;      // [HD] the new value row
   float* ml = vs + HD;      // [2][8]
   const int kvh = blockIdx.x, split = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+  const float inv[2] = {inv_freq[lane], inv_freq[lane + 32]};  // the lane's rotary pairs, issued beside the position load
   const int p = *pos0;
   const int ntask = G + 2;  // G query heads, then K, then V (the last two only in the owner block)
   float xr[4], wr[4];
@@ -256,10 +257,8 @@ __global__ void __launch_bounds__(128) k_attn_fused(const bf16* q, const bf16* k
       float o[4];
 #pragma unroll
       for (int jw = 0; jw < 2; jw++) {
-        const int j = lane + 32 * jw;
-        const float inv = exp2f(-(2.f * (float)j / (float)HD) * log2f(theta));
         float s, c;
-        sincosf((float)p * inv, &s, &c);
+        sincosf((float)p * inv[jw], &s, &c);
         const float lo = jw ? x1 : x0, hi = jw ? x3 : x2;
         o[jw] = __fmaf_rn(lo, c, -__fmul_rn(hi, s));
         o[jw + 2] = __fmaf_rn(hi, c, __fmul_rn(lo, s));

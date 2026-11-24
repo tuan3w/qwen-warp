@@ -6,6 +6,7 @@ LLAMA_CPP_DIR (a llama.cpp checkout) enables the ggml bit-identity check, WARPC_
 check; each skips when unset.
 """
 
+import math
 import os
 import shutil
 import subprocess
@@ -68,6 +69,45 @@ def tiny_model(family: str, **overrides):
     return model.eval()
 
 
+# Llama 3.1 rope scaling with all three bands in 8 rotary pairs (wavelengths 6.3 | 20, 63 | 199 ... 19869)
+LLAMA3_ROPE = {
+    "rope_type": "llama3",
+    "rope_theta": 10000.0,
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 64,
+}
+
+
+def converter_rope_freqs(c) -> np.ndarray:
+    """llama.cpp's converter (LlamaModel.generate_extra_tensors), verbatim: Llama 3.1 scaling as rope_freqs."""
+    rope_params = c.rope_parameters
+    base = rope_params.get("rope_theta", 10000.0)
+    dim = c.head_dim
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    factor = rope_params.get("factor", 8.0)
+    low_freq_factor = rope_params.get("low_freq_factor", 1.0)
+    high_freq_factor = rope_params.get("high_freq_factor", 4.0)
+    old_context_len = rope_params.get("original_max_position_embeddings", 8192)
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    rope_factors = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            rope_factors.append(1)
+        elif wavelen > low_freq_wavelen:
+            rope_factors.append(factor)
+        else:
+            smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+            rope_factors.append(1 / ((1 - smooth) / factor + smooth))
+    return torch.tensor(rope_factors, dtype=torch.float32).numpy()
+
+
 def permute_for_ggml(w: np.ndarray, heads: int) -> np.ndarray:
     """llama.cpp's converter permute of llama q / k rows (half-split pairs -> adjacent pairs)."""
     return w.reshape(heads, 2, w.shape[0] // heads // 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
@@ -101,7 +141,8 @@ def gguf_name(name: str) -> str:
 
 
 def write_gguf(path: Path, model, arch: str, *, extra=()) -> None:
-    """Convert an HF model the way llama.cpp's converter lays it out (names, metadata, llama q / k permute)."""
+    """Convert an HF model the way llama.cpp's converter lays it out (names, metadata, llama q / k permute, Llama 3.1
+    rope scaling as rope_freqs)."""
     c = model.config
     w = gguf.GGUFWriter(str(path), arch)
     w.add_block_count(c.num_hidden_layers)
@@ -122,6 +163,8 @@ def write_gguf(path: Path, model, arch: str, *, extra=()) -> None:
             w.add_tensor(gguf_name(name), x)
         else:
             w.add_tensor(gguf_name(name), gguf.quantize(x, qtype), raw_dtype=qtype)
+    if c.rope_parameters.get("rope_type") == "llama3":
+        w.add_tensor("rope_freqs.weight", converter_rope_freqs(c))
     for name, data, qtype in extra:
         w.add_tensor(name, data, raw_dtype=qtype)
     w.write_header_to_file()
@@ -197,8 +240,8 @@ def test_decoders_match_gguf_package():
 
 
 def test_gguf_matches_safetensors():
-    for family in ("qwen3", "llama"):
-        model = tiny_model(family)
+    for family, overrides in (("qwen3", {}), ("llama", {}), ("llama", {"rope_parameters": LLAMA3_ROPE})):
+        model = tiny_model(family, **overrides)
         with tempfile.TemporaryDirectory() as tmp:
             model.save_pretrained(tmp)
             path = Path(tmp) / "model.gguf"
@@ -207,6 +250,7 @@ def test_gguf_matches_safetensors():
             source = warpc.sources.open(path)
             assert isinstance(source, GGUFSource)
             assert source.config == hf.config, (family, source.config, hf.config)
+            assert (source.config.rope_freq_factors is not None) == bool(overrides), source.config
             assert check_against_gguf_package(source, path) == len(model.state_dict()), family
             for name in model.state_dict():
                 assert name in source, name
@@ -231,7 +275,14 @@ def test_gguf_guards():
     cases = {
         "IQ* block formats": {"arch": "qwen3", "extra": (iq,)},
         "GGUF architecture 'qwen2' (supported: llama, qwen3)": {"arch": "qwen2"},
-        "rope scaling 'llama3'": {"arch": "qwen3", "extra": (("rope_freqs.weight", np.ones(16, np.float32), Q.F32),)},
+        "15 rope frequency factors for 16 rotary pairs": {
+            "arch": "qwen3",
+            "extra": (("rope_freqs.weight", np.ones(15, np.float32), Q.F32),),
+        },
+        "rope_freqs.weight of type F16": {
+            "arch": "qwen3",
+            "extra": (("rope_freqs.weight", np.ones(16, np.float16), Q.F16),),
+        },
         "does not read: blk.0.mystery.weight": {
             "arch": "qwen3",
             "extra": (("blk.0.mystery.weight", np.ones(4, np.float32), Q.F32),),

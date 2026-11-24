@@ -3,15 +3,17 @@
 // run_decode1 (dense_attn_inst.cu): one row, head dim 128: the fused prep + split launch and the merge launch; returns an error code.
 template <int HD>
 int run_decode1(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, int nsplit,
-                float scale, float theta, float eps, int qk_norm, cudaStream_t st);
+                float scale, const float* inv_freq, float eps, int qk_norm, cudaStream_t st);
 
 // Attention prep. Per (row t, head): q heads and k heads get an optional RMSNorm over the head dim (weight qn / kn) rounded to bf16, then rotary embedding of the first rd dims
-// (half-split pairing, angle = (pos0 + t) * theta^(-2j/rd)), q goes to qout, k and v are written to the KV cache at position pos0 + t.
+// (half-split pairing, angle = (pos0 + t) * inv_freq[j], inv_freq the rd / 2 fp32 inverse frequencies), q goes to qout, k and v are written to the KV cache at position pos0 + t.
 __global__ void k_attn_prep(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, bf16* kv, const int* pos0, int Hq, int Hkv,
-                            int hd, int rd, float theta, float eps, int ctx, int qk_norm) {
+                            int hd, int rd, const float* __restrict__ inv_freq, float eps, int ctx, int qk_norm) {
   __shared__ float xs[256];
   __shared__ float sm[32];
   const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+  const int half = rd / 2;
+  const float inv = i < rd ? inv_freq[i < half ? i : i - half] : 0.f;  // issued beside the position load
   const int p = *pos0 + t;
   const bf16 *src, *nw = nullptr;
   bf16* dst;
@@ -48,9 +50,6 @@ __global__ void k_attn_prep(const bf16* q, const bf16* k, const bf16* v, const b
   if (i < hd) {
     float o = x;
     if (i < rd) {
-      const int half = rd / 2;
-      const int j = i < half ? i : i - half;
-      const float inv = exp2f(-(2.f * (float)j / (float)rd) * log2f(theta));
       float s, c;
       sincosf((float)p * inv, &s, &c);
       const float partner = i < half ? xs[i + half] : xs[i - half];
@@ -63,12 +62,12 @@ __global__ void k_attn_prep(const bf16* q, const bf16* k, const bf16* v, const b
 extern "C" {
 
 int warpc_attn_prep(int T, const void* q, const void* k, const void* v, const void* qn, const void* kn, void* qout, void* kv, const int* pos0, int Hq, int Hkv, int hd,
-                    int rd, float theta, float eps, int ctx, int qk_norm, cudaStream_t st) {
+                    int rd, const float* inv_freq, float eps, int ctx, int qk_norm, cudaStream_t st) {
   if (hd > 256 || hd % 32 || rd % 2 || rd > hd) return cudaErrorInvalidValue;
   dim3 grid(Hq + 2 * Hkv, T);
   k_attn_prep<<<grid, hd, 0, st>>>(reinterpret_cast<const bf16*>(q), reinterpret_cast<const bf16*>(k), reinterpret_cast<const bf16*>(v),
                                    reinterpret_cast<const bf16*>(qn), reinterpret_cast<const bf16*>(kn), reinterpret_cast<bf16*>(qout), reinterpret_cast<bf16*>(kv),
-                                   pos0, Hq, Hkv, hd, rd, theta, eps, ctx, qk_norm);
+                                   pos0, Hq, Hkv, hd, rd, inv_freq, eps, ctx, qk_norm);
   return cudaGetLastError();
 }
 
@@ -92,12 +91,13 @@ int warpc_attn_decode(int T, const void* qprep, const void* kv, const int* pos0,
 
 // one row (decode), head dim 128, rotary dims = head dim: prep folded into the split kernel (see k_attn_fused), then the merge; same partial layout and bits as prep + decode
 int warpc_attn_decode_fused(const void* q, const void* k, const void* v, const void* qn, const void* kn, void* kv, const int* pos0, void* out, float* ws, int Hq, int Hkv, int hd,
-                            int rd, float theta, float eps, int ctx, int qk_norm, float scale, cudaStream_t st) {
+                            int rd, const float* inv_freq, float eps, int ctx, int qk_norm, float scale, cudaStream_t st) {
   if (hd != 128 || rd != 128 || Hq % Hkv || Hq / Hkv > 8) return cudaErrorInvalidValue;
   const int nsplit = (ctx + CH - 1) / CH;
   if (nsplit > MAX_SPLITS) return cudaErrorInvalidValue;
   return run_decode1<128>(reinterpret_cast<const bf16*>(q), reinterpret_cast<const bf16*>(k), reinterpret_cast<const bf16*>(v), reinterpret_cast<const bf16*>(qn),
-                          reinterpret_cast<const bf16*>(kn), reinterpret_cast<bf16*>(kv), pos0, reinterpret_cast<bf16*>(out), ws, Hq, Hkv, ctx, nsplit, scale, theta, eps, qk_norm, st);
+                          reinterpret_cast<const bf16*>(kn), reinterpret_cast<bf16*>(kv), pos0, reinterpret_cast<bf16*>(out), ws, Hq, Hkv, ctx, nsplit, scale, inv_freq,
+                          eps, qk_norm, st);
 }
 
 // workspace of every decode entry point (kpb = keys per split block, 64 * nc; the hd + 4 floats per partial row also hold the hd + 2 of the nc = 1 kernels)

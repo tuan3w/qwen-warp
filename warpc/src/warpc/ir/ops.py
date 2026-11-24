@@ -112,14 +112,17 @@ def _argmax(g, a, ins):
 
 @_op("rope")
 def _rope(g, a, ins):
-    """Rotate the first rotary_dim dims of q [T, Hq, D] and k [T, Hkv, D] (half-split pairs) at positions pos i32[T]."""
+    """Rotate the first rotary_dim dims of q [T, Hq, D] and k [T, Hkv, D] (half-split pairs) at positions pos i32[T]:
+    pair j (dims j and j + rotary_dim / 2) by the angle pos * inv_freq[j], inv_freq a tuple of rotary_dim / 2 fp32
+    values."""
     q, k, pos = ins
     _need(
         pos.dtype == "i32"
         and pos.shape == (q.shape[0],)
         and a["rotary_dim"] <= q.shape[-1]
-        and a["rotary_dim"] % 2 == 0,
-        f"rope: q {q.shape}, pos {pos.shape}, rotary_dim {a['rotary_dim']}",
+        and a["rotary_dim"] % 2 == 0
+        and len(a["inv_freq"]) == a["rotary_dim"] // 2,
+        f"rope: q {q.shape}, pos {pos.shape}, rotary_dim {a['rotary_dim']}, {len(a['inv_freq'])} inverse frequencies",
     )
     return [q, k]
 

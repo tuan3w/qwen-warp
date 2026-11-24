@@ -1,10 +1,10 @@
 """The CUDA backend's capability table: what each kernel of kernels/ absorbs, its limits, and how a match binds to the
 launcher's roles.
 
-Nothing here hard-codes a model: head counts, head dim, rotary dim, theta, hidden and FFN widths come from the graph and
-reach the kernels as arguments. A match is declined only where a kernel's real limits are not met (K a multiple of 256
-for bf16 weights and of 32 for Q4_0, head dim 64 / 128 / 256, at most 8 query heads per KV head, at most STEP_ROWS rows,
-a KV cache format with a kernel).
+Nothing here hard-codes a model: head counts, head dim, rotary dim, rope frequencies, hidden and FFN widths come from
+the graph and reach the kernels as arguments. A match is declined only where a kernel's real limits are not met (K a
+multiple of 256 for bf16 weights and of 32 for Q4_0, head dim 64 / 128 / 256, at most 8 query heads per KV head, at
+most STEP_ROWS rows, a KV cache format with a kernel).
 """
 
 from __future__ import annotations
@@ -344,12 +344,12 @@ def _emit_attn(m, A):
         outs={"y": n.outs[0]},
         weights=weights,
         states={"kv": n.attrs["state"]},
+        constants={"inv_freq": rpn.attrs["inv_freq"]},
         attrs={
             "Hq": m.consts["Hq"],
             "Hkv": m.consts["Hkv"],
             "hd": m.consts["hd"],
             "rd": rpn.attrs["rotary_dim"],
-            "theta": rpn.attrs["theta"],
             "ctx": m.consts["ctx"],
             "scale": n.attrs["scale"],
             "qk_norm": bool(norms),

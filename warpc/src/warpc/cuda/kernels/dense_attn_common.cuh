@@ -125,7 +125,7 @@ template <int HD>
 int run_decode_x(int T, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st);
 template <int HD, int VB, int EX>
 int run_prep_q(int T, const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, const QKV& L, const int* pos0, int Hq, int Hkv,
-               int rd, float theta, float eps, int ctx, int qk_norm, cudaStream_t st);
+               int rd, const float* inv_freq, float eps, int ctx, int qk_norm, cudaStream_t st);
 // run_split_q: the checks (nsplit, shared memory, G variants) and the split launch of the quantised decode; run_merge_q: the merge launch (un-rotates V).
 template <int HD, int VB, int EX>
 int run_split_q(int T, const bf16* q, const uint8_t* kvb, const QKV& L, const int* pos0, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st);

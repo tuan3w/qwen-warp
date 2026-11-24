@@ -8,6 +8,7 @@ every architecture reads with the half-split rope of the graph. Q8_0 / Q4_0 / Q4
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -128,8 +129,6 @@ class GGUFSource:
                 raise UnsupportedModel(f"per-layer KV head counts {sorted(set(kv_heads))}")
             kv_heads = kv_heads[0]
         scaling = key(gguf.Keys.Rope.SCALING_TYPE)
-        if scaling in (None, "none") and "rope_freqs.weight" in tensors:
-            scaling = "llama3"  # llama.cpp stores Llama 3.1 rope scaling as a frequency-factor tensor
         window = key(gguf.Keys.Attention.SLIDING_WINDOW)
         eps, theta = key(gguf.Keys.Attention.LAYERNORM_RMS_EPS), key(gguf.Keys.Rope.FREQ_BASE)
         hf = {
@@ -150,7 +149,15 @@ class GGUFSource:
         }
         if heads and "blk.0.attn_q.weight" in tensors:
             hf["head_dim"] = int(tensors["blk.0.attn_q.weight"].shape[1]) // heads
-        self.config = ModelConfig.from_hf(hf)
+        config = ModelConfig.from_hf(hf)
+        freqs = tensors.get("rope_freqs.weight")
+        if freqs is not None:
+            # llama.cpp's form of Llama 3.1 rope scaling: the converter's per-pair divisors of the inverse frequency
+            if freqs.tensor_type.name != "F32":
+                raise UnsupportedModel(f"rope_freqs.weight of type {freqs.tensor_type.name} (only F32)")
+            factors = tuple(np.asarray(freqs.data, dtype=np.float32).reshape(-1).tolist())
+            config = dataclasses.replace(config, rope_freq_factors=factors)
+        self.config = config
 
         self._index: dict[str, tuple[gguf.ReaderTensor, int]] = {}
         for n, t in tensors.items():

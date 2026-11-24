@@ -35,10 +35,12 @@ __device__ __forceinline__ void q_store(float x, uint8_t* crow, __half* srow, fl
 // qk-norm + rope (+ rotation) of q, k and the quantised write of k and v at position pos0 + t; EX: also the exact fp16 sink / ring rows
 template <int HD, int VB, int EX>
 __global__ void k_attn_prep_q(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, QKV L, const int* pos0, int Hq, int Hkv,
-                              int rd, float theta, float eps, int ctx, int qk_norm) {
+                              int rd, const float* __restrict__ inv_freq, float eps, int ctx, int qk_norm) {
   __shared__ float xs[256];
   __shared__ float sm[32];
   const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+  const int half = rd / 2;
+  const float inv = i < rd ? inv_freq[i < half ? i : i - half] : 0.f;  // issued beside the position load
   const int p = *pos0 + t;
   const bf16 *src, *nw = nullptr;
   bool rope = true;
@@ -66,9 +68,6 @@ __global__ void k_attn_prep_q(const bf16* q, const bf16* k, const bf16* v, const
     __syncthreads();
     float o = x;
     if (i < rd) {
-      const int half = rd / 2;
-      const int j = i < half ? i : i - half;
-      const float inv = exp2f(-(2.f * (float)j / (float)rd) * log2f(theta));
       float s, c;
       sincosf((float)p * inv, &s, &c);
       const float partner = i < half ? xs[i + half] : xs[i - half];

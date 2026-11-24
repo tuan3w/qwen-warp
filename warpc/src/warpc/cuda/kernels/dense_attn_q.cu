@@ -18,14 +18,14 @@ static int decode_q(int T, const bf16* q, const uint8_t* kvb, const QKV& L, cons
 extern "C" {
 
 int warpc_attn_prep_q(int T, const void* q, const void* k, const void* v, const void* qn, const void* kn, void* qout, void* kv, const long long* meta, const int* pos0, int Hq,
-                      int Hkv, int hd, int rd, float theta, float eps, int ctx, int qk_norm, cudaStream_t st) {
+                      int Hkv, int hd, int rd, const float* inv_freq, float eps, int ctx, int qk_norm, cudaStream_t st) {
   if (hd > 256 || hd % 32 || rd % 2 || rd > hd || (hd & (hd - 1))) return cudaErrorInvalidValue;
   const QKV L = qkv_of(meta);
   const int vb = (int)meta[11], ex = (L.sink > 0 || L.win > 0);
   if (L.win && L.ring < L.win + T) return cudaErrorInvalidValue;  // a step must not evict a row it reads
 #define PQ(HD, VB, EX)                                                                                                                                              \
-  return run_prep_q<HD, VB, EX>(T, (const bf16*)q, (const bf16*)k, (const bf16*)v, (const bf16*)qn, (const bf16*)kn, (bf16*)qout, (uint8_t*)kv, L, pos0, Hq, Hkv, rd, theta, eps, \
-                                ctx, qk_norm, st)
+  return run_prep_q<HD, VB, EX>(T, (const bf16*)q, (const bf16*)k, (const bf16*)v, (const bf16*)qn, (const bf16*)kn, (bf16*)qout, (uint8_t*)kv, L, pos0, Hq, Hkv, rd, inv_freq, \
+                                eps, ctx, qk_norm, st)
   if (vb != 8 && vb != 4) return cudaErrorInvalidValue;
   if (hd == 128) { if (vb == 8) { if (ex) PQ(128, 8, 1); else PQ(128, 8, 0); } else { if (ex) PQ(128, 4, 1); else PQ(128, 4, 0); } }
   if (hd == 64) { if (vb == 8) { if (ex) PQ(64, 8, 1); else PQ(64, 8, 0); } else { if (ex) PQ(64, 4, 1); else PQ(64, 4, 0); } }

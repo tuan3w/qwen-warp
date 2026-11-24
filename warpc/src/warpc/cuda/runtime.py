@@ -31,6 +31,22 @@ def _live_tasks(graph: Graph, plan: Plan, needed: set[str]) -> list[Task]:
     return [t for t in plan.tasks if any(c in live for c in t.covers)]
 
 
+class _Scratch:
+    """Persistent device scratch by name, grown on demand; first used in the eager warm-up, before any capture. A
+    separate object, not a runtime method, so Memory holds no reference back to its runtime: a dropped runtime is freed
+    by refcount, never by a cyclic collection, which can run inside another runtime's capture and tear down CUDA graphs
+    there (an invalidated capture)."""
+
+    def __init__(self):
+        self._tensors: dict[str, torch.Tensor] = {}
+
+    def __call__(self, name: str, nbytes: int) -> int:
+        t = self._tensors.get(name)
+        if t is None or t.numel() < nbytes:
+            t = self._tensors[name] = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+        return t.data_ptr()
+
+
 class Runtime:
     """Greedy decode of one sequence: prompt steps of up to plan.rows_max rows, a KV cache of the positions the graph's
     states hold."""
@@ -58,7 +74,8 @@ class Runtime:
         self._states = {s.name: zeros(CudaBackend.kv_bytes(s, rows), torch.uint8) for s in graph.states.values()}
         self._tokens = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self._pos = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self._scratch: dict[str, torch.Tensor] = {}
+        self._scratch = _Scratch()
+        self._constants = {n: torch.tensor(v, dtype=torch.float32, device="cuda") for n, v in plan.constants.items()}
         self._ids = self._buffers[plan.buffer_of[graph.outputs["ids"]]]
         self._logits = self._buffers[plan.buffer_of[graph.outputs["logits"]]]
         self._vocab_size = graph.types[graph.outputs["logits"]].shape[-1]
@@ -71,7 +88,8 @@ class Runtime:
             buffers={k: v.data_ptr() for k, v in self._buffers.items()},
             packs={k: v.data_ptr() for k, v in self._packs.items()},
             states={k: v.data_ptr() for k, v in self._states.items()},
-            scratch=self._scratch_ptr,
+            constants={k: v.data_ptr() for k, v in self._constants.items()},
+            scratch=self._scratch,
         )
         self._position = 0  # host mirror of the device position: tokens in the KV cache
         heads = {False: set(), True: {graph.outputs["ids"]}}
@@ -82,14 +100,6 @@ class Runtime:
             self._capture(T, False)
         self._capture(1, True)
         self.reset()
-
-    def _scratch_ptr(self, name: str, nbytes: int) -> int:
-        """Pointer to a persistent device scratch of at least nbytes; first used in the eager warm-up, before any
-        capture."""
-        t = self._scratch.get(name)
-        if t is None or t.numel() < nbytes:
-            t = self._scratch[name] = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
-        return t.data_ptr()
 
     def _run(self, T: int, head: bool) -> None:
         main, mem = torch.cuda.current_stream(), self._memory

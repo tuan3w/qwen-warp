@@ -92,8 +92,8 @@ def _argmax(it, a, x):
 
 
 def _rope(it, a, q, k, pos):
-    rd, theta = a["rotary_dim"], a["theta"]
-    inv = 1.0 / (theta ** (torch.arange(0, rd, 2, device=q.device, dtype=torch.float32) / rd))
+    rd = a["rotary_dim"]
+    inv = torch.tensor(a["inv_freq"], device=q.device, dtype=torch.float32)
     freqs = pos.float()[:, None] * inv[None]
     emb = torch.cat([freqs, freqs], -1)
     cos, sin = emb.cos().to(q.dtype)[:, None, :], emb.sin().to(q.dtype)[:, None, :]
