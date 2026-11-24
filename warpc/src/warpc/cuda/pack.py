@@ -1,4 +1,10 @@
-"""Packer: the device tensors of a plan's packs, read from a Source."""
+"""Packer: the device tensors of the CUDA backend's packs, read from a Source.
+
+dense      one weight as the source stores it
+dense_cat  the rows of the dense `parts`, concatenated in order
+q4_0       one GGUF Q4_0 matrix as stored: raw blocks [N, K / 32 * 18] bytes, read in place by the fused dequant GEMV
+q4_0_cat   the rows of the Q4_0 `parts`, concatenated in order
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,8 @@ import torch
 from ..compiler import Pack
 from ..ir import Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, WeightDecl
 from ..sources import Source
+
+PACK_KINDS = ("dense", "dense_cat", "q4_0", "q4_0_cat")
 
 
 class Packer:
@@ -32,12 +40,16 @@ class Packer:
         d = self.weights[name]
         if d.scheme != "q4_0" or len(d.shape) != 2 or d.shape[1] % Q4_0_BLOCK_ELEMS:
             raise ValueError(f"{name}: a q4_0 pack of a {d.scheme} weight of shape {d.shape}")
-        raw = torch.from_numpy(self.source.raw(d.source).copy())  # the source's array may be a read-only memory map
+        raw = self.source.raw(d.source)["blocks"]
         if tuple(raw.shape) != (d.shape[0], d.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES):
             raise ValueError(f"{name}: Q4_0 blocks of shape {tuple(raw.shape)} for a {list(d.shape)} matrix")
         return raw
 
     def build(self, pack: Pack) -> torch.Tensor:
+        if pack.kind not in PACK_KINDS:
+            raise ValueError(
+                f"pack {pack.name}: kind {pack.kind!r} is not the CUDA backend's ({', '.join(PACK_KINDS)})"
+            )
         if pack.kind == "dense":
             source = self.weights[pack.parts[0]].source
             if source not in self._dense:

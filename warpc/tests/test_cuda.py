@@ -6,7 +6,8 @@ runtime's and the facade's contract, and a real GGUF file.
 
 Needs a CUDA device and nvcc (NVCC / PATH / CUDA_HOME); the GPU tests skip without a device. WARPC_TEST_GGUF (a GGUF
 file) enables the real-file check: the compiled tokens equal the reference interpreter's, and for Qwen3-0.6B Q4_0 the
-known 24 tokens.
+known 24 tokens. WARPC_TEST_SWIFT27 (the Qwen3.5 27B W4G128 checkpoint) enables its reference interpreter on the GPU
+(needs the card alone: about 18 GB).
 """
 
 import gc
@@ -273,6 +274,34 @@ def test_gguf_file():
     first = model.prefill(PROMPT)
     assert first == got[0] and int(torch.argmax(model.logits)) == first and model.logits.shape == (c.vocab_size,)
     assert model.step(first) == got[1] and model.step(got[1]) == got[2]
+
+
+def test_qwen35_27b_reference_on_the_gpu():
+    """The 27B reference fits the GPU (W4G128 linears stay packed, dequantised per use) and continues a factual prompt
+    sensibly; it is the tolerance oracle of the compiled 27B (the bit-exact one is the hand engine)."""
+    path = os.environ.get("WARPC_TEST_SWIFT27")
+    if not path:
+        raise Skip("WARPC_TEST_SWIFT27 unset")
+    require_gpu()
+    import time
+
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(path)
+    ids = tok("The capital of France is", add_special_tokens=False)["input_ids"]
+    source = sources.open(path)
+    t0 = time.perf_counter()
+    it = Interpreter(frontend.build(source, ctx_max=64), source, device="cuda", dtype=torch.bfloat16)
+    load = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    got = it.generate(ids, 8)
+    torch.cuda.synchronize()
+    text = tok.decode(got)
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    print(
+        f"  load {load:.0f} s, {len(ids)} + 8 tokens in {time.perf_counter() - t0:.1f} s, peak {peak:.1f} GiB: {text!r}"
+    )
+    assert "Paris" in text, (got, text)
 
 
 if __name__ == "__main__":

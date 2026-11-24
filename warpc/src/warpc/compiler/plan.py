@@ -11,8 +11,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-PACK_KINDS = ("dense", "dense_cat", "q4_0", "q4_0_cat")
-
 
 @dataclass
 class Buffer:
@@ -24,22 +22,13 @@ class Buffer:
 
 @dataclass
 class Pack:
-    """A device weight a kernel reads, built from the graph weights `parts`.
-
-    dense      one weight as the source stores it
-    dense_cat  the rows of the dense `parts`, concatenated in order
-    q4_0       one GGUF Q4_0 matrix as stored: raw blocks [N, K / 32 * 18] bytes, read in place by the fused
-               dequant GEMV
-    q4_0_cat   the rows of the Q4_0 `parts`, concatenated in order
+    """A device weight a kernel reads, built from the graph weights `parts` in the layout `kind` names. Kinds are the
+    backend's vocabulary (its executor builds them and refuses the others); `name` is for humans and unique per plan.
     """
 
     name: str
     kind: str
     parts: list[str]
-
-    def __post_init__(self):
-        if self.kind not in PACK_KINDS:
-            raise ValueError(f"pack {self.name}: unknown kind {self.kind!r}")
 
 
 @dataclass
@@ -66,7 +55,7 @@ class Plan:
     backend: str
     buffers: dict[str, Buffer] = field(default_factory=dict)
     buffer_of: dict[str, str] = field(default_factory=dict)  # graph value -> the buffer holding it
-    packs: dict[str, Pack] = field(default_factory=dict)
+    packs: dict[tuple[str, tuple[str, ...]], Pack] = field(default_factory=dict)  # (kind, parts) -> pack
     constants: dict[str, tuple[float, ...]] = field(default_factory=dict)  # name -> fp32 values
     tasks: list[Task] = field(default_factory=list)
 

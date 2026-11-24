@@ -1,4 +1,4 @@
-"""compile(): checkpoint -> graph -> plan -> CUDA runtime, behind one Model object."""
+"""compile(): checkpoint -> graph -> plan -> runtime over a backend, behind one Model object."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ from pathlib import Path
 import torch
 
 from . import frontend, sources
-from .compiler import Plan, lower
-from .cuda import CudaBackend, Runtime
+from .compiler import Backend, Plan, lower
+from .cuda import CudaBackend
 from .cuda.schedule import STEP_ROWS
+from .runtime import Runtime
 from .sources import ModelConfig, Source
 
 
@@ -50,11 +51,19 @@ class Model:
         return [first, *self._runtime.decode(max_new_tokens - 1)]
 
 
-def compile(source: Source | str | Path, *, ctx_max: int = 4096, rows_max: int = STEP_ROWS, kv: str = "bf16") -> Model:
+def compile(
+    source: Source | str | Path,
+    *,
+    ctx_max: int = 4096,
+    rows_max: int = STEP_ROWS,
+    kv: str = "bf16",
+    backend: Backend | None = None,
+) -> Model:
     """Compile a checkpoint (a Source, a *.gguf file or an HF directory) for greedy decode with a KV cache of `ctx_max`
-    positions; prompt steps take up to `rows_max` rows."""
+    positions; prompt steps take up to `rows_max` rows. `backend`: the kernels to lower onto (default CudaBackend())."""
     if isinstance(source, str | Path):
         source = sources.open(source)
+    backend = CudaBackend() if backend is None else backend
     graph = frontend.build(source, ctx_max=ctx_max, kv=kv)
-    plan = lower(graph, CudaBackend(), rows_max=rows_max)
-    return Model(source.config, plan, Runtime(graph, plan, source))
+    plan = lower(graph, backend, rows_max=rows_max)
+    return Model(source.config, plan, Runtime(graph, plan, source, backend))

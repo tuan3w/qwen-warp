@@ -30,6 +30,11 @@ def _lin_shape(A, i):
     return A.graph.weights[A.node(i).attrs["weight"]].shape
 
 
+def _norm_offset(m, A) -> float:
+    """The offset of the rmsnorm(s) a match folds in front of its anchor (0.0 without one)."""
+    return next((A.node(i).attrs.get("offset", 0.0) for i in m.pre if A.node(i).op == "rmsnorm"), 0.0)
+
+
 def _gemv_consts(mode: int):
     def f(m, A):
         shapes = [_lin_shape(A, i) for i in m.anchors]
@@ -41,6 +46,7 @@ def _gemv_consts(mode: int):
             "T": A.rows_max,
             "mode": mode,
             "dtype": A.graph.types[A.node(m.anchors[0]).ins[0]].dtype,
+            "offset": _norm_offset(m, A),
         }
 
     return f
@@ -75,9 +81,16 @@ def _dual_check(m, A):
 
 
 def _norm_consts(m, A):
-    x = A.graph.types[A.node(m.anchors[0]).ins[0]]
+    n = A.node(m.anchors[0])
+    x = A.graph.types[n.ins[0]]
     # the kernel normalises rows of [T][H]: a [T][heads][hd] input is not its shape
-    return {"H": x.shape[-1], "T": A.rows_max, "rank": len(x.shape), "dtype": x.dtype}
+    return {
+        "H": x.shape[-1],
+        "T": A.rows_max,
+        "rank": len(x.shape),
+        "dtype": x.dtype,
+        "offset": n.attrs.get("offset", 0.0),
+    }
 
 
 def _attn_consts(m, A):
@@ -101,6 +114,7 @@ def _attn_consts(m, A):
         "dtype": g.types[att.ins[0]].dtype,
         "nc": nc,
         "nsplit": schedule.attn_splits(ctx, nc),
+        "offset": _norm_offset(m, A),
     }
 
 
@@ -129,6 +143,8 @@ def _attn_check(m, A):
         return "qk-norm must apply to both q and k or neither"
     if norms and norms[0].attrs["eps"] != norms[1].attrs["eps"]:
         return "q and k norms differ in eps"
+    if norms and norms[0].attrs.get("offset", 0.0) != norms[1].attrs.get("offset", 0.0):
+        return "q and k norms differ in offset"
 
     # the launcher reads the GEMV outputs through the reshapes: q and k reach the rope as (qk-norm of)
     # reshape(projection) and v as reshape(projection); a norm anywhere else (full width before the reshape, or on v)
@@ -372,10 +388,11 @@ _NORM_PRO = Absorb("rmsnorm", min=0, max=1)
 # h = bf16(h + bf16(y)), the stream written back in place
 _RESADD = Absorb("add", min=1, max=1, exposes=True, inplace=True)
 _ROWS = schedule.STEP_ROWS
-# K: k_gemv reads 8 bf16 per lane and 32 lanes per iteration; k_q4_gemv one Q4_0 block per lane
-_GEMV_LIMITS = {"K_multiple": 256, "T_max": _ROWS, "dtype_in": ("bf16",)}
+# K: k_gemv reads 8 bf16 per lane and 32 lanes per iteration; k_q4_gemv one Q4_0 block per lane. offset: the norms
+# compute x-hat * w (a folded prologue norm included), not the zero-centred x-hat * (1 + w)
+_GEMV_LIMITS = {"K_multiple": 256, "T_max": _ROWS, "dtype_in": ("bf16",), "offset_in": (0.0,)}
 _Q4GEMV_LIMITS = {"K_multiple": Q4_0_BLOCK_ELEMS, "T_max": _ROWS, "dtype_in": ("bf16",)}
-_NORM_LIMITS = {"H_multiple": 8, "T_max": _ROWS, "rank_in": (2,), "dtype_in": ("bf16",)}
+_NORM_LIMITS = {"H_multiple": 8, "T_max": _ROWS, "rank_in": (2,), "dtype_in": ("bf16",), "offset_in": (0.0,)}
 
 # order = tie-break of the cost model: the kernels with the most absorbed work first
 CAPS = [
@@ -383,7 +400,13 @@ CAPS = [
         "g_attn",
         "attention",
         pre=(Absorb("reshape", min=3, max=3), Absorb("rmsnorm", min=0, max=2), Absorb("rope", min=1, max=1)),
-        limits={"hd_in": schedule.ATTN_HEAD_DIMS, "G_max": 8, "T_max": _ROWS, "dtype_in": ("bf16",)},
+        limits={
+            "hd_in": schedule.ATTN_HEAD_DIMS,
+            "G_max": 8,
+            "T_max": _ROWS,
+            "dtype_in": ("bf16",),
+            "offset_in": (0.0,),
+        },
         rounds={"rmsnorm": ("out",), "rope": ("out",), "attention": ("out",)},
         tolerance=("rope.trig", "rope.prod", "attention.p"),
         launches=3,

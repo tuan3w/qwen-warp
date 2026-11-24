@@ -1,4 +1,5 @@
-"""Checkpoint sources: GGUF decoders vs ggml C, GGUF reader vs gguf.dequantize, safetensors, config guards.
+"""Checkpoint sources: GGUF decoders vs ggml C, GGUF reader vs gguf.dequantize, safetensors and compressed-tensors
+W4G128 (vs compressed_tensors' own unpacking), config guards.
 
 uv run --package warpc python warpc/tests/test_sources.py
 
@@ -6,6 +7,7 @@ LLAMA_CPP_DIR (a llama.cpp checkout) enables the ggml bit-identity check, WARPC_
 check; each skips when unset.
 """
 
+import json
 import math
 import os
 import shutil
@@ -24,7 +26,7 @@ from harness import Skip, run
 from warpc import frontend
 from warpc.errors import UnsupportedModel
 from warpc.ir import Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS
-from warpc.sources import ModelConfig
+from warpc.sources import ModelConfig, w4g128
 from warpc.sources.gguf import DECODERS, GGUFSource, hf_name
 
 transformers_logging.disable_progress_bar()
@@ -257,9 +259,9 @@ def test_gguf_matches_safetensors():
                 if source.quant(name) is None and not name.endswith("v_proj.weight"):  # F16 rounds bf16 subnormals
                     assert torch.equal(source.get(name), hf.get(name)), (family, name)
             gate = "model.layers.1.mlp.gate_proj.weight"
-            raw = source.raw(gate)
-            assert raw.dtype == np.uint8 and raw.shape == (96, 64 // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES), raw.shape
-            assert torch.equal(torch.from_numpy(DECODERS["Q4_0"](raw)).bfloat16(), source.get(gate))
+            raw = source.raw(gate)["blocks"]
+            assert raw.dtype == torch.uint8 and raw.shape == (96, 64 // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES), raw.shape
+            assert torch.equal(torch.from_numpy(DECODERS["Q4_0"](raw.numpy())).bfloat16(), source.get(gate))
             q = "model.layers.0.self_attn.q_proj.weight"
             try:
                 source.raw(q)
@@ -315,7 +317,7 @@ def test_real_gguf():
         assert (decl.scheme == "q4_0") == (source.quant(decl.source) == "Q4_0"), decl.name
         if decl.scheme == "q4_0":
             row_bytes = decl.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
-            assert source.raw(decl.source).shape == (decl.shape[0], row_bytes), decl.name
+            assert source.raw(decl.source)["blocks"].shape == (decl.shape[0], row_bytes), decl.name
 
 
 def test_safetensors_source():
@@ -362,9 +364,17 @@ def test_config_errors():
     del missing["rms_norm_eps"], missing["vocab_size"]
     for patch, needle in (
         (missing, "missing vocab_size; missing rms_norm_eps"),
-        ({**base, "model_type": "qwen2"}, "model_type 'qwen2' (supported: llama, mistral, qwen3)"),
+        ({**base, "model_type": "qwen2"}, "model_type 'qwen2' (supported: llama, mistral, qwen3, qwen3_5"),
         ({**base, "model_type": "gemma"}, "model_type 'gemma'"),
         ({**base, "quantization_config": {"quant_method": "compressed-tensors"}}, "'compressed-tensors'"),
+        ({**base, **QWEN35_TEXT, "hidden_act": "gelu"}, "hidden_act='gelu'"),
+        ({**base, **QWEN35_TEXT, "rope_parameters": {"rope_type": "yarn"}}, "rope type 'yarn'"),
+        ({**base, **QWEN35_TEXT, "mamba_ssm_dtype": "bfloat16"}, "mamba_ssm_dtype='bfloat16'"),
+        ({**base, **QWEN35_TEXT, "quantization_config": {**W4G128, "format": "float-quantized"}}, "pack-quantized"),
+        ({**base, **QWEN35_TEXT, "quantization_config": w4g128_with(group_size=64)}, "group_size=64"),
+        ({**base, **QWEN35_TEXT, "quantization_config": w4g128_with(symmetric=False)}, "symmetric=False"),
+        ({**base, **QWEN35_TEXT, "quantization_config": w4g128_with(actorder="group")}, "actorder 'group'"),
+        ({**base, **QWEN35_TEXT, "quantization_config": w4g128_activations()}, "input_activations"),
     ):
         try:
             ModelConfig.from_hf(patch)
@@ -372,6 +382,149 @@ def test_config_errors():
             assert needle in str(e), (needle, str(e))
         else:
             raise AssertionError(f"{needle}: accepted")
+
+
+QWEN35_TEXT = {
+    "model_type": "qwen3_5_text",
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 64,
+    "linear_value_head_dim": 64,
+    "linear_conv_kernel_dim": 4,
+    "num_hidden_layers": 2,
+    "attn_output_gate": True,
+    "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [1]},
+}
+W4G128 = {
+    "quant_method": "compressed-tensors",
+    "format": "pack-quantized",
+    "config_groups": {
+        "group_0": {
+            "targets": ["Linear"],
+            "input_activations": None,
+            "weights": {"num_bits": 4, "type": "int", "strategy": "group", "group_size": 128, "symmetric": True},
+        }
+    },
+}
+
+
+def w4g128_with(**weights) -> dict:
+    group = W4G128["config_groups"]["group_0"]
+    return {**W4G128, "config_groups": {"group_0": {**group, "weights": {**group["weights"], **weights}}}}
+
+
+def w4g128_activations() -> dict:
+    group = W4G128["config_groups"]["group_0"]
+    return {**W4G128, "config_groups": {"group_0": {**group, "input_activations": {"num_bits": 8}}}}
+
+
+def test_qwen35_config():
+    """The 27B's config.json shape: text keys nested under text_config, quantisation and vision at the top."""
+    text = {**QWEN35_TEXT, "vocab_size": 1000, "hidden_size": 512, "intermediate_size": 1024, "num_attention_heads": 8,
+            "num_key_value_heads": 2, "head_dim": 256, "rms_norm_eps": 1e-6, "mamba_ssm_dtype": "float32"}  # fmt: skip
+    hf = {"model_type": "qwen3_5", "text_config": text, "vision_config": {"depth": 1}, "quantization_config": W4G128}
+    c = ModelConfig.from_hf(hf)
+    assert (c.family, c.head_dim, c.rotary_dim, c.norm_offset, c.quantization) == ("qwen3_5", 256, 64, 1.0, "w4g128")
+    assert c.layer_types == ("linear_attention", "attention") and c.linear.num_v_heads == 4 and c.attn_output_gate
+    want = 1.0 / (1e7 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+    assert c.rope_inv_freq() == tuple(want.tolist())
+    assert ModelConfig.from_hf(text).quantization is None  # a Qwen3_5ForCausalLM config.json
+
+
+def write_w4g128(directory: Path, tensors: dict, n: int = 48, k: int = 256, seed: int = 0) -> dict:
+    """A synthetic compressed-tensors checkpoint: one W4G128 linear "lin" packed by compressed_tensors itself, a
+    bf16 tensor, and `tensors`; returns the int8 codes and bf16 scales."""
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from safetensors.torch import save_file
+
+    g = torch.Generator().manual_seed(seed)
+    codes = torch.randint(-8, 8, (n, k), generator=g, dtype=torch.int8)
+    scale = (torch.rand(n, k // 128, generator=g) * 0.1 + 1e-3).bfloat16()
+    save_file(
+        {
+            "lin.weight_packed": pack_to_int32(codes, 4),
+            "lin.weight_scale": scale,
+            "lin.weight_shape": torch.tensor([n, k]),
+            "norm.weight": torch.randn(k, generator=g).bfloat16(),
+            **tensors,
+        },
+        directory / "model.safetensors",
+    )
+    (directory / "config.json").write_text(json.dumps({**QWEN35_CONFIG, "quantization_config": W4G128}))
+    return {"codes": codes, "scale": scale}
+
+
+QWEN35_CONFIG = {
+    **QWEN35_TEXT,
+    "vocab_size": 64,
+    "hidden_size": 256,
+    "intermediate_size": 256,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 128,
+    "rms_norm_eps": 1e-6,
+}
+
+
+def test_w4g128_source_and_dequantize_oracle():
+    """W4G128 linears by their logical name: quant / raw / contains, get() refused. The codes equal compressed_tensors'
+    own unpacking; dequantize is the exact fp32 (code - 8) * scale, and compressed_tensors' dequantize (which computes
+    in the scale's dtype, bf16, whatever output dtype is asked) is it rounded once."""
+    try:
+        from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+        from compressed_tensors.quantization.lifecycle.forward import dequantize as ct_dequantize
+    except ImportError as e:
+        raise Skip(f"compressed_tensors not installed: {e}") from e
+    with tempfile.TemporaryDirectory() as tmp:
+        want = write_w4g128(Path(tmp), {})
+        source = warpc.sources.open(tmp)
+        assert "lin.weight" in source and "lin.weight_packed" in source and "lin.bias" not in source
+        assert source.quant("lin.weight") == "W4G128" and source.quant("norm.weight") is None
+        raw = source.raw("lin.weight")
+        assert raw["packed"].dtype == torch.int32 and raw["packed"].shape == (48, 32)
+        assert torch.equal(raw["scale"], want["scale"])
+        assert torch.equal(w4g128.unpack(raw["packed"]) - 8, want["codes"].int())
+        ours = w4g128.dequantize(raw["packed"], raw["scale"])
+        unpacked = unpack_from_int32(raw["packed"], 4, torch.Size([48, 256]))
+        assert torch.equal(w4g128.unpack(raw["packed"]) - 8, unpacked.int())
+        assert torch.equal(ours, want["codes"].float() * want["scale"].float().repeat_interleave(128, 1))
+        assert torch.equal(ours.bfloat16(), ct_dequantize(unpacked, raw["scale"]))
+        assert torch.equal(ours.bfloat16().float(), ct_dequantize(unpacked, raw["scale"], dtype=torch.float32))
+        for call, name in ((source.get, "lin.weight"), (source.raw, "norm.weight")):
+            try:
+                call(name)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{call.__name__}({name}) must be refused")
+
+
+def test_w4g128_source_guards():
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            write_w4g128(Path(tmp), {})
+        except ImportError as e:
+            raise Skip(f"compressed_tensors not installed: {e}") from e
+    cases = {
+        "zero point": {"lin.weight_zero_point": torch.zeros(48, 2, dtype=torch.int32)},
+        "ambiguous": {"lin.weight": torch.zeros(48, 256).bfloat16()},
+        # 1 + 2^-10 needs 11 significant bits: the source must not round it to bf16 silently
+        "bf16 does not represent": {"f32.weight": torch.tensor([1.0, 1.0 + 2**-10])},
+    }
+    for needle, extra in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_w4g128(Path(tmp), extra)
+            try:
+                source = warpc.sources.open(tmp)
+                source.get("f32.weight")
+            except UnsupportedModel as e:
+                assert needle in str(e), (needle, str(e))
+            else:
+                raise AssertionError(f"{needle}: accepted")
+    with tempfile.TemporaryDirectory() as tmp:
+        write_w4g128(Path(tmp), {"f32.weight": torch.tensor([1.0, 0.5, -3.0])})
+        assert torch.equal(warpc.sources.open(tmp).get("f32.weight"), torch.tensor([1.0, 0.5, -3.0]).bfloat16())
 
 
 def test_open_errors():

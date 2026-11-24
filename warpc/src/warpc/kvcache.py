@@ -44,6 +44,9 @@ int4_rot layout, each section 16-byte aligned (no padding at the engine's 4 KV h
 [Hkv][ctx][hd / 2], ks / vs scale codes [Hkv][ctx][hd / 64], kx / vx sink fp16 [Hkv][4][hd] (positions 0..3), kr / vr
 ring fp16 [Hkv][512][hd] (slot = position % 512). The ring has 512 slots for a 496-row window so that a rejected
 speculative row of an 8-row step never overwrites a row the next step reads (kvrot.cuh RING_W / RING_R).
+
+"fp8" is the hand engine's e4m3 cache with the checkpoint's per-tensor k_scale / v_scale (`Fp8Format`); the CUDA
+backend has no kernel for it.
 """
 
 from __future__ import annotations
@@ -488,6 +491,47 @@ class RotatedInt4Format(KVFormat):
         return RotatedInt4Cache(shape, device=device)
 
 
+class Fp8Cache:
+    """Reference storage of an fp8 KV state: the rows as the reader decodes them (e4m3 value * scale), fp32."""
+
+    def __init__(self, shape: tuple[int, ...], *, device):
+        self.read = torch.zeros(shape, dtype=torch.float32, device=device)
+
+    def write(self, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, k_scale, v_scale) -> None:
+        for i, (x, s) in enumerate(((k, k_scale), (v, v_scale))):
+            s = s.float().reshape(())
+            q = (x.float() * (1.0 / s)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            self.read[i].index_copy_(0, pos, q.float() * s)
+
+    def attend(self, q: torch.Tensor, pos: torch.Tensor, scale: float, *, k_scale, v_scale) -> torch.Tensor:
+        """q and the probabilities meet the rows as fp16 (the reader's mma operand type)."""
+        length = int(pos.max()) + 1
+        hq, hkv = q.shape[1], self.read.shape[2]
+        kk = self.read[0, :length].repeat_interleave(hq // hkv, 1)
+        vv = self.read[1, :length].repeat_interleave(hq // hkv, 1)
+        sc = torch.einsum("thd,lhd->htl", q.half().float(), kk) * scale
+        mask = torch.arange(length, device=q.device)[None, :] > pos[:, None]
+        pr = torch.softmax(sc.masked_fill(mask[None], float("-inf")), -1).half().float()
+        out = torch.einsum("htl,lhd->thd", pr, vv).to(q.dtype)
+        return out.reshape(q.shape[0], hq * q.shape[2])
+
+
+@dataclass(frozen=True)
+class Fp8Format(KVFormat):
+    """fp8: per (token, KV head) row, x * fp32(1 / scale) saturated to e4m3 (+-448), round to nearest even; read as
+    e4m3 value * scale. scale: the checkpoint's per-layer, per-tensor k_scale / v_scale (the attention op's weights).
+    Layout [2 (K, V)][Hkv][ctx][hd] bytes."""
+
+    def layout(self, ctx: int, nkv: int, hd: int, rows_max: int) -> dict[str, int]:
+        raise ValueError("KV format fp8 has no sectioned layout")
+
+    def nbytes(self, ctx: int, nkv: int, hd: int, rows_max: int) -> int:
+        return 2 * nkv * ctx * hd
+
+    def reference_cache(self, shape: tuple[int, ...], *, device, dtype: torch.dtype) -> Fp8Cache:
+        return Fp8Cache(shape, device=device)
+
+
 FORMATS: dict[str, KVFormat] = {
     f.name: f
     for f in (
@@ -496,5 +540,6 @@ FORMATS: dict[str, KVFormat] = {
         KVFormat("k8v8w", 8, 8, sink=4, window=256),
         KVFormat("k8v4w", 8, 4, sink=4, window=256),
         RotatedInt4Format("int4_rot", 4, 4, sink=_ROT_SINK, window=_ROT_WINDOW),
+        Fp8Format("fp8", 8, 8),
     )
 }

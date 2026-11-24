@@ -193,9 +193,10 @@ class GGUFSource:
         kind = self._index[name][0].tensor_type.name
         return None if kind in _FLOATS else kind
 
-    def raw(self, name: str) -> np.ndarray:
+    def raw(self, name: str) -> dict[str, torch.Tensor]:
+        """{"blocks": uint8 [out, row_bytes]}: the block rows as stored (q / k rows un-permuted), a writable copy."""
         t, heads = self._index[name]
         if t.tensor_type.name in _FLOATS or len(t.shape) != 2:
             raise ValueError(f"{name}: {t.tensor_type.name} {len(t.shape)}-D tensor has no block rows")
         rows = np.asarray(t.data).reshape(int(t.shape[1]), -1)
-        return np.ascontiguousarray(_unpermute(rows, heads) if heads else rows)
+        return {"blocks": torch.from_numpy(np.array(_unpermute(rows, heads) if heads else rows, copy=True))}

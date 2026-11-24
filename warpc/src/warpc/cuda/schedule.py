@@ -3,7 +3,7 @@ constants mirror #defines of kernels/dense_common.cuh and kernels/dense_attn_com
 
 from __future__ import annotations
 
-from ..kvcache import KVFormat, RotatedInt4Format
+from ..kvcache import Fp8Format, KVFormat, RotatedInt4Format
 
 STEP_ROWS = 8  # rows one launch handles at most: the decode row or a prompt chunk
 GEMV_WARPS = 4  # warps per GEMV CTA (128 threads)
@@ -47,6 +47,8 @@ def attn_split_cap(cache: str, nc: int) -> int:
 
 def kv_kernel_reason(fmt: KVFormat, hd: int) -> str | None:
     """Why the attention kernels cannot run KV format `fmt` at head dim `hd`, or None."""
+    if isinstance(fmt, Fp8Format):
+        return f"KV format {fmt.name} has no kernel here"
     if fmt.quantized and hd not in ATTN_HEAD_DIMS:
         return f"KV format {fmt.name} has no kernel for head dim {hd} (only {ATTN_HEAD_DIMS})"
     return None

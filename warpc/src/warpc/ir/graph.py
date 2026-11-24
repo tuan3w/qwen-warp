@@ -11,10 +11,15 @@ from dataclasses import dataclass, field
 
 Dim = int | str
 DTYPES = ("bf16", "f32", "i32")
-SCHEMES = ("dense", "q4_0")
+SCHEMES = ("dense", "q4_0", "w4g128")
 # GGUF Q4_0 block: one fp16 scale and 32 4-bit codes
 Q4_0_BLOCK_ELEMS = 32
 Q4_0_BLOCK_BYTES = 18
+# compressed-tensors pack-quantized int4, symmetric: one bf16 scale per 128 columns, no zero point
+W4G128_GROUP = 128
+STATE_KINDS = ("kv", "conv", "recurrent")
+# kv: the element type is the cache format's (warpc.kvcache.FORMATS)
+STATE_DTYPE = {"conv": "bf16", "recurrent": "f32"}
 
 
 @dataclass(frozen=True)
@@ -31,7 +36,8 @@ class TType:
 class WeightDecl:
     """A read-only tensor of logical shape `shape`, read from `source` (a full HF tensor name).
 
-    scheme "dense": the source tensor in bf16; "q4_0": the source's on-disk GGUF Q4_0 blocks (`Source.raw`).
+    scheme "dense": the source tensor in bf16; "q4_0": the source's on-disk GGUF Q4_0 blocks (`Source.raw`);
+    "w4g128": the source's int4 codes packed 8 per int32 word and bf16 scales of 128 columns (`Source.raw`).
     """
 
     name: str
@@ -42,22 +48,34 @@ class WeightDecl:
     def __post_init__(self):
         if self.scheme not in SCHEMES:
             raise ValueError(f"weight {self.name}: unknown scheme {self.scheme!r}")
+        if self.scheme == "w4g128" and (len(self.shape) != 2 or self.shape[1] % W4G128_GROUP):
+            raise ValueError(f"weight {self.name}: w4g128 needs a 2-D shape with K a multiple of {W4G128_GROUP}")
 
     @property
     def nbytes(self) -> int:
         """Bytes of the weight on device in its scheme."""
         if self.scheme == "q4_0":
             return self.shape[0] * self.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
+        if self.scheme == "w4g128":
+            n, k = self.shape
+            return n * k // 2 + n * (k // W4G128_GROUP) * 2
         return 2 * math.prod(self.shape)
 
 
 @dataclass(frozen=True)
 class StateDecl:
-    """A positional KV cache [2 (K, V), ctx, Hkv, hd] of format `cache` (a name in `warpc.kvcache.FORMATS`)."""
+    """kv: positional cache [2 (K, V), ctx, Hkv, hd] in format `cache` (a name in `warpc.kvcache.FORMATS`). conv: the
+    last W-1 inputs of a depthwise causal conv, [C, W-1], oldest first. recurrent: one matrix per head, [H, dk, dv].
+    Element type: STATE_DTYPE (conv, recurrent) or the cache format (kv)."""
 
     name: str
+    kind: str
     shape: tuple[int, ...]
-    cache: str = "bf16"
+    cache: str = "bf16"  # kv only
+
+    def __post_init__(self):
+        if self.kind not in STATE_KINDS:
+            raise ValueError(f"state {self.name}: unknown kind {self.kind!r}")
 
 
 @dataclass
@@ -70,13 +88,28 @@ class Node:
 
 @dataclass(frozen=True)
 class OpDef:
-    """An op: `infer(graph, attrs, input types) -> output types`, raising ValueError on ill-typed use."""
+    """An op: `infer(graph, attrs, input types) -> output types`, raising ValueError on ill-typed use. `weights` and
+    `states` list the attrs that name a graph weight / state (an absent optional attr names none); `state_kind` is
+    the kind every named state must have."""
 
     name: str
     infer: Callable[[Graph, dict, list[TType]], list[TType]]
+    weights: tuple[str, ...] = ()
+    states: tuple[str, ...] = ()
+    state_kind: str = ""
 
 
 OPS: dict[str, OpDef] = {}
+
+
+def weights_of(n: Node) -> list[str]:
+    """The graph weights node `n` reads, in its op's attr order."""
+    return [n.attrs[k] for k in OPS[n.op].weights if k in n.attrs]
+
+
+def states_of(n: Node) -> list[str]:
+    """The graph states node `n` reads and writes."""
+    return [n.attrs[k] for k in OPS[n.op].states if k in n.attrs]
 
 
 class Graph:
@@ -124,17 +157,30 @@ class Graph:
             if v not in self.types:
                 raise ValueError(f"{op}: unknown input value {v}")
         base = attrs.pop("name", None) or op
+        node = Node(op, list(ins), [], attrs)
+        self._check_operands(node)
         otypes = OPS[op].infer(self, attrs, [self.types[v] for v in ins])
-        outs = []
         for i, t in enumerate(otypes):
             self._count += 1
             v = f"{base}.{self._count}" if len(otypes) == 1 else f"{base}.{self._count}.{i}"
             if v in self.types:
                 raise ValueError(f"{op}: duplicate value name {v}")
             self.types[v] = t
-            outs.append(v)
-        self.nodes.append(Node(op, list(ins), outs, attrs))
-        return tuple(outs)
+            node.outs.append(v)
+        self.nodes.append(node)
+        return tuple(node.outs)
+
+    def _check_operands(self, n: Node) -> None:
+        """Every weight and state the node names is declared, every state of the kind its op expects."""
+        d = OPS[n.op]
+        for w in weights_of(n):
+            if w not in self.weights:
+                raise ValueError(f"{n.op}: unknown weight {w}")
+        for s in states_of(n):
+            if s not in self.states:
+                raise ValueError(f"{n.op}: unknown state {s}")
+            if self.states[s].kind != d.state_kind:
+                raise ValueError(f"{n.op}: state {s} is {self.states[s].kind}, the op needs {d.state_kind}")
 
     def output(self, **values: str) -> None:
         for alias, v in values.items():
@@ -143,12 +189,14 @@ class Graph:
             self.outputs[alias] = v
 
     def verify(self) -> None:
-        """Every input defined before use, every stored type equal to a fresh inference, every output defined."""
+        """Every input defined before use, every named weight and state declared (states of the op's kind), every
+        stored type equal to a fresh inference, every output defined."""
         seen = set(self.inputs)
         for n in self.nodes:
             for v in n.ins:
                 if v not in seen:
                     raise ValueError(f"{n.op}: {v} used before definition")
+            self._check_operands(n)
             if [self.types[o] for o in n.outs] != OPS[n.op].infer(self, n.attrs, [self.types[v] for v in n.ins]):
                 raise ValueError(f"{n.op}: stored output types differ from inference")
             seen.update(n.outs)

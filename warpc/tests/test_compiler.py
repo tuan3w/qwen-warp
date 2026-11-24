@@ -16,7 +16,6 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from harness import run
@@ -25,6 +24,7 @@ from warpc.compiler import Absorb, Cap, CapsTable, Pack, Region, Verdict, lower
 from warpc.compiler.caps import ref_points
 from warpc.compiler.fuse import Analysis, _candidates, fuse
 from warpc.cuda import CudaBackend, glue, schedule
+from warpc.cuda.backend import state_nbytes
 from warpc.cuda.pack import Packer
 from warpc.cuda.table import HEAD_NUMERICS, RTX3090, TABLE
 from warpc.errors import LoweringError
@@ -73,7 +73,14 @@ class ShapeSource:
 
 
 def build(cfg: dict, family: str = "qwen3", ctx: int = 2048, kv: str = "bf16", q4: bool = False) -> Graph:
-    config = ModelConfig(family=family, qk_norm=family == "qwen3", tie_embeddings=False, rope_freq_factors=None, **cfg)
+    config = ModelConfig(
+        family=family,
+        qk_norm=family == "qwen3",
+        tie_embeddings=False,
+        rope_freq_factors=None,
+        rotary_dim=cfg["head_dim"],
+        **cfg,
+    )
     return frontend.build(ShapeSource(config, q4), ctx_max=ctx, kv=kv)
 
 
@@ -261,7 +268,8 @@ def test_llama_plan_folds_the_norm_into_qkv_and_updates_the_stream_in_place():
     assert [t.kernel for t in plan.tasks] == ["g_embed"] + LAYER * 2 + ["g_rmsnorm", "g_head"]
     qkv = plan.tasks[1]
     assert "nw" in qkv.weights and qkv.attrs["segs"] == [4096, 1024, 1024]
-    assert plan.packs[qkv.weights["w"]].kind == "dense_cat"
+    packs = {p.name: p for p in plan.packs.values()}
+    assert packs[qkv.weights["w"]].kind == "dense_cat"
     attn = plan.tasks[2]
     assert attn.attrs["qk_norm"] is False and "eps" not in attn.attrs and not attn.weights
     for t in plan.tasks:
@@ -472,7 +480,7 @@ def test_full_width_qk_norm_is_not_absorbed_into_the_attention():
     g.weight(WeightDecl("wo", (H, nq * hd), "dense", "wo"))
     g.weight(WeightDecl("qn", (nq * hd,), "dense", "qn"))
     g.weight(WeightDecl("kn", (nkv * hd,), "dense", "kn"))
-    g.state(StateDecl("kv", (2, 256, nkv, hd)))
+    g.state(StateDecl("kv", "kv", (2, 256, nkv, hd)))
     x = g.op("embed", ["tokens"], weight="embed", name="x")
     q = g.op("rmsnorm", [g.op("linear", [x], weight="wq")], weight="qn", eps=1e-6)  # full width, before the reshape
     k = g.op("rmsnorm", [g.op("linear", [x], weight="wk")], weight="kn", eps=1e-6)
@@ -643,7 +651,7 @@ from warpc.sources import ModelConfig
 class Shapes:
     config = ModelConfig(family="qwen3", qk_norm=True, tie_embeddings=False, vocab_size=4096, hidden_size=1024,
                          intermediate_size=3072, num_layers=3, num_heads=16, num_kv_heads=8, head_dim=128,
-                         rms_eps=1e-6, rope_theta=1e6, rope_freq_factors=None)
+                         rms_eps=1e-6, rope_theta=1e6, rope_freq_factors=None, rotary_dim=128)
     def __contains__(self, name): return True
     def quant(self, name): return None
 
@@ -677,7 +685,7 @@ class TensorSource:
 def test_packer_builds_the_four_kinds():
     torch.manual_seed(0)
     a, b, e = (torch.randn(s).bfloat16() for s in ((8, 64), (4, 64), (16, 64)))
-    qa, qb = (torch.randint(0, 256, (n, 2 * 18), dtype=torch.uint8).numpy() for n in (8, 4))
+    qa, qb = (torch.randint(0, 256, (n, 2 * 18), dtype=torch.uint8) for n in (8, 4))
     weights = {
         "a": WeightDecl("a", (8, 64), "dense", "a.weight"),
         "b": WeightDecl("b", (4, 64), "dense", "b.weight"),
@@ -688,40 +696,163 @@ def test_packer_builds_the_four_kinds():
         "norm": WeightDecl("norm", (64,), "dense", "norm.weight"),
     }
     dense = {"a.weight": a, "b.weight": b, "embed.weight": e, "norm.weight": e[0]}
-    pk = Packer(weights, TensorSource(dense, {"qa.weight": qa, "qb.weight": qb}), device="cpu")
+    raw = {"qa.weight": {"blocks": qa}, "qb.weight": {"blocks": qb}}
+    pk = Packer(weights, TensorSource(dense, raw), device="cpu")
     assert torch.equal(pk.build(Pack("a|b", "dense_cat", ["a", "b"])), torch.cat([a, b]))
     tied = pk.build(Pack("lm_head", "dense", ["lm_head"]))
     assert pk.build(Pack("embed", "dense", ["embed"])) is tied  # one device tensor
-    assert torch.equal(pk.build(Pack("qa|qb", "q4_0_cat", ["qa", "qb"])), torch.from_numpy(np.concatenate([qa, qb])))
-    assert torch.equal(pk.build(Pack("qa", "q4_0", ["qa"])), torch.from_numpy(qa))
+    assert torch.equal(pk.build(Pack("qa|qb", "q4_0_cat", ["qa", "qb"])), torch.cat([qa, qb]))
+    assert torch.equal(pk.build(Pack("qa", "q4_0", ["qa"])), qa)
     assert pk.build(Pack("norm", "dense", ["norm"])).shape == (64,)
-    for bad in (Pack("qa", "dense", ["qa"]), Pack("a", "q4_0", ["a"])):
+    for bad in (Pack("qa", "dense", ["qa"]), Pack("a", "q4_0", ["a"]), Pack("x", "w4r_cat", ["x"])):
         try:
             pk.build(bad)
         except ValueError:
             pass
         else:
             raise AssertionError(f"{bad} must be refused")
-    try:
-        Pack("x", "w4r_cat", ["x"])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("only the dense pack kinds exist")
 
 
-def test_kv_bytes_follow_the_cache_format_and_the_step_rows():
-    s = StateDecl("kv", (2, 4096, 8, 128), cache="bf16")
-    assert CudaBackend.kv_bytes(s, 8) == CudaBackend.kv_bytes(s, 1) == 2 * 8 * 4096 * 128 * 2
+def test_state_bytes_follow_the_cache_format_and_the_step_rows():
+    s = StateDecl("kv", "kv", (2, 4096, 8, 128), cache="bf16")
+    assert state_nbytes(s, 8) == state_nbytes(s, 1) == 2 * 8 * 4096 * 128 * 2
     q = replace(s, cache="k8v4w")
-    assert 4096 * 8 * (128 + 64 + 4) < CudaBackend.kv_bytes(q, 8) < CudaBackend.kv_bytes(s, 8)
-    assert CudaBackend.kv_bytes(q, 8) - CudaBackend.kv_bytes(q, 1) == 2 * 8 * 7 * 128 * 2  # the ring's extra rows
+    assert 4096 * 8 * (128 + 64 + 4) < state_nbytes(q, 8) < state_nbytes(s, 8)
+    assert state_nbytes(q, 8) - state_nbytes(q, 1) == 2 * 8 * 7 * 128 * 2  # the ring's extra rows
     meta = schedule.kv_meta(FORMATS["k8v4w"], 4096, 8, 128, 3)
     assert meta[8:] == (4, 256, 259, 4, 0), meta
     r = replace(s, cache="int4_rot")
-    assert CudaBackend.kv_bytes(r, 8) == CudaBackend.kv_bytes(r, 1)  # a fixed 512-slot ring
+    assert state_nbytes(r, 8) == state_nbytes(r, 1)  # a fixed 512-slot ring
+    assert state_nbytes(StateDecl("c", "conv", (10240, 3)), 8) == 10240 * 3 * 2
+    assert state_nbytes(StateDecl("r", "recurrent", (48, 128, 128)), 8) == 48 * 128 * 128 * 4
     meta = schedule.kv_meta(FORMATS["int4_rot"], 4096, 8, 128, 8)
     assert meta[8:] == (4, 496, 512, 4, 1), meta
+
+
+def test_zero_centred_norms_are_refused_by_the_dense_table():
+    """Every CUDA norm computes x-hat * w: a graph whose norms carry offset 1.0 (Qwen3.5's x-hat * (1 + w)) must not
+    lower onto them, and the error names the offset."""
+    g = build({**QWEN3_06B, "num_layers": 1})
+    for n in g.nodes:
+        if n.op == "rmsnorm":
+            n.attrs["offset"] = 1.0
+    g.verify()
+    try:
+        lower(g, BACKEND, rows_max=8)
+    except LoweringError as e:
+        assert "offset=1.0 not in (0.0,)" in str(e), str(e)
+        assert "rmsnorm x" in str(e), str(e)
+    else:
+        raise AssertionError("a zero-centred norm lowered onto x-hat * w kernels")
+    res = fuse(g, TABLE, 8)
+    assert not any(r.kernel in ("g_attn", "g_rmsnorm", "g_rmsnorm_add") for r in res.regions), res.regions
+    attn = next(i for i, n in enumerate(g.nodes) if n.op == "attention")
+    assert "offset=1.0" in res.unclaimed[attn], res.unclaimed[attn]  # with the qk-norms, the attention's only match
+
+
+class Qwen35Shapes:
+    """The 27B's text geometry with 4 layers: linears W4G128 except in_proj_a / b, as in the checkpoint."""
+
+    config = ModelConfig.from_hf(
+        {
+            "model_type": "qwen3_5_text",
+            "vocab_size": 248320,
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "rms_norm_eps": 1e-6,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25},
+        }
+    )
+
+    def __contains__(self, name: str) -> bool:
+        return name.startswith(("model.language_model.", "lm_head"))
+
+    def quant(self, name: str) -> str | None:
+        lin = name.endswith("proj.weight") or name.endswith("in_proj_qkv.weight") or name.endswith("in_proj_z.weight")
+        return "W4G128" if lin and "in_proj_a" not in name and "in_proj_b" not in name else None
+
+
+def test_qwen35_graph_on_the_cuda_table():
+    """The 27B graph (4 layers, the checkpoint's prefix and schemes) verifies, and the CUDA table refuses it naming the
+    ops it has no kernel for: the stage-2 progress readout."""
+    g = frontend.build(Qwen35Shapes(), ctx_max=4096)
+    assert g.weights["embed"].source == "model.language_model.embed_tokens.weight"
+    schemes = Counter(w.scheme for w in g.weights.values())
+    assert schemes["w4g128"] == 4 * 3 + 3 * 3 + 4, schemes  # MLPs, qkv / z / out, q / k / v / o
+    assert g.weights["L0.qkv"].nbytes == 10240 * 5120 // 2 + 10240 * 40 * 2
+    try:
+        lower(g, BACKEND, rows_max=8)
+    except LoweringError as e:
+        for op in ("gated_delta_rule", "causal_conv1d", "gated_rmsnorm", "sigmoid_mul", "split", "silu x3"):
+            assert op in str(e), (op, str(e))
+    else:
+        raise AssertionError("the CUDA table claimed a Qwen3.5 graph")
+
+
+def test_prologue_absorbs_producers_of_epilogue_operands():
+    """The epilogue chain is matched before the prologue closure: a gate's reshapes in front of the sigmoid_mul a
+    kernel applies after its linear are absorbed into the same region."""
+    g = Graph("gated")
+    g.input("tokens", TType(("T",), "i32"))
+    for n, s in (("embed", (32, 64)), ("wa", (64, 64)), ("wb", (64, 64))):
+        g.weight(WeightDecl(n, s, "dense", n))
+    x = g.op("embed", ["tokens"], weight="embed")
+    y = g.op("linear", [x], weight="wa")
+    gate = g.op("reshape", [g.op("reshape", [g.op("linear", [x], weight="wb")], shape=["T", 4, 16])], shape=["T", 64])
+    g.output(out=g.op("sigmoid_mul", [y, gate]))
+    g.verify()
+
+    def emit(m, A):
+        return Region("k_gated", set(m.covers), ins={}, outs={})
+
+    cap = Cap("k_gated", "linear", pre=(Absorb("reshape", max=2),), post=(Absorb("sigmoid_mul", min=1),), emit=emit)
+    res = fuse(g, CapsTable([cap], RTX3090, TABLE.unfused_ctas), 8)
+    region = next(r for r in res.regions if r.kernel == "k_gated")
+    assert sorted(g.nodes[i].op for i in region.covers) == ["linear", "reshape", "reshape", "sigmoid_mul"], region
+
+
+def test_plan_packs_are_keyed_by_kind_and_parts():
+    """plan.packs is keyed (kind, parts): one weight read in two layouts is two packs; one human name for two different
+    packs is a LoweringError."""
+    g = Graph("packs")
+    g.input("tokens", TType(("T",), "i32"))
+    for n, s in (("embed", (32, 64)), ("w", (64, 64))):
+        g.weight(WeightDecl(n, s, "dense", n))
+    g.output(out=g.op("linear", [g.op("embed", ["tokens"], weight="embed")], weight="w"))
+
+    def emitter(kernel: str, pack: Pack):
+        return lambda m, A: Region(
+            kernel, set(m.covers), ins={}, outs={"y": A.node(m.anchors[0]).outs[0]}, packs=[pack]
+        )
+
+    class Toy:
+        name = "toy"
+
+        def __init__(self, emb: Pack, lin: Pack):
+            caps = [
+                Cap("k_emb", "embed", emit=emitter("k_emb", emb)),
+                Cap("k_lin", "linear", emit=emitter("k_lin", lin)),
+            ]
+            self.caps = CapsTable(caps, RTX3090, TABLE.unfused_ctas)
+
+    plan = lower(g, Toy(Pack("w", "dense", ["w"]), Pack("w.r", "repacked", ["w"])), rows_max=8)
+    assert sorted(plan.packs) == [("dense", ("w",)), ("repacked", ("w",))], plan.packs
+    try:
+        lower(g, Toy(Pack("w", "dense", ["w"]), Pack("w", "repacked", ["w"])), rows_max=8)
+    except LoweringError as e:
+        assert "pack w is built as ('dense', ('w',)) and as ('repacked', ('w',))" in str(e), str(e)
+    else:
+        raise AssertionError("one pack name for two layouts lowered")
 
 
 def test_glue_signatures_and_constants_match_the_kernel_sources():
