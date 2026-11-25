@@ -6,6 +6,8 @@
 // attention output un-rotated once in the reduce kernel), optionally the first `sink` positions and the newest `win` positions of each query row read from
 // exact fp16 rows (a sink buffer and a ring of at least win + T slots, slot = position % ring). The buffer layout is KVFormat.layout(); 4-bit rows hold 8-element words with
 // elements 0-3 in the low nibbles and 4-7 in the high nibbles of the 4 bytes.
+// R4 (KV format int4_rot, the hand engine's rotated 4-bit cache, engine/src/kvrot.cuh): the r4:: writer below, which is the engine's own code generalised to head dims
+// 64 / 128; the sections ks / vs hold the HD / 64 8-bit log scale codes of a row; the exact ring covers the `win` positions before the step's last row (not each row's).
 
 // code (0 .. 2^BITS - 1) of x for the symmetric grid: level = code - OFF, scale s = fp16(amax / QMAX); the same operations as the reference quantiser
 template <int BITS>
@@ -32,13 +34,158 @@ __device__ __forceinline__ void q_store(float x, uint8_t* crow, __half* srow, fl
   if (i == 0) *srow = __float2half_rn(__fdiv_rn(amax, (float)QMAX));
 }
 
-// qk-norm + rope (+ rotation) of q, k and the quantised write of k and v at position pos0 + t; EX: also the exact fp16 sink / ring rows
-template <int HD, int VB, int EX>
+namespace r4 {
+// One warp owns a row: lane holds element d = lane + 32 i, i < HD / 32 (kvrot.cuh's lane layout). Every function here is kvrot.cuh's, bit for bit at HD 256.
+constexpr int E_BIAS = 176;
+constexpr float E_RES = 12.f;  // scale codes per octave
+constexpr float CUBE_B = 0.0030002594f;  // fp16 of 0.003: L(n) = u (1 + B u^2), u = 2n - 15
+constexpr float LOG2_GAIN = 0.010779f;  // the readers' decoded scales x 1.0075, K and V (kvrot::LOG2_KGAIN / LOG2_VGAIN)
+
+__device__ __forceinline__ int cand_off(int k) { return k == 0 ? 1 : (k < 6 ? 1 - k : (k == 6 ? -6 : -8)); }  // kvrot::c_cand_off
+__device__ __forceinline__ float level(int n) {
+  const float u = (float)(2 * n - 15);
+  return u * fmaf(CUBE_B, u * u, 1.f);
+}
+__device__ __forceinline__ float ex2a(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float scale_of(uint32_t e) { return ex2a((float)((int)e - E_BIAS) * (1.f / E_RES)); }
+__device__ __forceinline__ float scale_read(uint32_t e) {
+  return ex2a(fmaf(__uint_as_float(0x4B000000u | e) - 8388608.f, 1.f / E_RES, LOG2_GAIN - (float)E_BIAS / E_RES));
+}
+// byte j of w -> (L(low nibble), L(high nibble)) evaluated in fp16x2 as the engine's reader does (attn.cu i4_pair): 1024 + 2n - 1039 = u exactly, u * u exact, the rest rounds
+__device__ __forceinline__ float2 lv_pair(uint32_t w, int j) {
+  const uint32_t b = w >> (8 * j);
+  const uint32_t t = ((b << 1) & 0x1Eu) | ((b << 13) & 0x1E0000u) | 0x64006400u;
+  const __half2 u = __hsub2(*reinterpret_cast<const __half2*>(&t), __float2half2_rn(1039.f));
+  const __half2 f = __hfma2(__hmul2(u, u), __float2half2_rn(CUBE_B), __float2half2_rn(1.f));
+  return __half22float2(__hmul2(u, f));
+}
+// meta of a row: byte G = scale code of group G
+template <int HD>
+__device__ __forceinline__ uint32_t meta_load(const uint8_t* m) {
+  if (HD == 256) return __ldg(reinterpret_cast<const uint32_t*>(m));
+  if (HD == 128) return __ldg(reinterpret_cast<const uint16_t*>(m));
+  return __ldg(m);
+}
+
+// in place y = H x / sqrt(HD) over the row held by the warp: strides 32 .. HD / 2 within a lane, then 1 .. 16 across lanes (kvrot::wht256)
+template <int HD>
+__device__ __forceinline__ void wht(float (&x)[HD / 32], int lane) {
+  constexpr int NI = HD / 32;
+#pragma unroll
+  for (int h = 1; h < NI; h <<= 1) {
+#pragma unroll
+    for (int i = 0; i < NI; i++) {
+      if (!(i & h)) {
+        const float a = x[i], b = x[i + h];
+        x[i] = a + b;
+        x[i + h] = a - b;
+      }
+    }
+  }
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const bool up = (lane & o) != 0;
+#pragma unroll
+    for (int i = 0; i < NI; i++) {
+      const float y = __shfl_xor_sync(0xffffffffu, x[i], o);
+      x[i] = up ? y - x[i] : x[i] + y;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < NI; i++) x[i] *= HD == 64 ? 0.125f : (HD == 128 ? 0.08838834764831845f : 0.0625f);
+}
+
+// over the lanes of one 64-element group (xor 1, 2, 4, 16: the 16 lanes sharing bit 3; HD 64: the whole warp), identical on all of them
+template <int HD>
+__device__ __forceinline__ float gsum(float v) {
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1)
+    if (HD == 64 || o != 8) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+template <int HD>
+__device__ __forceinline__ float gmax(float v) {
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1)
+    if (HD == 64 || o != 8) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+
+// nearest level to v / s (inv = 1 / s): the decision midpoints below it
+__device__ __forceinline__ int quant_code(float v, float inv) {
+  const float z = v * inv;
+  int n = 0;
+#pragma unroll
+  for (int k = 0; k < 15; k++) n += (z > 0.5f * (level(k) + level(k + 1)));
+  return n;
+}
+
+// quantise the rotated row y (warp-wide): HD / 2 code bytes (byte d / 2: low nibble even d) and HD / 64 scale code bytes (kvrot::quant_store)
+template <int HD>
+__device__ __forceinline__ void quant_store(const float (&y)[HD / 32], int lane, uint8_t* __restrict__ codes, uint8_t* __restrict__ meta) {
+  constexpr int NI = HD / 32, Q = NI < 4 ? NI : 4, C = NI / Q;  // Q values per lane in each of the C chunks; a group = (chunk, lane bit 3), or the warp at HD 64
+  const int h = HD == 64 ? 0 : (lane >> 3) & 1;
+  int eb[C];
+#pragma unroll
+  for (int c = 0; c < C; c++) {
+    float a = 0.f;
+#pragma unroll
+    for (int q = 0; q < Q; q++) a = fmaxf(a, fabsf(y[Q * c + q]));
+    a = gmax<HD>(a);
+    int e0 = __float2int_rn(E_RES * log2f(fmaxf(a, 1e-30f) * (1.f / level(15))) + (float)E_BIAS);
+    e0 = min(max(e0, 0), 255);
+    float err[8];
+    int ec[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      ec[k] = min(max(e0 + cand_off(k), 0), 255);
+      const float s = scale_of(ec[k]), inv = 1.f / s;
+      float er = 0.f;
+#pragma unroll
+      for (int q = 0; q < Q; q++) {
+        const float r = y[Q * c + q] - s * level(quant_code(y[Q * c + q], inv));
+        er = fmaf(r, r, er);
+      }
+      err[k] = er;
+    }
+#pragma unroll
+    for (int k = 0; k < 8; k++) err[k] = gsum<HD>(err[k]);
+    int e = ec[0];
+    float be = err[0];
+#pragma unroll
+    for (int k = 1; k < 8; k++)
+      if (err[k] < be) {
+        be = err[k];
+        e = ec[k];
+      }
+    eb[c] = e;
+  }
+#pragma unroll
+  for (int i = 0; i < NI; i++) {
+    const int code = quant_code(y[i], 1.f / scale_of(eb[i / Q]));
+    const int hi = __shfl_xor_sync(0xffffffffu, code, 1);
+    if (!(lane & 1)) codes[16 * i + (lane >> 1)] = (uint8_t)((hi << 4) | code);
+  }
+  if ((lane & ~8) == 0 && (HD > 64 || lane == 0))
+#pragma unroll
+    for (int c = 0; c < C; c++) meta[2 * c + h] = (uint8_t)eb[c];
+}
+}  // namespace r4
+
+// qk-norm + rope (+ rotation) of q, k and the quantised write of k and v at position pos0 + t; EX: also the exact fp16 sink / ring rows. R4: warp 0 rotates and
+// quantises the row the way the engine's writers do (q stored as fp16), every row also goes to the ring.
+template <int HD, int VB, int EX, int R4>
 __global__ void k_attn_prep_q(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, QKV L, const int* pos0, int Hq, int Hkv,
-                              int rd, float theta, float eps, int ctx, int qk_norm) {
+                              int rd, const float* __restrict__ inv_freq, float eps, int ctx, int qk_norm) {
   __shared__ float xs[256];
   __shared__ float sm[32];
   const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
+  const int half = rd / 2;
+  const float inv = i < rd ? inv_freq[i < half ? i : i - half] : 0.f;  // issued beside the position load
   const int p = *pos0 + t;
   const bf16 *src, *nw = nullptr;
   bool rope = true;
@@ -66,9 +213,6 @@ __global__ void k_attn_prep_q(const bf16* q, const bf16* k, const bf16* v, const
     __syncthreads();
     float o = x;
     if (i < rd) {
-      const int half = rd / 2;
-      const int j = i < half ? i : i - half;
-      const float inv = exp2f(-(2.f * (float)j / (float)rd) * log2f(theta));
       float s, c;
       sincosf((float)p * inv, &s, &c);
       const float partner = i < half ? xs[i + half] : xs[i - half];
@@ -76,6 +220,32 @@ __global__ void k_attn_prep_q(const bf16* q, const bf16* k, const bf16* v, const
     }
     x = rb(o);
     __syncthreads();
+  }
+  if constexpr (R4) {
+    xs[i] = x;
+    __syncthreads();
+    if (i >= 32) return;
+    float y[HD / 32];
+#pragma unroll
+    for (int j = 0; j < HD / 32; j++) y[j] = xs[i + 32 * j];
+    r4::wht<HD>(y, i);
+    __half* rows;
+    if (h < Hq) {
+      rows = reinterpret_cast<__half*>(qout) + ((size_t)t * Hq + h) * HD;
+    } else {
+      const bool isk = h < Hq + Hkv;
+      const size_t row = (size_t)kvh * ctx + p;
+      r4::quant_store<HD>(y, i, kvb + (isk ? L.kc : L.vc) + row * (HD / 2), kvb + (isk ? L.ks : L.vs) + row * (HD / 64));
+      if (p < L.sink) {
+        __half* s = reinterpret_cast<__half*>(kvb + (isk ? L.kx : L.vx)) + ((size_t)kvh * L.sink + p) * HD;
+#pragma unroll
+        for (int j = 0; j < HD / 32; j++) s[i + 32 * j] = __float2half_rn(y[j]);
+      }
+      rows = reinterpret_cast<__half*>(kvb + (isk ? L.kr : L.vr)) + ((size_t)kvh * L.ring + p % L.ring) * HD;
+    }
+#pragma unroll
+    for (int j = 0; j < HD / 32; j++) rows[i + 32 * j] = __float2half_rn(y[j]);
+    return;
   }
   x = wht_blk<HD>(x, xs);
   if (h < Hq) {
@@ -104,24 +274,32 @@ __device__ __forceinline__ float q_lv(uint32_t w) {
 //   softmax: one warp per query head
 //   P V    : a thread owns 8 consecutive dims of the head and every KS-th key of the chunk (4 B (int4) / 8 B (int8) code load per key), acc += (p * scale) * level;
 //            the partial sums of the key subsets are added at the end (shuffle, then the four warps through shared memory)
-template <int HD, int VB, int EX, int GM>  // GM: register array size for the query heads per KV head (G <= GM)
+// R4: fp16 query; 8 B of K codes per 16 dims, the dot products summed per scale group and weighed by the decoded group scales; V: the 8 dims of a thread share one group;
+// levels as the engine's reader evaluates them (r4::lv_pair).
+template <int HD, int VB, int EX, int GM, int R4>  // GM: register array size for the query heads per KV head (G <= GM)
 __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8_t* kvb, QKV L, const int* pos0, float* part, int Hq, int Hkv, int ctx, int nsplit, int nc,
                                                        float scale) {
   extern __shared__ float smem[];
   const int G = Hq / Hkv;
   constexpr int DS = HD / 8, KS = 128 / DS, NK = CH / KS;  // dim slots, key subsets, keys per thread and chunk
-  constexpr int VROW = HD * VB / 8;
+  constexpr int VROW = HD * VB / 8, KROW = R4 ? HD / 2 : HD, KW = KROW / 32;  // V / K row bytes, 16-byte K loads per half row
+  constexpr int NG = R4 ? HD / 64 : 1;  // V scales per key
   float* qs = smem;              // [G][HD]
   float* sc = qs + G * HD;       // [G][CH]
   float* po = sc + G * CH;       // [4][G][HD]
   float* ml = po + 4 * G * HD;   // [3][8]
-  float* vsc = ml + 24;          // [CH] V scales of the chunk
+  float* vsc = ml + 24;          // [CH][NG] V scales of the chunk
   const int kvh = blockIdx.x, split = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
   const int p = *pos0 + t, live = p + 1;
+  const int pe = R4 ? *pos0 + (int)gridDim.z - 1 : p;  // the newest position the exact window is counted from
+  auto exact = [&](int kp) { return EX && (kp < L.sink || pe - kp < L.win); };
   const int start0 = split * nc * CH;
   if (start0 >= live) return;
   for (int g = 0; g < G; g++)
-    for (int d = tid; d < HD; d += 128) qs[g * HD + d] = bf(q[((size_t)t * Hq + kvh * G + g) * HD + d]);
+    for (int d = tid; d < HD; d += 128) {
+      const size_t qi = ((size_t)t * Hq + kvh * G + g) * HD + d;
+      qs[g * HD + d] = R4 ? __half2float(reinterpret_cast<const __half*>(q)[qi]) : bf(q[qi]);
+    }
   if (tid < 8) {
     ml[tid] = -INFINITY;
     ml[8 + tid] = 0.f;
@@ -132,53 +310,93 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
   for (int g = 0; g < GM; g++)
 #pragma unroll
     for (int e = 0; e < 8; e++) o[g][e] = 0.f;
-  const uint8_t* kc = kvb + L.kc + (size_t)kvh * ctx * HD;
+  const uint8_t* kc = kvb + L.kc + (size_t)kvh * ctx * KROW;
   const uint8_t* vc = kvb + L.vc + (size_t)kvh * ctx * VROW;
   const __half* ksc = reinterpret_cast<const __half*>(kvb + L.ks) + (size_t)kvh * ctx;
   const __half* vss = reinterpret_cast<const __half*>(kvb + L.vs) + (size_t)kvh * ctx;
+  const uint8_t* kmb = kvb + L.ks + (size_t)kvh * ctx * NG;  // R4: scale codes
+  const uint8_t* vmb = kvb + L.vs + (size_t)kvh * ctx * NG;
   // Loads of one chunk, issued before they are needed: this thread's half row of its key (K codes + scale) and its keys' V code words (none for exact keys).
   constexpr int CWN = VB == 8 ? 2 : 1;
   const int kj = tid >> 1, khalf = tid & 1;
-  uint4 raw[HD / 32], rawn[HD / 32];
+  uint4 raw[KW], rawn[KW];
   uint32_t cw[NK][CWN], cwn[NK][CWN];
   float ks = 0.f, ksn = 0.f;
-  auto load = [&](int start, int n, uint4 (&r)[HD / 32], float& kscale, uint32_t (&w)[NK][CWN]) {
+  uint32_t km = 0, kmn = 0;
+  auto load = [&](int start, int n, uint4 (&r)[KW], float& kscale, uint32_t& kmeta, uint32_t (&w)[NK][CWN]) {
     const int kp = start + kj;
-    if (kj < n && !(EX && (kp < L.sink || p - kp < L.win))) {
-      const uint4* kr = reinterpret_cast<const uint4*>(kc + (size_t)kp * HD) + khalf * (HD / 32);
+    if (kj < n && !exact(kp)) {
+      const uint4* kr = reinterpret_cast<const uint4*>(kc + (size_t)kp * KROW) + khalf * KW;
 #pragma unroll
-      for (int cc = 0; cc < HD / 32; cc++) r[cc] = __ldg(kr + cc);
-      kscale = __half2float(ksc[kp]);
+      for (int cc = 0; cc < KW; cc++) r[cc] = __ldg(kr + cc);
+      if (R4) kmeta = r4::meta_load<HD>(kmb + (size_t)kp * NG);
+      else kscale = __half2float(ksc[kp]);
     }
 #pragma unroll
     for (int jj = 0; jj < NK; jj++) {
       const int j = ksub + jj * KS, kq = start + j;
       w[jj][0] = 0;
       if (VB == 8) w[jj][1] = 0;
-      if (j < n && !(EX && (kq < L.sink || p - kq < L.win))) {
+      if (j < n && !exact(kq)) {
         const uint32_t* vp = reinterpret_cast<const uint32_t*>(vc + (size_t)kq * VROW) + ds * CWN;
         w[jj][0] = __ldg(vp);
         if (VB == 8) w[jj][1] = __ldg(vp + 1);
       }
     }
   };
-  load(start0, min(CH, live - start0), raw, ks, cw);
+  load(start0, min(CH, live - start0), raw, ks, km, cw);
   for (int c = 0; c < nc; c++) {
     const int start = start0 + c * CH;
     if (start >= live) break;
     const int n = min(CH, live - start);
     __syncthreads();
-    if (tid < CH) vsc[tid] = tid < n ? __half2float(vss[start + tid]) : 0.f;
+    if (R4) {
+      if (tid < CH) {
+        const uint32_t m = tid < n ? r4::meta_load<HD>(vmb + (size_t)(start + tid) * NG) : 0u;
+#pragma unroll
+        for (int gi = 0; gi < NG; gi++) vsc[tid * NG + gi] = tid < n ? r4::scale_read((m >> (8 * gi)) & 255u) : 0.f;
+      }
+    } else if (tid < CH) {
+      vsc[tid] = tid < n ? __half2float(vss[start + tid]) : 0.f;
+    }
     {
       const int kp = start + kj;
       float dot[GM];
 #pragma unroll
       for (int g = 0; g < GM; g++) dot[g] = 0.f;
       if (kj < n) {
-        const bool ex = EX && (kp < L.sink || p - kp < L.win);
-        if (!ex) {
+        const bool ex = exact(kp);
+        if (!ex && R4) {
+          // 16-byte load cc, word wi: dims khalf HD / 2 + 32 cc + 8 wi .. + 7, all in local scale group wi & 1 (one group at HD 64)
+          float dg[GM][2];
 #pragma unroll
-          for (int cc = 0; cc < HD / 32; cc++) {
+          for (int g = 0; g < GM; g++) dg[g][0] = dg[g][1] = 0.f;
+#pragma unroll
+          for (int cc = 0; cc < KW; cc++) {
+            const uint32_t w4[4] = {raw[cc].x, raw[cc].y, raw[cc].z, raw[cc].w};
+#pragma unroll
+            for (int wi = 0; wi < 4; wi++) {
+              const int lg = HD == 64 ? 0 : (wi & 1), e0 = khalf * (HD / 2) + cc * 32 + wi * 8;
+#pragma unroll
+              for (int b = 0; b < 4; b++) {
+                const float2 lv = r4::lv_pair(w4[wi], b);
+#pragma unroll
+                for (int g = 0; g < GM; g++)
+                  if (g < G) {
+                    dg[g][lg] = fmaf(lv.x, qs[g * HD + e0 + 2 * b], dg[g][lg]);
+                    dg[g][lg] = fmaf(lv.y, qs[g * HD + e0 + 2 * b + 1], dg[g][lg]);
+                  }
+              }
+            }
+          }
+          const int gb = HD == 256 ? 2 * khalf : 0;  // the half's first scale group
+          const float s0 = r4::scale_read((km >> (8 * gb)) & 255u);
+          const float s1 = HD == 64 ? 0.f : r4::scale_read((km >> (8 * gb + 8)) & 255u);
+#pragma unroll
+          for (int g = 0; g < GM; g++) dot[g] = HD == 64 ? dg[g][0] * s0 : fmaf(s1, dg[g][1], dg[g][0] * s0);
+        } else if (!ex) {
+#pragma unroll
+          for (int cc = 0; cc < KW; cc++) {
             const uint32_t w4[4] = {raw[cc].x, raw[cc].y, raw[cc].z, raw[cc].w};
 #pragma unroll
             for (int wi = 0; wi < 4; wi++) {
@@ -226,7 +444,7 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
     // the next chunk's loads go out now and overlap the softmax and the P V phase of this one
     const int startn = start + CH;
     const bool more = c + 1 < nc && startn < live;
-    if (more) load(startn, min(CH, live - startn), rawn, ksn, cwn);
+    if (more) load(startn, min(CH, live - startn), rawn, ksn, kmn, cwn);
     __syncthreads();
     for (int g = tid >> 5; g < G; g += 4) {
       const int lane = tid & 31;
@@ -259,7 +477,7 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
     for (int jj = 0; jj < NK; jj++) {
       const int j = ksub + jj * KS, kp = start + j;
       if (j >= n) continue;
-      if (EX && (kp < L.sink || p - kp < L.win)) {
+      if (exact(kp)) {
         const __half* row = kp < L.sink ? reinterpret_cast<const __half*>(kvb + L.vx) + ((size_t)kvh * L.sink + kp) * HD
                                         : reinterpret_cast<const __half*>(kvb + L.vr) + ((size_t)kvh * L.ring + kp % L.ring) * HD;
         const uint4 u = *reinterpret_cast<const uint4*>(row + ds * 8);
@@ -280,7 +498,14 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
           }
       } else {
         float lv[8];
-        if (VB == 8) {
+        if (R4) {  // dims 8 ds .. 8 ds + 7: byte b holds 8 ds + 2 b (low nibble) and + 1
+#pragma unroll
+          for (int b = 0; b < 4; b++) {
+            const float2 l2 = r4::lv_pair(cw[jj][0], b);
+            lv[2 * b] = l2.x;
+            lv[2 * b + 1] = l2.y;
+          }
+        } else if (VB == 8) {
           lv[0] = q_lv<0, 128>(cw[jj][0]); lv[1] = q_lv<1, 128>(cw[jj][0]); lv[2] = q_lv<2, 128>(cw[jj][0]); lv[3] = q_lv<3, 128>(cw[jj][0]);
           lv[4] = q_lv<0, 128>(cw[jj][1]); lv[5] = q_lv<1, 128>(cw[jj][1]); lv[6] = q_lv<2, 128>(cw[jj][1]); lv[7] = q_lv<3, 128>(cw[jj][1]);
         } else {
@@ -288,7 +513,8 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
           lv[0] = q_lv<0, 8>(lo); lv[1] = q_lv<1, 8>(lo); lv[2] = q_lv<2, 8>(lo); lv[3] = q_lv<3, 8>(lo);
           lv[4] = q_lv<0, 8>(hi); lv[5] = q_lv<1, 8>(hi); lv[6] = q_lv<2, 8>(hi); lv[7] = q_lv<3, 8>(hi);
         }
-        const float s = vsc[j];
+        // R4: the V scale group of dims 8 ds ..: G(d) = 2 (d >> 7) + ((d & 15) >> 3)
+        const float s = R4 ? vsc[j * NG + (HD == 64 ? 0 : 2 * (ds >> 4) + (ds & 1))] : vsc[j];
 #pragma unroll
         for (int g = 0; g < GM; g++)
           if (g < G) {
@@ -300,8 +526,9 @@ __global__ void __launch_bounds__(128) k_attn_split_q(const bf16* q, const uint8
     }
     if (more) {
 #pragma unroll
-      for (int cc = 0; cc < HD / 32; cc++) raw[cc] = rawn[cc];
+      for (int cc = 0; cc < KW; cc++) raw[cc] = rawn[cc];
       ks = ksn;
+      km = kmn;
 #pragma unroll
       for (int jj = 0; jj < NK; jj++) {
         cw[jj][0] = cwn[jj][0];

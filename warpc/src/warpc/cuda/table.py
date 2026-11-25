@@ -1,17 +1,17 @@
 """The CUDA backend's capability table: what each kernel of kernels/ absorbs, its limits, and how a match binds to the
 launcher's roles.
 
-Nothing here hard-codes a model: head counts, head dim, rotary dim, theta, hidden and FFN widths come from the graph and
-reach the kernels as arguments. A match is declined only where a kernel's real limits are not met (K a multiple of 256
-for bf16 weights and of 32 for Q4_0, head dim 64 / 128 / 256, at most 8 query heads per KV head, at most STEP_ROWS rows,
-a KV cache format with a kernel).
+Nothing here hard-codes a model: head counts, head dim, rotary dim, rope frequencies, hidden and FFN widths come from
+the graph and reach the kernels as arguments. A match is declined only where a kernel's real limits are not met (K a
+multiple of 256 for bf16 weights and of 32 for Q4_0, head dim 64 / 128 / 256, at most 8 query heads per KV head, at
+most STEP_ROWS rows, a KV cache format with a kernel).
 """
 
 from __future__ import annotations
 
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
 from ..ir import Q4_0_BLOCK_ELEMS
-from ..kvcache import FORMATS
+from ..kvcache import FORMATS, RotatedInt4Format
 from . import schedule
 
 # GeForce RTX 3090 (sm_86): measured launch cost inside a CUDA graph, DRAM bandwidth, SM count. The cost model uses
@@ -329,7 +329,13 @@ def _emit_attn(m, A):
     numerics = (
         "prep (qk norm, rope, KV write) + split-K flash decode + reduce; fp32 softmax, one bf16 rounding of the output"
     )
-    if fmt.quantized:
+    if isinstance(fmt, RotatedInt4Format):
+        numerics += (
+            f"; KV cache {st.cache}: the hand engine's rotated int4 (WHT, 16-level companded grid, 8-bit log2 scale per"
+            " 64 rotated coefficients, the engine's writer bit for bit), fp16 query, levels decoded in fp16,"
+            f" first {fmt.sink} positions and the {fmt.window} before the step's last row exact (fp16)"
+        )
+    elif fmt.quantized:
         numerics += (
             f"; KV cache {st.cache}: rotated (WHT) int{fmt.k_bits} K and int{fmt.v_bits} V"
             " with one fp16 scale per (token, head), quantised on write in prep"
@@ -344,12 +350,12 @@ def _emit_attn(m, A):
         outs={"y": n.outs[0]},
         weights=weights,
         states={"kv": n.attrs["state"]},
+        constants={"inv_freq": rpn.attrs["inv_freq"]},
         attrs={
             "Hq": m.consts["Hq"],
             "Hkv": m.consts["Hkv"],
             "hd": m.consts["hd"],
             "rd": rpn.attrs["rotary_dim"],
-            "theta": rpn.attrs["theta"],
             "ctx": m.consts["ctx"],
             "scale": n.attrs["scale"],
             "qk_norm": bool(norms),

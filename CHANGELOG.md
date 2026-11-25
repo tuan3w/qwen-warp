@@ -5,6 +5,7 @@
 ### Added
 
 - `warpc/`: an experimental compiler, separate from the engine, for dense decoder-only models (Llama, Mistral, Qwen3) from Hugging Face safetensors or GGUF files to fused CUDA kernels replayed as CUDA graphs; GGUF Q4_0 weights run through a fused dequantising GEMV. On the RTX 3090, Qwen3-0.6B Q4_0 decodes at 706 tok/s against 568 tok/s for llama.cpp's `llama-server` on the same file ([warpc/README.md](warpc/README.md)). It is a uv workspace member: `uv sync --all-packages`.
+- `warpc`: KV cache format `int4_rot`, the engine's rotated 4-bit cache (`compile(..., kv="int4_rot")`), for head dims 64, 128 and 256: its writer stores the engine's bytes (checked against `libswiftmk.so` when `WARPC_SWIFTMK_LIB` is set), and the reader decodes like the engine's. Qwen3-4B on the RTX 3090 at 32k context: 38,016 KV bytes per position against 147,456 for bf16 and 56,448 for `k8v4w`; 69 tok/s against 61 and 71.
 - `scripts/check_repo.sh` also compiles and lints `warpc/`, and its personal-path check also covers shared-memory scratch paths.
 
 ### Fixed

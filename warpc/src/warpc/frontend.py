@@ -15,6 +15,7 @@ def build(source: Source, *, ctx_max: int, kv: str = "bf16") -> Graph:
         raise ValueError(f"unknown KV format {kv!r} (known: {', '.join(FORMATS)})")
     H, V, FF, hd = c.hidden_size, c.vocab_size, c.intermediate_size, c.head_dim
     nq, nkv, eps = c.num_heads, c.num_kv_heads, c.rms_eps
+    inv_freq = c.rope_inv_freq()
     missing = []
 
     g = Graph(c.family)
@@ -44,7 +45,7 @@ def build(source: Source, *, ctx_max: int, kv: str = "bf16") -> Graph:
         if c.qk_norm:
             q = rmsnorm(q, f"{n}.qn", f"{p}.self_attn.q_norm.weight", hd)
             k = rmsnorm(k, f"{n}.kn", f"{p}.self_attn.k_norm.weight", hd)
-        q, k = g.op_multi("rope", [q, k, pos], rotary_dim=hd, theta=c.rope_theta)
+        q, k = g.op_multi("rope", [q, k, pos], rotary_dim=hd, inv_freq=inv_freq)
         att = g.op("attention", [q, k, v, pos], state=state, scale=hd**-0.5)
         x = g.op("add", [x, linear(att, f"{n}.o", f"{p}.self_attn.o_proj.weight", H, nq * hd)], name="x")
         h = rmsnorm(x, f"{n}.ln2", f"{p}.post_attention_layernorm.weight", H)

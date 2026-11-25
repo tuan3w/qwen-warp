@@ -73,7 +73,7 @@ class ShapeSource:
 
 
 def build(cfg: dict, family: str = "qwen3", ctx: int = 2048, kv: str = "bf16", q4: bool = False) -> Graph:
-    config = ModelConfig(family=family, qk_norm=family == "qwen3", tie_embeddings=False, **cfg)
+    config = ModelConfig(family=family, qk_norm=family == "qwen3", tie_embeddings=False, rope_freq_factors=None, **cfg)
     return frontend.build(ShapeSource(config, q4), ctx_max=ctx, kv=kv)
 
 
@@ -122,7 +122,8 @@ def _cases() -> dict:
     g.nodes[of(g, "attention")[0]].attrs["scale"] = 0.5
     c["attn_scale"] = (g, 8)
     g = small()
-    g.nodes[of(g, "rope")[0]].attrs["rotary_dim"] = 64
+    rope = g.nodes[of(g, "rope")[0]].attrs
+    rope.update(rotary_dim=64, inv_freq=rope["inv_freq"][:32])
     c["partial_rope"] = (g, 8)
     g = small()
     g.nodes[of(g, "rmsnorm")[1]].attrs["eps"] = 1e-5
@@ -149,6 +150,8 @@ def behaviour(g: Graph, rows_max: int) -> dict:
                 "outs": r.outs,
                 "weights": {role: packs[name] for role, name in r.weights.items()},
                 "states": r.states,
+                # a table's values are the graph's (test_frontend); the claim is which tables a kernel reads
+                "constants": {role: len(values) for role, values in r.constants.items()},
                 "attrs": r.attrs,
                 "tolerance": list(r.tolerance),
             }
@@ -248,6 +251,9 @@ def test_qwen3_06b_plan_structure_and_tolerance():
     assert tolerant[-1].tolerance == ("linear.out",) and tolerant[-1].numerics == HEAD_NUMERICS
     attn = [t for t in plan.tasks if t.kernel == "g_attn"]
     assert all(t.attrs["qk_norm"] and t.attrs["eps"] == 1e-6 for t in attn)
+    (table,) = {n.attrs["inv_freq"] for n in g.nodes if n.op == "rope"}
+    assert list(plan.constants.values()) == [table], "one rope table for the 28 layers"
+    assert all(plan.constants[t.constants["inv_freq"]] == table for t in attn)
 
 
 def test_llama_plan_folds_the_norm_into_qkv_and_updates_the_stream_in_place():
@@ -305,6 +311,19 @@ def test_unknown_kv_format_and_lone_cast_are_lowering_errors():
         assert "cast x1: only absorbable as epilogue of g_head" in str(e), str(e)
     else:
         raise AssertionError("a cast alone has no kernel")
+
+
+def test_int4_rot_lowers_at_the_kernel_head_dims_only():
+    plan = lower(build({**QWEN3_06B, "num_layers": 1}, kv="int4_rot"), BACKEND, rows_max=8)
+    attn = next(t for t in plan.tasks if t.kernel == "g_attn")
+    assert attn.attrs["cache"] == "int4_rot", attn.attrs
+    g = build({**QWEN3_06B, "num_layers": 1, "head_dim": 96}, kv="int4_rot")
+    try:
+        lower(g, BACKEND, rows_max=8)
+    except LoweringError as e:
+        assert "attention x1: g_attn: hd=96 not in (64, 128, 256)" in str(e), str(e)
+    else:
+        raise AssertionError("int4_rot has no kernel for head dim 96")
 
 
 def test_attention_split_chunks_and_their_limit():
@@ -460,7 +479,7 @@ def test_full_width_qk_norm_is_not_absorbed_into_the_attention():
     q = g.op("reshape", [q], shape=["T", nq, hd])
     k = g.op("reshape", [k], shape=["T", nkv, hd])
     v = g.op("reshape", [g.op("linear", [x], weight="wv")], shape=["T", nkv, hd])
-    q, k = g.op_multi("rope", [q, k, pos], rotary_dim=hd, theta=1e6)
+    q, k = g.op_multi("rope", [q, k, pos], rotary_dim=hd, inv_freq=(1.0,) * (hd // 2))
     att = g.op("attention", [q, k, v, pos], state="kv", scale=hd**-0.5)
     g.output(y=g.op("add", [x, g.op("linear", [att], weight="wo")], name="y"))
     g.verify()
@@ -624,7 +643,7 @@ from warpc.sources import ModelConfig
 class Shapes:
     config = ModelConfig(family="qwen3", qk_norm=True, tie_embeddings=False, vocab_size=4096, hidden_size=1024,
                          intermediate_size=3072, num_layers=3, num_heads=16, num_kv_heads=8, head_dim=128,
-                         rms_eps=1e-6, rope_theta=1e6)
+                         rms_eps=1e-6, rope_theta=1e6, rope_freq_factors=None)
     def __contains__(self, name): return True
     def quant(self, name): return None
 
@@ -698,7 +717,11 @@ def test_kv_bytes_follow_the_cache_format_and_the_step_rows():
     assert 4096 * 8 * (128 + 64 + 4) < CudaBackend.kv_bytes(q, 8) < CudaBackend.kv_bytes(s, 8)
     assert CudaBackend.kv_bytes(q, 8) - CudaBackend.kv_bytes(q, 1) == 2 * 8 * 7 * 128 * 2  # the ring's extra rows
     meta = schedule.kv_meta(FORMATS["k8v4w"], 4096, 8, 128, 3)
-    assert meta[8:] == (4, 256, 259, 4), meta
+    assert meta[8:] == (4, 256, 259, 4, 0), meta
+    r = replace(s, cache="int4_rot")
+    assert CudaBackend.kv_bytes(r, 8) == CudaBackend.kv_bytes(r, 1)  # a fixed 512-slot ring
+    meta = schedule.kv_meta(FORMATS["int4_rot"], 4096, 8, 128, 8)
+    assert meta[8:] == (4, 496, 512, 4, 1), meta
 
 
 def test_glue_signatures_and_constants_match_the_kernel_sources():

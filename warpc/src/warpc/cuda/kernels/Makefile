@@ -30,9 +30,9 @@ Q4GEMV_MODES := 0 1 3
 Q4GEMV_OBJS := $(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_q4_gemv_inst_$(s)_m$(m).o))
 
 # attention: one object per (head dim, part); parts 1 bf16 split + reduce, 2 chunked bf16, 4 quantised prep + merge,
-# 8 / 16 quantised split with 8-bit / 4-bit V
+# 8 / 16 quantised split with 8-bit / 4-bit V, 32 int4_rot prep + split
 ATTN_HDS := 64 128 256
-ATTN_PARTS := 1 2 4 8 16
+ATTN_PARTS := 1 2 4 8 16 32
 ATTN_OBJS := $(foreach h,$(ATTN_HDS),$(foreach p,$(ATTN_PARTS),$(OBJ)/dense_attn_inst_hd$(h)_p$(p).o))
 
 CC_CACHED = sh ./nvcc_cached.sh "$(CACHE)" "$(NVCC)" $@ $< $(NVFLAGS) $(DEFS)

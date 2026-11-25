@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 -m py_compile engine/*.py server/*.py tests/*.py && echo "py_compile ok"
-python3 -m compileall -q warpc/src warpc/tests && echo "warpc compile ok"
+python3 -m compileall -q warpc/src warpc/tests warpc/tools && echo "warpc compile ok"
 uv run --package warpc --only-group dev ruff check warpc && uv run --package warpc --only-group dev ruff format --check warpc && echo "warpc ruff ok"
 uv lock --check && echo "uv.lock ok"
 bad=0

@@ -16,6 +16,7 @@ from transformers import (
     Qwen3Config,
     Qwen3ForCausalLM,
 )
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.utils import logging as transformers_logging
 
 import warpc.sources
@@ -52,6 +53,44 @@ MODELS = {
             tie_word_embeddings=True,
         )
     ),
+    # 8 rotary pairs: wavelengths 6.3 (high band, unscaled), 20 and 63 (smoothed), 199 ... 19869 (divided by 8)
+    "llama_rope_llama3": lambda: LlamaForCausalLM(
+        LlamaConfig(
+            **SIZES,
+            rope_parameters={
+                "rope_type": "llama3",
+                "rope_theta": 10000.0,
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 64,
+            },
+            tie_word_embeddings=False,
+        )
+    ),
+}
+LLAMA_3_1_8B = {  # the real Llama-3.1-8B config.json fields the guard and the rope read, with one layer
+    "model_type": "llama",
+    "vocab_size": 128256,
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-05,
+    "max_position_embeddings": 131072,
+    "rope_theta": 500000.0,
+    "rope_scaling": {
+        "factor": 8.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 8192,
+        "rope_type": "llama3",
+    },
+    "hidden_act": "silu",
+    "attention_bias": False,
+    "mlp_bias": False,
+    "tie_word_embeddings": False,
 }
 QWEN3_0_6B = {  # the real Qwen3-0.6B config.json fields the guard reads, with one layer
     "model_type": "qwen3",
@@ -73,9 +112,9 @@ QWEN3_0_6B = {  # the real Qwen3-0.6B config.json fields the guard reads, with o
 }
 
 
-def tiny_model(family: str):
+def tiny_model(name: str):
     """A tiny random fp32 model whose weights are exactly bf16-representable (the source hands out bf16)."""
-    model = MODELS[family]()
+    model = MODELS[name]()
     torch.manual_seed(0)
     with torch.no_grad():
         for n, p in model.named_parameters():
@@ -99,8 +138,8 @@ class Quantized:
         return "Q4_0" if name.endswith("proj.weight") else None
 
 
-def check_family(family: str):
-    model = tiny_model(family)
+def check_family(family: str, model_name: str | None = None):
+    model = tiny_model(model_name or family)
     ids = torch.randint(0, SIZES["vocab_size"], (24,), generator=torch.Generator().manual_seed(1))
     with torch.no_grad():
         expected = model(ids[None]).logits[0]
@@ -133,6 +172,24 @@ def test_mistral():
 
 def test_qwen3():
     check_family("qwen3")
+
+
+def test_llama3_rope_scaling():
+    check_family("llama", "llama_rope_llama3")
+    tiny = tiny_model("llama_rope_llama3")
+    real = {k: v for k, v in LLAMA_3_1_8B.items() if k != "model_type"}
+    for hf, want, bands in (
+        (tiny.config.to_dict(), tiny.model.rotary_emb.inv_freq, (1, 2, 5)),
+        (LLAMA_3_1_8B, ROPE_INIT_FUNCTIONS["llama3"](LlamaConfig(**real), "cpu")[0], (29, 6, 29)),
+    ):
+        config = ModelConfig.from_hf(hf)
+        factors = torch.tensor(config.rope_freq_factors)
+        high, low = int((factors == 1).sum()), int((factors == 8).sum())
+        assert (high, len(factors) - high - low, low) == bands, factors
+        # the factors are llama.cpp's divisors while transformers smooths the inverse frequency itself: measured, the
+        # smoothed pairs are bit-equal or one fp32 ulp apart (tiny: 7 of 8 equal; Llama 3.1 8B: 61 of 64, 1.1e-7)
+        got = torch.tensor(config.rope_inv_freq())
+        assert torch.allclose(got, want, rtol=2e-7, atol=0), ((got - want) / want).abs().max()
 
 
 def test_graph_shape():
@@ -228,8 +285,10 @@ def test_real_config_accepted():
 
 def test_unsupported_settings_are_named():
     cases = {
-        "rope scaling 'llama3'": {"rope_scaling": {"rope_type": "llama3", "factor": 8.0}},
+        "missing rope scaling low_freq_factor; missing rope scaling high_freq_factor; missing rope scaling "
+        "original_max_position_embeddings": {"rope_scaling": {"rope_type": "llama3", "factor": 8.0}},
         "rope scaling 'yarn'": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6}},
+        "rope scaling 'linear'": {"rope_scaling": {"type": "linear", "factor": 2.0}},
         "sliding_window=4096": {"sliding_window": 4096, "use_sliding_window": True},
         "attention_bias=True": {"attention_bias": True},
         "mlp_bias=True": {"mlp_bias": True},
