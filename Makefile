@@ -41,7 +41,7 @@ test:
 	uv run tests/test_server_batch.py
 	$(MAKE) test-dspine
 
-# DSpine block drafter (docs/TESTING.md): quantiser + vocabulary on the CPU, then the GEMV op test and the end-to-end test on the GPU (stop the serving container first).
+# DSpine block drafter (docs/TESTING.md at v0.12.0): quantiser + vocabulary on the CPU, then the GEMV op test and the end-to-end test on the GPU (stop the serving container first).
 test-dspine:
 	uv run tests/test_dspine_quant.py
 	uv run tests/test_toolcall_validator.py
