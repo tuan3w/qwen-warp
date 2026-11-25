@@ -1,7 +1,9 @@
 """G-near-tie: greedy MTP speculation against plain greedy decode on the 27B (design mtp-design.md §2, O2).
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tools/near_tie.py MODEL \
-      --mtp 2 --kv bf16|int4_rot --prompt-files engine/src/*.cu [--prompt-len 385 4096] [--slices 3] [--tokens 256] \
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
+  uv run --package warpc python warpc/tools/near_tie.py MODEL \
+      --mtp 2 --kv bf16|int4_rot \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu [--prompt-len 385 4096] [--slices 3] [--tokens 256] \
       [--ctx-max 4608] [--out FILE]
 
 Speculation verifies a row inside a (k + 1)-row step, and the kernels' arithmetic depends on the row count, so its

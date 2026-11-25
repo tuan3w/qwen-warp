@@ -1,16 +1,17 @@
 """A Source wrapper that re-quantises float tensors to W4G128 on demand: the MTP head of the Qwen3.5 27B.
 
-The checkpoint stores the MTP layer in BF16. The hand engine (engine/pack_mtp.py) quantises it at load to its W4G128
-format, and `Requantized.mtp` reproduces that byte for byte: per row and 128-column group
+The checkpoint stores the MTP layer in BF16. The hand engine (v0.12.0, engine/pack_mtp.py) quantises it at load to its
+W4G128 format, and `Requantized.mtp` reproduces that byte for byte: per row and 128-column group
 `scale = bf16(amax * r / 7.5)`, `q = clamp(round(g / scale), -8, 7)`, nibble `q + 8`, with `r` chosen per group by
 minimum squared error from {1.0, 0.95, ..., 0.5} (the clip search; the scale is rounded to bf16 before quantising, so
 the kernel's `(nibble - 8) * scale` is exactly what was optimised). The draft head is the rows of `lm_head.weight`
 listed by `draft_vocab()`, quantised round to nearest (no clip search), exposed as the pseudo-tensor
 `mtp.draft_head.weight`.
 
-The vocabulary list (data/draft_vocab_ext_68864.npy, byte-identical to the hand engine's file) was built offline from a
-token-frequency list over English / code text plus 3,314 extension tokens and 14 pad ids; the frequency list is not part
-of this repository, so the list cannot be regenerated here (see the comment in engine/pack_mtp.py).
+The vocabulary list (data/draft_vocab_ext_68864.npy, byte-identical to the hand engine's file at v0.12.0) was built
+offline from a token-frequency list over English / code text plus 3,314 extension tokens and 14 pad ids; the frequency
+list is not part of this repository, so the list cannot be regenerated here (see the comment in the hand engine's
+pack_mtp.py).
 """
 
 from __future__ import annotations

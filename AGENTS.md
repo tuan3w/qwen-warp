@@ -6,9 +6,10 @@ Instructions for coding agents and contributors. Read [README.md](README.md) fir
 
 - `warpc/` is the active code: a compiler from model checkpoints to fused CUDA kernels. New work goes here. Its
   [README](warpc/README.md) has the architecture and usage.
-- `engine/`, `server/`, top-level `tests/`, `Makefile`, `Dockerfile`, `docker/`, the compose files and every file in
-  `scripts/` except `check_repo.sh` are the legacy 27B engine and server, frozen at release v0.12.0. Do not add features
-  to them; fix only what blocks the build or the repo checks. Their docs are at the v0.12.0 tag, not in this tree.
+- The legacy 27B engine and server (`engine/`, `server/`, their tests, Dockerfile and scripts) are not in this tree;
+  they are frozen at release v0.12.0. warpc's oracle tests and gates read a checkout of that tag named by
+  `WARPC_LEGACY_DIR` (`git worktree add ../qwen-warp-legacy v0.12.0`, built per
+  [warpc/README.md](warpc/README.md#the-legacy-checkout)). Do not recreate them here.
 
 ## Commands
 
@@ -33,6 +34,9 @@ because its path scan reads tracked files.
   passes silently and never fails. Checkpoints and tools are reached only through environment variables documented in
   `warpc/README.md`.
 - GPU tests need an NVIDIA GPU with nvcc; the 27B needs the whole 24 GB card, so run one GPU job at a time.
+- Tests and tools that use the hand engine as the oracle (`test_windows`, `test_requantize`, `test_speculate`, `test_deltanet`,
+  `gate27.py`, `agentloop.py` and others) reach it only through `warpc/tools/legacy.py`, which reads `WARPC_LEGACY_DIR`;
+  with the variable unset a test raises `Skip("WARPC_LEGACY_DIR unset")`.
 - The oracle decides, not the implementation. Correctness is bit-identity to a reference where the arithmetic allows it
   (the hand-written engine, ggml's C code, the CPU reference of a kernel), otherwise a stated tolerance against a
   trusted implementation. If a gate fails, find the cause. Do not loosen the gate to make it pass; if a gate is wrong,

@@ -1,9 +1,10 @@
 """MTP at long context on the 27B (design mtp-design.md G-long): memory against the budget table, decode speed and
 acceptance, and the agent-turn flow on the `Speculator` (snapshot, restore, append after a decode).
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tools/mtp_long.py MODEL \
-      --prompt-files engine/src/*.cu --prompt-len 16384 [--kv int4_rot] [--mtp 3] [--host-tables] [--forge-position] \
-      [--no-window] [--ctx-max N] [--tokens 256] [--tool 600] [--out FILE]
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
+  uv run --package warpc python warpc/tools/mtp_long.py MODEL \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu --prompt-len 16384 [--kv int4_rot] [--mtp 3] \
+      [--host-tables] [--forge-position] [--no-window] [--ctx-max N] [--tokens 256] [--tool 600] [--out FILE]
 
 One process per prompt length (the 27B takes the card). The prompt is prefilled with the window plan (`plan_windows`,
 `window_rows` 4096) or, with --forge-position, as 385 real tokens under a moved position (timing and memory only: the

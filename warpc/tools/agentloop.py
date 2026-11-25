@@ -6,8 +6,9 @@ answer. One workload, replayed token for token by every engine.
       [--turns N] [--verify-last] [--kv ...] --out result.json
 
 ENGINE: warpc (PrefixCache over warpc.compile; `--cache lineage` appends to the device cache or re-prefills, `none`
-re-prefills every turn), hand (server/smk_runner.py Runner with snapshots and the host prefix store; `--mtp K`),
-hand-cold (the same Runner with no reuse), vllm (LLM with prefix caching on, chunked prefill, language model only).
+re-prefills every turn), hand (server/smk_runner.py of the v0.12.0 checkout $WARPC_LEGACY_DIR: Runner with
+snapshots and the host prefix store; `--mtp K`), hand-cold (the same Runner with no reuse), vllm (LLM with prefix
+caching on, chunked prefill, language model only).
 
 The trace (deterministic, token ids only): the corpus is the text of --files in sorted path order tokenised by the
 checkpoint's tokenizer; the prefix is `<|im_start|>system\\n` + --prefix-len corpus tokens + the user header and a
@@ -35,7 +36,8 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+import legacy
+
 IM_START, IM_END = 248045, 248046
 SYSTEM, USER, ASSISTANT, NL, THINK = [8678, 198], [846, 198], [74455, 198], [198], [248068, 198]
 
@@ -119,7 +121,7 @@ class Mem:
 class HandEngine:
     def __init__(self, model, ctx_max, args):
         os.environ["SWIFT_MODEL"] = str(model)
-        sys.path.insert(0, str(ROOT / "server"))
+        sys.path.insert(0, str(legacy.server_dir()))
         import smk_runner as R
 
         self.R = R

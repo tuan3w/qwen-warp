@@ -1,12 +1,13 @@
 """The window-prefill gate on the 27B checkpoint (longctx design G1): warpc's window plan against the hand engine's
 `FastPrefill(fold=False)`, bit for bit.
 
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
   # once per KV format: the hand engine's records of every cell (one process, ~1 minute to load)
-  WARPC_SWIFTMK_LIB=... uv run --package warpc python warpc/tools/gate_window.py reference MODEL --kv int4_rot \
-      --prompt-files engine/src/*.cu --out DIR
+  uv run --package warpc python warpc/tools/gate_window.py reference MODEL --kv int4_rot \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu --out DIR
   # warpc over the same cells, judged against DIR
-  WARPC_SWIFTMK_LIB=... uv run --package warpc python warpc/tools/gate_window.py check MODEL --kv int4_rot \
-      --prompt-files engine/src/*.cu --out DIR
+  uv run --package warpc python warpc/tools/gate_window.py check MODEL --kv int4_rot \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu --out DIR
 
 Cells: --prompt-len (385, 4096, 16384) x --slices (3) disjoint slices of the text; ctx_max fixed by --ctx-max so that
 both sides have the same KV layout. A cell records, after the prefill and the head step on the last prompt token: sha256
@@ -26,9 +27,9 @@ from pathlib import Path
 
 import torch
 
+import legacy
 import prompts
 
-ROOT = Path(__file__).resolve().parents[2]
 KV_FP8 = {"bf16": 0, "fp8": 1, "int4_rot": 2}
 
 
@@ -51,7 +52,7 @@ def record_path(args) -> Path:
 
 def reference(args) -> None:
     os.environ["SWIFT_MODEL"] = str(args.model)
-    sys.path.insert(0, str(ROOT / "engine"))
+    sys.path.insert(0, str(legacy.engine_dir()))
     import engine as hand
     from prefill import FastPrefill
 
@@ -145,7 +146,7 @@ def main() -> None:
     ap.add_argument("mode", choices=("reference", "check"))
     ap.add_argument("model", type=Path)
     ap.add_argument("--kv", choices=tuple(KV_FP8), default="int4_rot")
-    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True)
+    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help=prompts.PROMPT_FILES_HELP)
     ap.add_argument("--prompt-len", type=int, nargs="+", default=[385, 4096, 16384])
     ap.add_argument("--slices", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=256)

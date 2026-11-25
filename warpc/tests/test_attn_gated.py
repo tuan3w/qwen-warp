@@ -9,7 +9,7 @@ swiftmk_attn_step.
            real-like rows; T = 1..8 at ctx 385 and 4096)
   speed:   one decode step of both, CUDA-graph timed over a ring of layer caches (only with $WARPC_ATTN_SPEED)
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tests/test_attn_gated.py
+  WARPC_SWIFTMK_LIB=<libswiftmk.so> uv run --package warpc python warpc/tests/test_attn_gated.py
 
 The GPU tests need a CUDA device and $WARPC_SWIFTMK_LIB (the hand kernel); they skip without.
 """

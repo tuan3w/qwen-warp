@@ -2,9 +2,9 @@
 copy checked at kernel level (the repacked GEMV equals the natural-layout GEMV bit for bit), and the executor's DeltaNet
 ring cursors against the hand engine's own k_advance.
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tests/test_swiftmk.py
+  WARPC_SWIFTMK_LIB=<libswiftmk.so> uv run --package warpc python warpc/tests/test_swiftmk.py
 
-Needs a CUDA device and $WARPC_SWIFTMK_LIB (built by `make engine`); the tests skip without either.
+Needs a CUDA device and $WARPC_SWIFTMK_LIB (built from the v0.12.0 checkout); the tests skip without either.
 """
 
 import ctypes as C

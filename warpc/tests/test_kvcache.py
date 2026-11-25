@@ -4,7 +4,7 @@ bytes.
 
   uv run --package warpc python warpc/tests/test_kvcache.py
 
-WARPC_SWIFTMK_LIB (the engine library, `make engine` builds engine/build/libswiftmk.so) and a CUDA device enable the
+WARPC_SWIFTMK_LIB (the engine library, built from the v0.12.0 checkout) and a CUDA device enable the
 engine comparisons. The engine is built for 4 KV heads of head dim 256; only its V rows reach the quantiser unchanged
 (K is normed and roped first), so the engine's bytes are compared on V and its dequantiser on both.
 """

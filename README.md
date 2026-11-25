@@ -9,14 +9,30 @@ qwen-warp started as a hand-written CUDA engine and OpenAI-compatible server for
 that turns a checkpoint (Hugging Face safetensors or GGUF) into fused CUDA kernels replayed as CUDA graphs. A new model
 becomes a graph and a table of kernels instead of a new engine.
 
-- **Legacy engine and server** (`engine/`, `server/`, `Dockerfile`, the tests next to them): frozen at
-  [v0.12.0](https://github.com/tuan3w/qwen-warp/releases/tag/v0.12.0), the latest release that has them. Its documentation
-  ([README](https://github.com/tuan3w/qwen-warp/blob/v0.12.0/README.md),
-  [docs](https://github.com/tuan3w/qwen-warp/tree/v0.12.0/docs)) lives at that tag. The directories are still in this tree
-  until warpc replaces them; code comments in them that cite `docs/...` mean the docs at v0.12.0. To run the OpenAI-compatible
-  server today, use v0.12.0.
-- **warpc** (`warpc/`): the active code. It is a library: it has no HTTP server yet. It reproduces the legacy engine's
-  results on the 27B bit for bit, and runs other models on the same machinery.
+- **Legacy engine and server**: removed from `main`; they live at
+  [v0.12.0](https://github.com/tuan3w/qwen-warp/releases/tag/v0.12.0), the latest release that has them, with their
+  documentation ([README](https://github.com/tuan3w/qwen-warp/blob/v0.12.0/README.md),
+  [docs](https://github.com/tuan3w/qwen-warp/tree/v0.12.0/docs)). To run the OpenAI-compatible server, use that tag.
+  warpc's tests and gates that compare with the legacy engine read a checkout of the tag named by `WARPC_LEGACY_DIR`
+  ([warpc/README.md](warpc/README.md#the-legacy-checkout)).
+- **warpc** (`warpc/`): the only code in this tree. It is a library: it has no HTTP server yet. It reproduces the legacy
+  engine's results on the 27B bit for bit, and runs other models on the same machinery.
+
+## Supported models
+
+|Family|Tested models|Checkpoint formats|
+|---|---|---|
+|Qwen3|0.6B, 1.7B, 4B, 8B|Hugging Face bf16, GGUF Q4_0 (Q8_0 up to 4B)|
+|Llama 3|3.2 1B Instruct, 3.2 3B Instruct, 3.1 8B Instruct|Hugging Face bf16, GGUF Q4_0 (Q8_0 up to 3B)|
+|Mistral|7B Instruct v0.3|Hugging Face bf16, GGUF Q4_0|
+|Qwen3.5 (Gated DeltaNet hybrid)|Qwen3.8-27B (Swift-1.5, INT4)|compressed-tensors W4A16, group size 128|
+|Gemma 4|E2B (text decoder)|Hugging Face bf16|
+|Inkling 2|Inkling-2-Mini|W4G128 INT4 directory (compressed-tensors pack-quantized experts; `warpc/tools/inkling_w4_config.py` writes its `config.json`, the official one declares NVFP4)|
+
+The exact tested files and revisions are in [`warpc/tools/models.toml`](warpc/tools/models.toml). Anything else raises
+`UnsupportedModel` naming the setting that is not supported. Not supported: Qwen2 and Qwen2.5 (q/k/v projection biases),
+rope scaling other than `llama3`, sliding-window attention on the dense families, GGUF IQ formats, other GPUs than the
+RTX 3090 (untested). The Qwen3.5 kernels carry the 27B's shapes; other sizes are untested.
 
 ## Results
 

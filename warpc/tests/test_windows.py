@@ -1,24 +1,22 @@
-"""plan_windows against the hand engine's planner (`server/smk_runner.py` Runner._plan, fold off) on random prompts
-chat-turn headers, and the properties a resume relies on.
+"""plan_windows against the hand engine's planner (`server/smk_runner.py` Runner._plan of the v0.12.0 checkout, fold
+off) on random prompts with chat-turn headers, and the properties a resume relies on.
 
-  uv run --package warpc python warpc/tests/test_windows.py
+  [WARPC_LEGACY_DIR=<v0.12.0>] uv run --package warpc python warpc/tests/test_windows.py
 
-The hand planner needs the engine's Python side (torch, fla, vllm) but no GPU work: it is called on a stub."""
+The comparison with the hand planner skips without $WARPC_LEGACY_DIR. The planner needs the engine's Python side
+(torch, fla, vllm) but no GPU work: it is called on a stub."""
 
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
-from harness import Skip, run
+from harness import Skip, legacy, run
 from warpc.windows import IM_START, plan_windows
-
-SERVER = Path(__file__).resolve().parents[2] / "server"
 
 
 def hand_plan():
-    sys.path.insert(0, str(SERVER))
+    sys.path.insert(0, str(legacy().server_dir()))
     try:
         import smk_runner
     except Exception as e:  # the hand engine's imports (fla, vllm) are not installed
