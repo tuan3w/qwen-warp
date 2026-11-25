@@ -31,6 +31,9 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 - Qwen3.5 (Gated DeltaNet + gated attention hybrids, including compressed-tensors W4A16 group-128 checkpoints): graph and
   reference interpreter; the CUDA table refuses its ops with a `LoweringError` that lists them. The `swiftmk` backend runs
   the 27B checkpoint on the hand engine's kernels (below).
+- Gemma 4 E2B (the text decoder: sliding-window and global attention layers with their own head dims, KV sharing, per-layer
+  input embeddings, sandwich norms, softcapped logits; bf16 weights) on the CUDA backend, bf16 KV only. The 31B / 26B-A4B
+  variants (`attention_k_eq_v`, MoE) and every other Gemma 4 setting the graph cannot reproduce raise `UnsupportedModel`.
 - GGUF: F32, F16, BF16, Q8_0, Q4_0 and Q4_1 are decoded by warpc, bit-identical to ggml; other block formats go through the
   `gguf` package; IQ formats are rejected. Q4_0 linears stay in their 18-byte blocks on the device and run a fused
   dequantising GEMV; every other weight is bf16.
@@ -45,7 +48,7 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 | Module | Role |
 |---|---|
 | `sources/` | `open(path)`: safetensors (float and W4G128) and GGUF readers behind one `Source` (HF tensor names, `ModelConfig`) |
-| `frontend/` | `Source` to `ir.Graph`, one module per family (`dense`, `qwen35`) over shared helpers |
+| `frontend/` | `Source` to `ir.Graph`, one module per family (`dense`, `qwen35`, `gemma4`) over shared helpers |
 | `ir/` | the graph and its op vocabulary |
 | `reference.py` | pure-torch interpreter of a graph, the test oracle |
 | `kvcache.py` | KV formats: sizes and reference quantisation |
@@ -69,6 +72,9 @@ uv run --package warpc python warpc/tests/test_compiler.py  # CPU
 uv run --package warpc python warpc/tests/test_kvcache.py   # KV formats
 uv run --package warpc python warpc/tests/test_cuda.py      # GPU and nvcc
 uv run --package warpc python warpc/tests/test_swiftmk.py   # GPU, $WARPC_SWIFTMK_LIB
+uv run --package warpc python warpc/tests/test_gemma4.py        # Gemma 4: CPU, and the compiled tiny model on the GPU
+uv run --package warpc python warpc/tests/test_gemma4_rows.py   # GPU: the Gemma row / GEMV kernels, one by one
+uv run --package warpc python warpc/tests/test_gemma4_attn.py   # GPU: the attention kernels against the reference
 ```
 
 | Variable | Effect |
@@ -79,6 +85,7 @@ uv run --package warpc python warpc/tests/test_swiftmk.py   # GPU, $WARPC_SWIFTM
 | `WARPC_TEST_GGUF` | a GGUF file: enables the real-file tests |
 | `WARPC_SWIFTMK_LIB` | `engine/build/libswiftmk.so` (built by `make engine`): the `swiftmk` backend's library and tests, and the `int4_rot` byte-identity test against the engine |
 | `WARPC_TEST_SWIFT27` | the Qwen3.5 27B checkpoint directory: its graph (`test_frontend.py`), lowering onto `swiftmk` (`test_swiftmk.py`), the reference on the GPU (`test_cuda.py`) |
+| `WARPC_TEST_GEMMA4` | a Gemma 4 E2B text checkpoint directory: its header and graph (`test_gemma4.py`) |
 
 A test whose prerequisite is missing prints `skip` with the reason.
 
@@ -186,3 +193,50 @@ RTX 3090 (350 W limit), Swift-1.5-Qwen3.8-27B-INT4, swiftmk backend (bf16 head) 
 
 With the bf16 head and with the hand engine's int4 head, all 256 greedy ids and the fp32 logits of the first 16 steps
 are equal to the hand engine's for every KV cache at 385- and 4,096-token prompts (`compare27.py`).
+
+### Gemma 4 E2B
+
+`google/gemma-4-E2B`, text tensors only (540 bf16 tensors, 9.26 GB), RTX 3090 (sm clock 1755 MHz during the warpc runs).
+The graph is 875 nodes (35 layers, 15 KV states: 12 sliding rings of window + rows_max - 1 = 519 positions, rounded up to
+576 by the CUDA executor, and 3 positional ones; the 20 sharing layers read layer 13's or 14's state through
+`attention_read`); the CUDA table lowers it into 355 tasks, 10 per layer (12 launches per layer at the cost model's count,
+where an attention is three), and a decode row of attention is one launch.
+
+Correctness (`tools/compare_hf.py`, fixed text of 2,000 tokens, transformers 5.18 in fp32 as the oracle; the 768
+teacher-forced positions cross the window at 512 and wrap the ring):
+
+| 768 teacher-forced positions vs HF fp32 | rel. L2 | top-1 | argmax within 0.25 of the fp32 maximum |
+| --- | --- | --- | --- |
+| HF bf16 (the floor) | 1.544e-2 | 0.956 | 768 / 768 |
+| reference interpreter (bf16, 8-row windows to 704, then single rows) | 1.404e-2 | 0.979 | 768 / 768 (worst gap 0.149) |
+| compiled (a head step per position) | 1.357e-2 | 0.986 | 768 / 768 (worst gap 0.060) |
+| compiled, 8-row prompt windows to 704, last 64 positions | 1.994e-2 (HF bf16 on those: 2.519e-2) | 1.000 | 64 / 64 |
+
+The tiny fp32 `Gemma4ForCausalLM` of `test_gemma4.py` agrees with the interpreter to rel. L2 0.0 at every layer and on the
+logits (also through wrapping rings and transformers' own cache), and all 16 injected slips (rope theta / angles, window
++-1, unscaled embeddings, attention scale, wrong KV owner, `1 + w` norms, no softcap, no layer scalar, PLE slice, no
+v-norm, erf gelu) move the outputs at least 28 times the gate. Free run, six prompts of 2,000 ids, 64 greedy tokens each
+against HF fp32: 6 / 6 identical (an earlier build of the kernels differed at fp32 near-ties 0.060 and 0.001 on two
+prompts; the rule is that every divergence is a near-tie, top-2 margin <= 0.1).
+
+Speed (`bench.py warpc MODEL --ids-file tokens.json --prompt-len 64 600 2048 3900`: 256 greedy tokens, end of sequence
+ignored, median of 5 rounds, two visits, prefill not counted; vLLM 0.34.0 with `language_model_only` and TRITON_ATTN,
+llama.cpp b8889 on a bf16 GGUF made from the same tensors, measured once each at sm clock 1800 to 1875 MHz; the old
+tree's numbers are its own result document's, 6.0 ms at 81% of the roofline):
+
+| ms/token (tok/s) at prompt | 64 | 600 | 2,048 | 3,900 |
+| --- | --- | --- | --- | --- |
+| warpc | 6.04 (165.6) | 6.07 (164.7) | 6.15 (162.7) | 6.24 (160.3) |
+| vLLM 0.34.0 | 6.94 (144.0) | 7.06 (141.6) | 7.36 (135.9) | 7.71 (129.7) |
+| llama.cpp, bf16 | 7.66 (130.5) | 7.70 (129.9) | 7.75 (129.1) | 7.84 (127.6) |
+| old tree | 6.01 | 6.03 | 6.07 | 6.12 |
+
+The step reads 4.56 GB of weights (4.87 ms at 936 GB/s); the GEMV and norm kernels average about 815 GB/s. The kernels
+behind the numbers: a K-split GEMV for the down projections (K = 6144 and 12288, 44 against 49 us at the wide size), the
+one-launch decode attention (prep, split and merge in `k_attn_decode1`: the tensor-core scores and P V of a 32-key chunk
+per block, the last block merges; 0.35 ms per step against 0.86 for the three-launch path), an L2 prefetch of the o
+projection beside the attention, and the post-norm residual add as one kernel.
+
+`tools/compare_hf.py MODEL TOKENS WORK it|rt|cmp|freerun` runs the four stages (its docstring names the files: the token
+fixture and the transformers dumps it compares with); `bench.py warpc MODEL --ids-file TOKENS --prompt-len ...` the speed
+rows.

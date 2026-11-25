@@ -5,6 +5,7 @@
 // synchronises, so it can be captured in a CUDA graph. Position is a DEVICE scalar (pos0 = tokens already cached).
 //
 // KV cache layout (per layer): bf16 [2 (K, V)][Hkv][ctx][hd], or a quantised type (dense_attn_q.cuh, warpc/kvcache.py).
+// A bf16 state with a sliding window is a ring: position p lives in row p mod ctx, ctx a multiple of 64 (dense_attn_common.cuh).
 //
 // Source layout (the Makefile builds every translation unit in parallel into libwarpc_glue.so):
 //   dense_common.cuh      types, rounding helpers, warp / block reductions (this file)
@@ -13,12 +14,16 @@
 //   dense_gemv_inst.cu    one object per (T set, mode): the k_gemv instantiations (-DGEMV_SET= / -DGEMV_MODE=)
 //   dense_dec_gemv.cuh    k_dg: the single-row (T = 1) GEMV with every load issued up front, k_gemv's arithmetic bit
 //                         for bit; dense_dec_gemv_body.cuh + dense_dec_gemv_m<mode>.cu: its launchers, one per mode
+//   dense_ks_gemv.cuh     k_ks: the K-split GEMV (KS warps share a row, K = 2048 KS; a different reduction order) of the
+//                         segmented GEMVs k_dg cannot hold in registers (dense_ks_gemv_inst.cu: instantiations)
 //   dense_q4_gemv.cuh     k_q4_gemv: k_gemv over GGUF Q4_0 weights dequantised in registers (dense_q4_gemv.cu: entry
 //                         point, dense_q4_gemv_inst.cu: instantiations)
-//   dense_norm.cu         embed, rmsnorm, argmax, the CUDA error string
+//   dense_norm.cu         embed (optionally scaled), rmsnorm, rmsnorm_post (the norm folded into its residual add),
+//                         argmax, the CUDA error string
+//   gemma_rows.cu         k_ple: Gemma's per-layer-embedding prelude in one launch
 //   dense_attn_common.cuh constants, QKV, the shared WHT and merge kernel (k_attn_reduce2), the attention launchers run_*
 //   dense_attn.cuh        bf16 attention kernel templates (split, reduce, chunked split_x, and k_attn_fused = prep +
-//                         split of one row)
+//                         split of one row, k_attn_decode1 = prep + split + merge of one row at head dim 256 / 512)
 //   dense_attn.cu         k_attn_prep and the bf16 attention entry points
 //   dense_attn_q.cuh      quantised-KV kernel templates (prep_q, split_q; r4:: the hand engine's int4_rot writer)
 //   dense_attn_q.cu       the quantised-KV entry points

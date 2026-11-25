@@ -34,6 +34,8 @@ _QWEN35_REQUIRED = (
 )
 # config.json layer_types -> the frontend's layer kinds
 _QWEN35_LAYERS = {"full_attention": "attention", "linear_attention": "linear_attention"}
+_GEMMA4_REQUIRED = ("layer_types", "sliding_window", "rope_parameters", "head_dim")
+_GEMMA4_LAYERS = ("sliding_attention", "full_attention")
 
 
 def _rope_settings(hf: dict) -> dict:
@@ -46,11 +48,12 @@ def _rope_kind(hf: dict) -> str | None:
     return rope.get("rope_type") or rope.get("type")
 
 
-def _common_unsupported(text: dict) -> list[str]:
-    """Settings of the text config that no family's graph reproduces."""
+def _common_unsupported(text: dict, *, windowed: bool = False) -> list[str]:
+    """Settings of the text config that no family's graph reproduces (`windowed`: the family has sliding-window layers
+    of its own)."""
     bad = []
     # Qwen configs switch their window off with use_sliding_window false; Mistral configs have no switch (absent/null).
-    if text.get("sliding_window") and text.get("use_sliding_window") is not False:
+    if not windowed and text.get("sliding_window") and text.get("use_sliding_window") is not False:
         bad.append(f"sliding_window={text['sliding_window']}")
     if text.get("attention_bias"):
         bad.append("attention_bias=True")
@@ -139,6 +142,32 @@ def llama3_freq_factors(theta: float, rotary_dim: int, rope: dict) -> tuple[floa
 
 
 @dataclass(frozen=True)
+class Gemma4Text:
+    """What Gemma 4 adds to a dense decoder: global (full-attention) layers with their own head dim and proportional
+    rope, KV sharing, per-layer input embeddings (PLE), a wider MLP on the sharing layers."""
+
+    kv_shared_layers: int  # the last n layers own no K / V: they read the last owner of their layer type
+    global_head_dim: int
+    global_kv_heads: int
+    global_rope_theta: float
+    global_rope_partial: float  # the fraction of a global head's dims that rotate (proportional rope)
+    per_layer_hidden: int  # PLE width per layer; 0: no per-layer embeddings
+    per_layer_vocab: int
+    double_wide_mlp: bool  # sharing layers have twice the intermediate size
+
+    def owner(self, layer_types: tuple[str, ...], layer: int) -> int:
+        """The layer whose KV cache `layer` reads (itself unless it shares)."""
+        first_shared = len(layer_types) - self.kv_shared_layers
+        if layer < first_shared:
+            return layer
+        kind = layer_types[layer]
+        owners = [i for i in range(first_shared) if layer_types[i] == kind]
+        if not owners:
+            raise UnsupportedModel(f"layer {layer} ({kind}) shares KV but no earlier layer owns that type")
+        return owners[-1]
+
+
+@dataclass(frozen=True)
 class LinearAttention:
     """Gated DeltaNet geometry."""
 
@@ -151,7 +180,7 @@ class LinearAttention:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    family: str  # "llama" | "mistral" | "qwen3" | "qwen3_5"
+    family: str  # "llama" | "mistral" | "qwen3" | "qwen3_5" | "gemma4"
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -168,9 +197,15 @@ class ModelConfig:
     rotary_dim: int  # the leading dims of a head that rope rotates (dense: head_dim)
     norm_offset: float = 0.0  # every RMSNorm computes x-hat * (norm_offset + w)
     attn_output_gate: bool = False  # the attention output is multiplied by sigmoid of half of q_proj
-    layer_types: tuple[str, ...] = ()  # per layer "attention" | "linear_attention"; empty: all attention
+    layer_types: tuple[str, ...] = ()  # per layer; qwen3_5 "attention" | "linear_attention", gemma4 the config's
+    # "sliding_attention" | "full_attention"; empty: all attention
     linear: LinearAttention | None = None
     quantization: str | None = None  # "w4g128": compressed-tensors int4 linears
+    activation: str = "silu"  # the MLP gate: "silu" | "gelu_tanh"
+    logit_softcap: float | None = None  # logits = cap * tanh(logits / cap)
+    embed_scale: float = 1.0  # the embedding rows are multiplied by this
+    sliding_window: int | None = None  # the window of the sliding_attention layers
+    gemma: Gemma4Text | None = None
 
     def __post_init__(self):
         factors = self.rope_freq_factors
@@ -178,10 +213,22 @@ class ModelConfig:
             raise UnsupportedModel(f"{len(factors)} rope frequency factors for {self.rotary_dim // 2} rotary pairs")
         if self.layer_types and len(self.layer_types) != self.num_layers:
             raise UnsupportedModel(f"{len(self.layer_types)} layer types for {self.num_layers} layers")
+        if self.gemma is not None:
+            self.gemma.owner(self.layer_types, self.num_layers - 1)  # every sharing layer has an owner of its type
 
-    def rope_inv_freq(self) -> tuple[float, ...]:
+    def rope_inv_freq(self, layer_type: str | None = None) -> tuple[float, ...]:
         """The inverse frequency of each of the rotary_dim / 2 rotary pairs, fp32 values: the angle of pair j at
-        position p is p * inv_freq[j]."""
+        position p is p * inv_freq[j]. Gemma 4's full-attention layers (`layer_type` "full_attention") rotate the
+        first `partial` of the pairs of their global head with theta^(-2j / global_head_dim) and leave the rest at
+        frequency 0, the identity (transformers' proportional rope)."""
+        if layer_type == "full_attention" and self.gemma is not None:
+            g = self.gemma
+            angles = int(g.global_rope_partial * g.global_head_dim // 2)
+            rotated = 1.0 / (
+                g.global_rope_theta ** (torch.arange(0, 2 * angles, 2, dtype=torch.float32) / g.global_head_dim)
+            )
+            zeros = torch.zeros(g.global_head_dim // 2 - angles, dtype=torch.float32)
+            return tuple(torch.cat([rotated, zeros]).tolist())
         inv = _plain_inv_freq(self.rope_theta, self.rotary_dim)
         if self.rope_freq_factors is not None:
             inv = inv / torch.tensor(self.rope_freq_factors, dtype=torch.float32)
@@ -197,13 +244,13 @@ class ModelConfig:
             raise UnsupportedModel(
                 f"cannot build this model faithfully: model_type {model_type!r} (supported: {supported})"
             )
-        text = (hf.get("text_config") or hf) if family == "qwen3_5" else hf
+        text = (hf.get("text_config") or hf) if family in ("qwen3_5", "gemma4") else hf
         unsupported, extras = _FAMILIES[family]
-        bad = _common_unsupported(text) + unsupported(text, hf)
+        bad = _common_unsupported(text, windowed=family == "gemma4") + unsupported(text, hf)
         if bad:
             raise UnsupportedModel(f"cannot build this model faithfully: {'; '.join(bad)}")
         common = _common(text)
-        return cls(family=family, **common, **extras(text, hf, common))
+        return cls(family=family, **{**common, **extras(text, hf, common)})
 
 
 def _common(text: dict) -> dict:
@@ -256,8 +303,84 @@ def _qwen35_extras(text: dict, hf: dict, common: dict) -> dict:
     }
 
 
-_FAMILY_OF = {**{f: f for f in _QK_NORM}, "qwen3_5": "qwen3_5", "qwen3_5_text": "qwen3_5"}
+def _gemma4_unsupported(text: dict, hf: dict) -> list[str]:
+    bad = [f"missing {key}" for key in _GEMMA4_REQUIRED if text.get(key) is None]
+    kinds = sorted({t for t in text.get("layer_types") or () if t not in _GEMMA4_LAYERS})
+    if kinds:
+        bad.append(f"layer_types {kinds} (only {', '.join(_GEMMA4_LAYERS)})")
+    for key, why in (
+        ("enable_moe_block", "the MoE block"),
+        ("attention_k_eq_v", "attention_k_eq_v (keys are values on the global layers)"),
+        ("use_bidirectional_attention", "bidirectional attention"),
+        ("attn_logit_softcapping", "attention logit softcapping"),
+    ):
+        if text.get(key):
+            bad.append(f"{key}={text[key]!r} ({why})")
+    act = text.get("hidden_activation", "gelu_pytorch_tanh")
+    if act != "gelu_pytorch_tanh":
+        bad.append(f"hidden_activation={act!r} (only gelu_pytorch_tanh)")
+    rope = text.get("rope_parameters") or {}
+    for kind in _GEMMA4_LAYERS:
+        params = rope.get(kind)
+        if params is None:
+            bad.append(f"missing rope_parameters for {kind}")
+            continue
+        rope_type = params.get("rope_type", "default")
+        if rope_type not in ("default", "proportional"):
+            bad.append(f"rope_type {rope_type!r} for {kind} (only default, proportional)")
+        if params.get("factor", 1.0) != 1.0:
+            bad.append(f"rope factor {params['factor']} for {kind}")
+    for layer, over in (text.get("per_layer_config") or {}).items():
+        extra = sorted(set(over) - {"head_dim"})
+        if extra:
+            bad.append(f"per_layer_config[{layer}] overrides {extra} (only head_dim)")
+    if hf.get("quantization_config") or text.get("quantization_config"):
+        bad.append("quantization_config (only float safetensors)")
+    return bad
+
+
+def _gemma4_extras(text: dict, hf: dict, common: dict) -> dict:
+    types = tuple(text["layer_types"])
+    rope = text["rope_parameters"]
+    over = text.get("per_layer_config") or {}
+    # transformers writes the global head dim as a per-layer head_dim override of the full-attention layers
+    per_layer = next(
+        (over[str(i)]["head_dim"] for i, t in enumerate(types) if t == "full_attention" and str(i) in over), None
+    )
+    global_head_dim = int(text.get("global_head_dim") or per_layer or common["head_dim"])
+    sliding, full = rope["sliding_attention"], rope["full_attention"]
+    return {
+        "rope_theta": float(sliding["rope_theta"]),
+        "rope_freq_factors": None,
+        "qk_norm": True,
+        "rotary_dim": common["head_dim"],
+        "layer_types": types,
+        "activation": "gelu_tanh",
+        "logit_softcap": text.get("final_logit_softcapping"),
+        "embed_scale": float(common["hidden_size"] ** 0.5),
+        "sliding_window": int(text["sliding_window"]),
+        "gemma": Gemma4Text(
+            kv_shared_layers=int(text.get("num_kv_shared_layers") or 0),
+            global_head_dim=global_head_dim,
+            global_kv_heads=common["num_kv_heads"],
+            global_rope_theta=float(full["rope_theta"]),
+            global_rope_partial=float(full.get("partial_rotary_factor", 1.0)),
+            per_layer_hidden=int(text.get("hidden_size_per_layer_input") or 0),
+            per_layer_vocab=int(text.get("vocab_size_per_layer_input") or common["vocab_size"]),
+            double_wide_mlp=bool(text.get("use_double_wide_mlp")),
+        ),
+    }
+
+
+_FAMILY_OF = {
+    **{f: f for f in _QK_NORM},
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "gemma4": "gemma4",
+    "gemma4_text": "gemma4",
+}
 _FAMILIES = {
     **dict.fromkeys(_QK_NORM, (_dense_unsupported, _dense_extras)),
     "qwen3_5": (_qwen35_unsupported, _qwen35_extras),
+    "gemma4": (_gemma4_unsupported, _gemma4_extras),
 }

@@ -7,7 +7,7 @@ import heapq
 from typing import TYPE_CHECKING, Protocol
 
 from ..errors import LoweringError
-from ..ir import Graph
+from ..ir import Graph, reads_of, states_of
 from .caps import CapsTable
 from .fuse import Region, fuse
 from .plan import Buffer, Plan, Task
@@ -38,6 +38,7 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
         raise LoweringError(f"{backend.name}: no kernel for {count}:\n  {lines}")
     regions = res.regions
     order = _toposort(regions)
+    _check_state_order(graph, regions, order)
     plan = Plan(graph.name, rows_max, backend.name)
     _assign_buffers(graph, regions, order, plan)
 
@@ -75,13 +76,37 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
     return plan
 
 
+def _check_state_order(graph: Graph, regions: list[Region], order: list[int]) -> None:
+    """A task that reads a state (attention_read) runs after every task that writes it: fusion moves a node to its
+    anchor's position, and the dataflow alone does not order two tasks that meet only in a state."""
+    at = {ri: pos for pos, ri in enumerate(order)}
+    last_write: dict[str, int] = {}
+    for ri, r in enumerate(regions):
+        for i in r.covers:
+            for s in states_of(graph.nodes[i]):
+                last_write[s] = max(last_write.get(s, -1), at[ri])
+    for ri, r in enumerate(regions):
+        for i in r.covers:
+            for s in reads_of(graph.nodes[i]):
+                if last_write.get(s, -1) > at[ri]:
+                    raise LoweringError(f"{r.kernel} reads state {s} before the task that writes it")
+
+
 def _toposort(regions: list[Region]) -> list[int]:
-    """Kahn's algorithm over region dependencies; ties go to the region whose first covered node comes first."""
+    """Kahn's algorithm over region dependencies, plus one edge from every other reader of a value a region updates
+    in place to that region; ties go to the region whose first covered node comes first."""
     producer: dict[str, int] = {}
     for ri, r in enumerate(regions):
         for v in r.outs.values():
             producer[v] = ri
     waiting = [{producer[v] for v in r.ins.values() if producer.get(v, ri) != ri} for ri, r in enumerate(regions)]
+    readers: dict[str, list[int]] = {}
+    for ri, r in enumerate(regions):
+        for v in r.ins.values():
+            readers.setdefault(v, []).append(ri)
+    for ri, r in enumerate(regions):
+        if r.inplace:
+            waiting[ri] |= {rj for rj in readers.get(r.ins[r.inplace[1]], []) if rj != ri}
     users: dict[int, list[int]] = {}
     for ri, d in enumerate(waiting):
         for dep in d:

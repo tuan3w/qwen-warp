@@ -31,14 +31,24 @@ def rmsnorm(g: Graph, source: Source, missing: list[str], x: str, decl: str, ten
     return g.op("rmsnorm", [x], weight=weight(g, source, missing, decl, tensor, (size,)), **attrs)
 
 
-def head(g: Graph, source: Source, missing: list[str], x: str, prefix: str, **norm) -> None:
-    """Final norm, lm_head (the embedding if tied), fp32 logits and their argmax as the graph outputs; then the
-    missing-tensor report and the verification every family ends with."""
+def text_prefix(source: Source) -> str:
+    """The text model's tensor prefix: "model.language_model." in a vision-language checkpoint, "model." in a
+    plain causal-LM one."""
+    return "model.language_model." if "model.language_model.embed_tokens.weight" in source else "model."
+
+
+def head(
+    g: Graph, source: Source, missing: list[str], x: str, prefix: str, *, softcap: float | None = None, **norm
+) -> None:
+    """Final norm, lm_head (the embedding if tied), fp32 logits (softcapped if `softcap`) and their argmax as the
+    graph outputs; then the missing-tensor report and the verification every family ends with."""
     c = source.config
     x = rmsnorm(g, source, missing, x, "final_norm", f"{prefix}norm.weight", c.hidden_size, name="hidden", **norm)
     tensor = f"{prefix}embed_tokens.weight" if c.tie_embeddings else "lm_head.weight"
     lm = linear(g, source, missing, x, "lm_head", tensor, c.vocab_size, c.hidden_size)
     logits = g.op("cast", [lm], dtype="f32", name="logits")
+    if softcap:
+        logits = g.op("softcap", [logits], cap=float(softcap), name="logits")
     g.output(logits=logits, ids=g.op("argmax", [logits], name="ids"))
     if missing:
         raise UnsupportedModel(f"checkpoint lacks {len(missing)} tensors the graph reads: {', '.join(missing[:4])}")

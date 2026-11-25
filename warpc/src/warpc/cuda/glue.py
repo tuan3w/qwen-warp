@@ -21,14 +21,24 @@ KERNELS = Path(__file__).resolve().parent / "kernels"
 
 _PTR, _INT, _FLOAT, _SIZE = C.c_void_p, C.c_int, C.c_float, C.c_size_t
 SIGNATURES: dict[str, tuple[list, type]] = {
-    "warpc_embed": ([_PTR, _PTR, _PTR, _INT, _INT, _PTR], _INT),
+    "warpc_embed": ([_PTR, _PTR, _PTR, _INT, _INT, _FLOAT, _PTR], _INT),
     "warpc_rmsnorm": ([_PTR, _PTR, _PTR, _PTR, _INT, _INT, _FLOAT, _PTR], _INT),
-    "warpc_gemv": ([_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT, _PTR, _PTR, _PTR, _FLOAT, _INT, _PTR], _INT),
+    "warpc_rmsnorm_post": ([_PTR, _PTR, _PTR, _PTR, _INT, _INT, _FLOAT, _PTR], _INT),
+    "warpc_ple": ([_PTR, _PTR, _PTR, _PTR, _PTR, _INT, _INT, _INT, _FLOAT, _FLOAT, _FLOAT, _FLOAT, _PTR], _INT),
+    "warpc_gemv": (
+        [_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT, _PTR, _PTR, _PTR, _FLOAT, _INT, _PTR, _INT, _FLOAT, _INT, _PTR],
+        _INT,
+    ),
     "warpc_q4_gemv": ([_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT, _PTR, _PTR, _INT, _PTR], _INT),
-    "warpc_attn_prep": ([_INT, *[_PTR] * 8, _INT, _INT, _INT, _INT, _PTR, _FLOAT, _INT, _INT, _PTR], _INT),
-    "warpc_attn_decode": ([_INT, *[_PTR] * 5, _INT, _INT, _INT, _INT, _FLOAT, _PTR], _INT),
+    "warpc_attn_prep": ([_INT, *[_PTR] * 8, _INT, _INT, _INT, _INT, _PTR, _FLOAT, _INT, _INT, _INT, _PTR], _INT),
+    "warpc_attn_decode": ([_INT, *[_PTR] * 5, _INT, _INT, _INT, _INT, _FLOAT, _INT, _PTR], _INT),
+    "warpc_attn_splits": ([_INT, _INT, _INT, _INT], _INT),
     "warpc_attn_decode_fused": ([*[_PTR] * 9, _INT, _INT, _INT, _INT, _PTR, _FLOAT, _INT, _INT, _FLOAT, _PTR], _INT),
-    "warpc_attn_decode_x": ([_INT, *[_PTR] * 5, _INT, _INT, _INT, _INT, _FLOAT, _INT, _PTR], _INT),
+    "warpc_attn_decode1": (
+        [*[_PTR] * 10, _INT, _INT, _INT, _INT, _PTR, _FLOAT, _INT, _INT, _INT, _FLOAT, _INT, _INT, _PTR],
+        _INT,
+    ),
+    "warpc_attn_decode_x": ([_INT, *[_PTR] * 5, _INT, _INT, _INT, _INT, _FLOAT, _INT, _INT, _PTR], _INT),
     "warpc_attn_prep_q": ([_INT, *[_PTR] * 9, _INT, _INT, _INT, _INT, _PTR, _FLOAT, _INT, _INT, _PTR], _INT),
     "warpc_attn_decode_q": ([_INT, *[_PTR] * 6, _INT, _INT, _INT, _INT, _FLOAT, _INT, _PTR], _INT),
     "warpc_attn_ws_bytes": ([_INT, _INT, _INT, _INT, _INT], _SIZE),

@@ -93,22 +93,35 @@ def _dequantize(bits: int, codes: torch.Tensor, scales: torch.Tensor) -> torch.T
 
 
 class ExactCache:
-    """Reference storage of a bf16-format KV state, in the interpreter's activation dtype."""
+    """Reference storage of a bf16-format KV state, in the interpreter's activation dtype. A state of R rows holds
+    position p in slot p mod R, so a state with R >= every position is positional and a smaller one is a ring: a step
+    writes its rows before it reads, so it must fit the ring together with the window it reads."""
 
     def __init__(self, shape: tuple[int, ...], *, device, dtype: torch.dtype):
         self.rows = torch.zeros(shape, dtype=dtype, device=device)
 
     def write(self, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
-        self.rows[0].index_copy_(0, pos, k)
-        self.rows[1].index_copy_(0, pos, v)
+        slots = pos % self.rows.shape[1]
+        if slots.unique().numel() != slots.numel():
+            raise ValueError(f"{slots.numel()} rows do not fit a ring of {self.rows.shape[1]} rows")
+        self.rows[0].index_copy_(0, slots, k)
+        self.rows[1].index_copy_(0, slots, v)
 
-    def attend(self, q: torch.Tensor, pos: torch.Tensor, scale: float) -> torch.Tensor:
-        length = int(pos.max()) + 1
+    def attend(self, q: torch.Tensor, pos: torch.Tensor, scale: float, window: int | None = None) -> torch.Tensor:
+        """Row t attends to the positions pos_t - window + 1 .. pos_t (0 .. pos_t without a window)."""
+        ring = self.rows.shape[1]
+        last = int(pos.max())
+        first = 0 if window is None else max(0, int(pos.min()) - window + 1)
+        if last - first + 1 > ring:
+            raise ValueError(f"a ring of {ring} rows cannot hold positions {first}..{last} (window {window})")
+        where = torch.arange(first, last + 1, device=q.device)
+        slots = where % ring
         hq, hkv = q.shape[1], self.rows.shape[2]
-        kk = self.rows[0, :length].repeat_interleave(hq // hkv, 1).float()
-        vv = self.rows[1, :length].repeat_interleave(hq // hkv, 1).float()
+        kk = self.rows[0, slots].repeat_interleave(hq // hkv, 1).float()
+        vv = self.rows[1, slots].repeat_interleave(hq // hkv, 1).float()
         sc = torch.einsum("thd,lhd->htl", q.float(), kk) * scale
-        mask = torch.arange(length, device=q.device)[None, :] > pos[:, None]
+        dist = pos[:, None] - where[None, :]
+        mask = dist < 0 if window is None else (dist < 0) | (dist >= window)
         pr = torch.softmax(sc.masked_fill(mask[None], float("-inf")), -1).to(q.dtype).float()
         out = torch.einsum("htl,lhd->thd", pr, vv).to(q.dtype)
         return out.reshape(q.shape[0], hq * q.shape[2])

@@ -1,9 +1,21 @@
 #include "dense_common.cuh"
 
-__global__ void k_embed(const uint4* table, const int* tok, uint4* out, int H8) {
+// out[t] = bf16(table[tok[t]] * bf16(scale)); scale 1 is a plain row copy (the product is exact)
+__global__ void k_embed(const uint4* table, const int* tok, uint4* out, int H8, float scale) {
   const int t = blockIdx.x;
   const size_t row = (size_t)tok[t] * H8;
-  for (int i = threadIdx.x; i < H8; i += blockDim.x) out[(size_t)t * H8 + i] = table[row + i];
+  const float s = rb(scale);
+  for (int i = threadIdx.x; i < H8; i += blockDim.x) {
+    uint4 v = table[row + i];
+    if (s != 1.f) {
+      float f[8];
+      unpack8(v, f);
+#pragma unroll
+      for (int k = 0; k < 8; k++) f[k] *= s;
+      v = pack8(f);
+    }
+    out[(size_t)t * H8 + i] = v;
+  }
 }
 
 // rmsnorm (+ residual add). y != NULL: h[t] = bf16(h[t] + y[t]) in place. xn[t] = bf16(h[t] * rsqrt(mean(h[t]^2) + eps) * w); fp32 math, one rounding.
@@ -35,6 +47,56 @@ __global__ void k_rmsnorm(bf16* h, const bf16* y, const bf16* w, bf16* xn, int H
 #pragma unroll
     for (int k = 0; k < 8; k++) f[k] = f[k] * r * wf[k];
     reinterpret_cast<uint4*>(xn + base)[i] = pack8(f);
+  }
+}
+
+// The norm of a sub-block output folded into its residual add (Gemma's post-norms): h[t] = bf16(h[t] + bf16(x[t] * rsqrt(mean(x[t]^2) + eps) * w)) in place, then h[t] = bf16(h[t] * sc[0]) when
+// sc != NULL (the layer scalar). The statistics are k_rmsnorm's: thread partials of 8 consecutive elements per 16-byte group (fma order), block_sum.
+__global__ void k_rmsnorm_post(bf16* h, const bf16* x, const bf16* w, const bf16* sc, int H, float eps) {
+  __shared__ float sm[32];
+  const size_t base = (size_t)blockIdx.x * H;
+  const int H8 = H / 8;
+  const uint4* xp = reinterpret_cast<const uint4*>(x + base);
+  uint4* hp = reinterpret_cast<uint4*>(h + base);
+  // every operand a thread needs is loaded before the first reduction: the second pass waits on no memory (blockDim.x >= H8 / 2: at most two 16-byte groups per thread)
+  uint4 xv[2], wv[2], hv[2];
+#pragma unroll
+  for (int j = 0; j < 2; j++) {
+    const int i = threadIdx.x + j * blockDim.x;
+    if (i < H8) {
+      xv[j] = xp[i];
+      wv[j] = __ldg(reinterpret_cast<const uint4*>(w) + i);
+      hv[j] = hp[i];
+    }
+  }
+  const float s = sc ? bf(sc[0]) : 1.f;
+  float ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < 2; j++) {
+    if (threadIdx.x + j * blockDim.x < H8) {
+      float f[8];
+      unpack8(xv[j], f);
+#pragma unroll
+      for (int k = 0; k < 8; k++) ss += f[k] * f[k];
+    }
+  }
+  ss = block_sum(ss, sm);
+  const float r = rsqrtf(ss / (float)H + eps);
+#pragma unroll
+  for (int j = 0; j < 2; j++) {
+    const int i = threadIdx.x + j * blockDim.x;
+    if (i < H8) {
+      float f[8], wf[8], hf[8];
+      unpack8(xv[j], f);
+      unpack8(wv[j], wf);
+      unpack8(hv[j], hf);
+#pragma unroll
+      for (int k = 0; k < 8; k++) {
+        hf[k] = rb(hf[k] + rb(f[k] * r * wf[k]));
+        if (sc) hf[k] *= s;
+      }
+      hp[i] = pack8(hf);
+    }
   }
 }
 
@@ -110,9 +172,9 @@ __global__ void k_argmax_final(const float* pv, const int* pi, int nb, int* out)
 
 extern "C" {
 
-int warpc_embed(const void* table, const int* tok, void* out, int T, int H, cudaStream_t st) {
+int warpc_embed(const void* table, const int* tok, void* out, int T, int H, float scale, cudaStream_t st) {
   if (H % 8) return cudaErrorInvalidValue;
-  k_embed<<<T, 128, 0, st>>>(reinterpret_cast<const uint4*>(table), tok, reinterpret_cast<uint4*>(out), H / 8);
+  k_embed<<<T, 128, 0, st>>>(reinterpret_cast<const uint4*>(table), tok, reinterpret_cast<uint4*>(out), H / 8, scale);
   return cudaGetLastError();
 }
 
@@ -120,6 +182,14 @@ int warpc_rmsnorm(void* h, const void* y, const void* w, void* xn, int T, int H,
   if (H % 8) return cudaErrorInvalidValue;
   k_rmsnorm<<<T, H >= 4096 ? 512 : 256, 0, st>>>(reinterpret_cast<bf16*>(h), reinterpret_cast<const bf16*>(y), reinterpret_cast<const bf16*>(w),
                                                   reinterpret_cast<bf16*>(xn), H, eps);
+  return cudaGetLastError();
+}
+
+// h[T][H] += rmsnorm(x[T][H]) * w in place; sc (a bf16 [1], or NULL) is then multiplied in (see k_rmsnorm_post)
+int warpc_rmsnorm_post(void* h, const void* x, const void* w, const void* sc, int T, int H, float eps, cudaStream_t st) {
+  if (H % 8 || H > 8192 || T < 1 || T > STEP_ROWS) return cudaErrorInvalidValue;  // 256 threads cover H / 8 <= 512 in two groups, 512 cover 1024
+  k_rmsnorm_post<<<T, H >= 4096 ? 512 : 256, 0, st>>>(reinterpret_cast<bf16*>(h), reinterpret_cast<const bf16*>(x), reinterpret_cast<const bf16*>(w),
+                                                      reinterpret_cast<const bf16*>(sc), H, eps);
   return cudaGetLastError();
 }
 

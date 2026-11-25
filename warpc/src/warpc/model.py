@@ -64,6 +64,6 @@ def compile(
     if isinstance(source, str | Path):
         source = sources.open(source)
     backend = CudaBackend() if backend is None else backend
-    graph = frontend.build(source, ctx_max=ctx_max, kv=kv)
+    graph = frontend.build(source, ctx_max=ctx_max, rows_max=rows_max, kv=kv)
     plan = lower(graph, backend, rows_max=rows_max)
     return Model(source.config, plan, Runtime(graph, plan, source, backend))

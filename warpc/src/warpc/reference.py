@@ -70,7 +70,9 @@ class Interpreter:
 
 
 def _embed(it, a, tokens):
-    return it.weights[a["weight"]][tokens.long()].to(it.dtype)
+    rows = it.weights[a["weight"]][tokens.long()].to(it.dtype)
+    # the scale is rounded to the activation dtype first, as transformers does
+    return rows if "scale" not in a else rows * torch.tensor(a["scale"], dtype=it.dtype, device=rows.device)
 
 
 def _normed(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -79,6 +81,8 @@ def _normed(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _rmsnorm(it, a, x):
+    if "weight" not in a:
+        return _normed(x, a["eps"]).to(x.dtype)
     w = it.weights[a["weight"]].float()
     offset = a.get("offset", 0.0)
     return (_normed(x, a["eps"]) * (offset + w if offset else w)).to(x.dtype)
@@ -98,6 +102,20 @@ def _add(it, a, x, y):
 
 def _silu_mul(it, a, gate, up):
     return F.silu(gate) * up
+
+
+def _gelu_mul(it, a, gate, up):
+    return F.gelu(gate, approximate="tanh") * up
+
+
+def _scale(it, a, x):
+    s = it.weights[a["weight"]].float() if "weight" in a else a["factor"]
+    return (x.float() * s).to(x.dtype)
+
+
+def _softcap(it, a, x):
+    cap = a["cap"]
+    return (cap * torch.tanh(x.float() / cap)).to(x.dtype)
 
 
 def _silu(it, a, x):
@@ -124,7 +142,8 @@ def _argmax(it, a, x):
     return x.argmax(-1).to(torch.int32)
 
 
-def _rope(it, a, q, k, pos):
+def _rope(it, a, q, *rest):
+    *ks, pos = rest
     rd = a["rotary_dim"]
     inv = torch.tensor(a["inv_freq"], device=q.device, dtype=torch.float32)
     freqs = pos.float()[:, None] * inv[None]
@@ -137,7 +156,12 @@ def _rope(it, a, q, k, pos):
         rh = torch.cat([-xr[..., half:], xr[..., :half]], -1)
         return torch.cat([xr * cos + rh * sin, xp], -1)
 
-    return rotate(q), rotate(k)
+    return (rotate(q), *(rotate(k) for k in ks))
+
+
+def _window(a: dict) -> dict:
+    """The window keyword, only when set: caches without window support take none."""
+    return {} if a.get("window") is None else {"window": a["window"]}
 
 
 def _attention(it, a, q, k, v, pos):
@@ -145,7 +169,11 @@ def _attention(it, a, q, k, v, pos):
     p = pos.long()
     scales = {s: it.weights[a[s]] for s in ("k_scale", "v_scale") if s in a}
     cache.write(p, k, v, **scales)
-    return cache.attend(q, p, a["scale"], **scales)
+    return cache.attend(q, p, a["scale"], **scales, **_window(a))
+
+
+def _attention_read(it, a, q, pos):
+    return it.states[a["state"]].attend(q, pos.long(), a["scale"], **_window(a))
 
 
 def _causal_conv1d(it, a, x):
@@ -194,6 +222,9 @@ _IMPL = {
     "linear": _linear,
     "add": _add,
     "silu_mul": _silu_mul,
+    "gelu_mul": _gelu_mul,
+    "scale": _scale,
+    "softcap": _softcap,
     "silu": _silu,
     "sigmoid_mul": _sigmoid_mul,
     "reshape": _reshape,
@@ -202,6 +233,7 @@ _IMPL = {
     "argmax": _argmax,
     "rope": _rope,
     "attention": _attention,
+    "attention_read": _attention_read,
     "causal_conv1d": _causal_conv1d,
     "gated_delta_rule": _gated_delta_rule,
     "gated_rmsnorm": _gated_rmsnorm,

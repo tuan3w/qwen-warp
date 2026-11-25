@@ -13,7 +13,7 @@ import math
 from collections import Counter, deque
 from dataclasses import dataclass, field
 
-from ..ir import Graph, Node, states_of, weights_of
+from ..ir import Graph, Node, reads_of, states_of, weights_of
 from .caps import REDUCTION_OPS, Absorb, Cap, CapsTable
 from .plan import Pack
 
@@ -184,7 +184,7 @@ def _post_chain(cap: Cap, A: Analysis, value: str) -> tuple[list[int], str | Non
         if nxt is None:
             if a.min > 0:
                 return [], f"no {a.op} consumer to absorb"
-            break
+            continue  # an absent optional op: the next record matches the same value
         if a.op in REDUCTION_OPS and not a.reduction_ok:
             return [], f"{a.op} is a reduction: not legal in an epilogue"
         chain.append(nxt)
@@ -233,6 +233,7 @@ def _operands(A: Analysis, covers, ext_in, ext_out) -> int:
     for i in covers:
         ws.update(weights_of(A.node(i)))
         st.update(states_of(A.node(i)))
+        st.update(reads_of(A.node(i)))
     return len(ext_in) + len(ext_out) + len(ws) + len(st)
 
 
@@ -281,12 +282,13 @@ def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | Non
         if v not in exposed:
             m.why_not = f"intermediate of {A.node(A.prod[v]).op} has users outside the region (single-user rule)"
             return m
-    if _operands(A, covers, ext_in, ext_out) > OPERAND_CAP:
-        m.why_not = f"more than {OPERAND_CAP} operands"
+    cap_operands = cap.operand_cap or OPERAND_CAP
+    if _operands(A, covers, ext_in, ext_out) > cap_operands:
+        m.why_not = f"more than {cap_operands} operands"
         return m
     for i in itertools.chain([pair] if pair is not None else [], m.post):
         n = A.node(i)
-        if n.op in ("add", "silu_mul") and len({g.types[v] for v in n.ins}) != 1:
+        if n.op in ("add", "silu_mul", "gelu_mul") and len({g.types[v] for v in n.ins}) != 1:
             m.why_not = f"{n.op} operands differ in shape or dtype"
             return m
     # memory tier: in-place residual update
@@ -323,7 +325,10 @@ def _inplace(A: Analysis, m: Match, i: int, covers) -> str | None:
     """Memory tier for an absorbed residual add `i`: pick the operand updated in place and prove that no later reader
     exists and that the region itself does not read it (the kernel's CTAs write their slice of `h` while others still
     read their inputs, so `h` must not be any other input of the task: y = linear(x); add(x, y) would update the GEMV's
-    own input). One region updates one value in place."""
+    own input). A reader that is not an ancestor of the region but comes before it in the graph (Gemma's PLE
+    projection reads the embedding the first layer then updates) is ordered before the region by the pass
+    (`_region_cycle`) and by lowering (`_toposort`); one that comes after races. One region updates one value in
+    place."""
     n = A.node(i)
     if m.h is not None:
         return "two in-place updates in one region: the region has one in-place output"
@@ -338,7 +343,8 @@ def _inplace(A: Analysis, m: Match, i: int, covers) -> str | None:
         if v in A.outputs or v in A.graph.inputs:
             why = "the operand is a graph input or output: no in-place update"
             continue
-        late = [c for c in A.cons.get(v, []) if c not in covers and not (cover_anc >> c) & 1]
+        first = min(covers)
+        late = [c for c in A.cons.get(v, []) if c not in covers and c > first and not (cover_anc >> c) & 1]
         if late:
             reader = A.node(late[0]).op
             why = f"the operand is read by a {reader} that does not precede the region: in-place update would race it"
@@ -489,7 +495,7 @@ def _solve(cs: list[Match]) -> list[Match]:
 
 def _region_cycle(A: Analysis, chosen: list[Match]) -> list[Match]:
     """Multi-node matches on a cycle of the contracted region graph (empty if acyclic); uncovered nodes are their own
-    regions."""
+    regions. Edges: dataflow, and from every other reader of a value a region updates in place to that region."""
     rid = list(range(len(A.graph.nodes)))
     members: dict[int, Match] = {}
     for m in chosen:
@@ -505,6 +511,13 @@ def _region_cycle(A: Analysis, chosen: list[Match]) -> list[Match]:
             if p is not None and rid[p] != rid[i]:
                 succ.setdefault(rid[p], set()).add(rid[i])
                 pred.setdefault(rid[i], set()).add(rid[p])
+    for m in chosen:
+        if m.h is not None:
+            owner = rid[min(m.covers)]
+            for c in A.cons.get(m.h, []):
+                if rid[c] != owner:
+                    succ.setdefault(rid[c], set()).add(owner)
+                    pred.setdefault(owner, set()).add(rid[c])
     left = set(rid)
     # peel sources, then sinks: what survives lies on cycles or between them
     for fwd, back in ((succ, pred), (pred, succ)):

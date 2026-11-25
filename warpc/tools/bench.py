@@ -65,6 +65,13 @@ def _swiftmk_backend(head: str):
     return SwiftmkBackend(head=head), lib.load()
 
 
+def long_prompt(args, length: int) -> list[int]:
+    """The prompt of `length` tokens: from --ids-file (JSON {"speed": {length: ids}}) or cut from --prompt-files."""
+    if args.ids_file:
+        return json.loads(args.ids_file.read_text())["speed"][str(length)]
+    return prompts.prompt_ids(args.tokenizer or args.model, args.prompt_files, length)
+
+
 def bench_warpc_long(args, ctx_max: int) -> dict:
     backend, library = _swiftmk_backend(args.head) if args.backend == "swiftmk" else (None, None)
     torch.cuda.reset_peak_memory_stats()
@@ -74,7 +81,7 @@ def bench_warpc_long(args, ctx_max: int) -> dict:
     rt, n = compiled._runtime, args.tokens - 1
     cells = {}
     for length in args.prompt_len:
-        ids = prompts.prompt_ids(args.tokenizer or args.model, args.prompt_files, length)
+        ids = long_prompt(args, length)
         compiled.reset()
         t0 = time.perf_counter()
         compiled.prefill(ids)
@@ -161,6 +168,7 @@ def main():
     ap.add_argument("--backend", choices=("cuda", "swiftmk"), default="cuda", help="warpc backend")
     ap.add_argument("--head", choices=("bf16", "int4_refine"), default="bf16", help="swiftmk / swift-engine head")
     ap.add_argument("--prompt-files", type=Path, nargs="+", help="text the long prompts are cut from")
+    ap.add_argument("--ids-file", type=Path, help="warpc: JSON with 'speed': {length: prompt ids}, instead of files")
     ap.add_argument("--prompt-len", type=int, nargs="+", help="long prompt length(s) in tokens")
     ap.add_argument(
         "--gpu-memory-utilization", type=float, nargs="+", default=[0.93, 0.90, 0.87], help="vllm, tried in order"
@@ -168,9 +176,11 @@ def main():
     ap.add_argument("--language-model-only", action="store_true", help="vllm: skip the vision tower")
     ap.add_argument("--mtp", type=int, default=0, help="vllm / swift-engine: MTP draft tokens (0: plain decode)")
     args = ap.parse_args()
-    if args.prompt_files:
+    if args.prompt_files or args.ids_file:
         if not args.prompt_len:
-            ap.error("--prompt-files needs --prompt-len")
+            ap.error("--prompt-files / --ids-file need --prompt-len")
+        if args.ids_file and args.engine != "warpc":
+            ap.error("--ids-file is for the warpc engine (the other engines' prompts come from --prompt-files)")
         # every round's tokens (+ the events round), and a speculative round's overshoot of up to 8 cycles x (k + 1)
         rounds = (args.repeats + 2) * (args.tokens - 1 + 8 * (args.mtp + 1) * bool(args.mtp))
         ctx_max = args.ctx_max or max(args.prompt_len) + 1 + rounds

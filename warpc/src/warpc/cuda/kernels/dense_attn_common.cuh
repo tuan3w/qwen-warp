@@ -11,6 +11,23 @@ struct QKV {
   int sink, win, ring;
 };
 
+// Sliding window (window 0 = none). A row whose newest key is position live - 1 sees the keys lo .. live - 1, lo = max(0, live - window); a split block s of a row covers the
+// 64-key chunks fc + s * nc .. fc + (s + 1) * nc - 1 of position space, fc = lo / CH. A state with a window holds position p in slot p mod ctx (the launcher rounds ctx up to a
+// multiple of CH, so a chunk never wraps); without a window p < ctx and the slot is p.
+__device__ __forceinline__ int attn_lo(int live, int window) { return window ? max(0, live - window) : 0; }
+// split blocks of a row with `live` keys when a block covers kpb keys (kpb < CH: one chunk of kpb keys, else kpb / CH chunks of CH): ceil(chunks / nc); without a window this is
+// ceil(live / kpb)
+__device__ __forceinline__ int attn_blocks(int live, int window, int kpb) {
+  const int ch = kpb < CH ? kpb : CH, nc = kpb / ch;
+  return ((live - 1) / ch - attn_lo(live, window) / ch + nc) / nc;
+}
+// split blocks per head any row can need (the grid's y extent and the partial layout): the state's chunks, or with a window the chunks the window's keys touch in POSITION space,
+// (window - 1 + 63) / 64 + 1 wherever it starts: more than the ring holds when the ring is one chunk (window 2, ring 64 rows: positions 63 and 64 are in two chunks, one slot range)
+static inline int attn_nsplit(int ctx, int window, int nc, int ch = CH) {
+  const int chunks = window ? (window - 1 + ch - 1) / ch + 1 : (ctx + ch - 1) / ch;
+  return (chunks + nc - 1) / nc;
+}
+
 template <int HD>
 __device__ __forceinline__ float wht_blk(float x, float* xs) {  // orthonormal WHT over the HD threads of the block, butterfly h = 1, 2, 4 ... (a + b, a - b)
   const int i = threadIdx.x;
@@ -34,7 +51,7 @@ __device__ __forceinline__ float wht_blk(float x, float* xs) {  // orthonormal W
 // un-rotated here (WHT in fp32, strides 1, 2, 4 ..; ROT 2 (int4_rot): the hand engine's order 32 .. HD / 2, then 1 .. 16) before the bf16 rounding. All 128 threads
 // weigh the splits, then each thread merges one float4 of the head dim over every SG-th split (SG = 128 / (HD / 4) groups), the groups are added in a fixed order.
 template <int HD, int ROT>
-__global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const int* pos0, bf16* out, int Hq, int nsplit, int kpb) {
+__global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const int* pos0, bf16* out, int Hq, int nsplit, int kpb, int window) {
   constexpr int PS = HD + 4, NSLOT = HD / 4, SG = 128 / NSLOT;
   __shared__ float wgt[MAX_SPLITS2];
   __shared__ float red[32];
@@ -42,7 +59,7 @@ __global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const i
   __shared__ float ov[HD];
   const int head = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
   const int live = *pos0 + t + 1;
-  const int ns = (live + kpb - 1) / kpb;
+  const int ns = attn_blocks(live, window, kpb);
   const float* base = part + ((size_t)t * Hq + head) * nsplit * PS;
   float m = -INFINITY;
   for (int s = tid; s < ns; s += 128) m = fmaxf(m, base[s * PS + HD]);
@@ -121,10 +138,14 @@ __global__ void __launch_bounds__(128) k_attn_reduce2(const float* part, const i
 // run_decode: split + reduce launches of the bf16 cache (warpc_attn_decode); run_decode_x / run_prep_q / run_split_q return an error code (cudaGetLastError after the launches, or
 // cudaErrorInvalidValue for a configuration they reject).
 template <int HD>
-void run_decode(dim3 grid, dim3 g2, size_t smem, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, int nsplit, float scale,
+void run_decode(dim3 grid, dim3 g2, size_t smem, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, int nsplit, float scale, int window,
                 cudaStream_t st);
 template <int HD>
-int run_decode_x(int T, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, cudaStream_t st);
+int run_decode_x(int T, const bf16* q, const bf16* kv, const int* pos0, bf16* o, float* ws, int Hq, int Hkv, int ctx, float scale, int nc, int window, cudaStream_t st);
+// run_decode1x: the one-row decode of head dims 256 / 512 (k_attn_decode1); READ: q-only prep on another layer's cache.
+template <int HD, int READ>
+int run_decode1x(const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* kv, const int* pos0, bf16* o, float* ws, unsigned* cnt, int Hq, int Hkv, int ctx,
+                 float scale, const float* inv_freq, float eps, int qk_norm, int v_norm, int window, cudaStream_t st);
 // R4: KV format int4_rot (VB 4, EX 1).
 template <int HD, int VB, int EX, int R4>
 int run_prep_q(int T, const bf16* q, const bf16* k, const bf16* v, const bf16* qn, const bf16* kn, bf16* qout, uint8_t* kvb, const QKV& L, const int* pos0, int Hq, int Hkv,

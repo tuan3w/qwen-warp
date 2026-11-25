@@ -7,7 +7,7 @@ from ..sources import Source
 from . import common
 
 
-def build(source: Source, *, ctx_max: int, kv: str) -> Graph:
+def build(source: Source, *, ctx_max: int, rows_max: int, kv: str) -> Graph:
     c = source.config
     H, FF, hd = c.hidden_size, c.intermediate_size, c.head_dim
     nq, nkv, eps = c.num_heads, c.num_kv_heads, c.rms_eps

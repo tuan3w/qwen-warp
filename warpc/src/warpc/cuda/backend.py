@@ -14,7 +14,7 @@ from ..ir import STATE_DTYPE, Graph, StateDecl
 from ..kvcache import FORMATS
 from ..runtime import Launch, Memory
 from ..sources import Source
-from . import glue, launch
+from . import glue, launch, schedule
 from .pack import Packer
 from .table import TABLE
 
@@ -23,11 +23,13 @@ _STATE_BYTES = {"bf16": 2, "f32": 4}
 
 def state_nbytes(state: StateDecl, rows_max: int) -> int:
     """Bytes of a state in this backend's layout. kv: the format's layout for steps of up to `rows_max` rows (the
-    quantised formats' exact-row ring holds the window plus one step); conv / recurrent: the plain [shape] array of
-    STATE_DTYPE."""
+    quantised formats' exact-row ring holds the window plus one step; a bf16 state's rows are rounded up to whole
+    attention chunks, so a ring of 519 rows holds 576 and its 64-key chunks never wrap); conv / recurrent: the plain
+    [shape] array of STATE_DTYPE."""
     if state.kind == "kv":
         _, ctx, nkv, hd = state.shape
-        return FORMATS[state.cache].nbytes(ctx, nkv, hd, rows_max)
+        fmt = FORMATS[state.cache]
+        return fmt.nbytes(ctx if fmt.quantized else schedule.kv_rows(ctx), nkv, hd, rows_max)
     return math.prod(state.shape) * _STATE_BYTES[STATE_DTYPE[state.kind]]
 
 

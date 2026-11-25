@@ -7,7 +7,7 @@ from typing import Protocol
 
 import torch
 
-from .config import LinearAttention, ModelConfig
+from .config import Gemma4Text, LinearAttention, ModelConfig
 from .gguf import GGUFSource
 from .safetensors import SafetensorsSource
 
@@ -46,4 +46,4 @@ def open(path: str | Path) -> Source:
     raise ValueError(f"{path}: neither a .gguf file nor a directory with config.json")
 
 
-__all__ = ["GGUFSource", "LinearAttention", "ModelConfig", "SafetensorsSource", "Source", "open"]
+__all__ = ["GGUFSource", "Gemma4Text", "LinearAttention", "ModelConfig", "SafetensorsSource", "Source", "open"]

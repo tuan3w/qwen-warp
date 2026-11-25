@@ -14,6 +14,8 @@ A `Cap` is one kernel:
   rounds     per absorbed op, which rounding points of the reference interpreter the kernel reproduces (see REF_POINTS)
   tolerance  the gaps (op.point) a kernel is known to leave open, so a plan containing it is reference-tolerance, not
              bit-exact
+  operand_cap  operands (inputs, outputs, weights, states) one launch can bind when that differs from the pass's
+               default: a kernel that writes one buffer per layer (the PLE row kernel, 35) takes them as an array
 
 The legality tiers live in the pass (structural, memory) and in `Cap.check` / `Cap.info` (semantic).
 """
@@ -28,14 +30,16 @@ from dataclasses import dataclass, field
 # with a bf16 output, "out" being the boundary itself; ops not listed round once, at the boundary; views round nothing.
 REF_POINTS: dict[str, tuple[str, ...]] = {
     "silu_mul": ("silu", "out"),  # silu(gate) is a bf16 tensor before the product with up
+    "gelu_mul": ("gelu", "out"),  # gelu_tanh(gate) is a bf16 tensor before the product with up
     "rope": ("trig", "prod", "out"),  # cos / sin cast to bf16, x*cos and rot(x)*sin are bf16 tensors, then their sum
     "attention": ("p", "out"),  # the softmax probabilities are rounded to bf16 before P V
+    "attention_read": ("p", "out"),
     "sigmoid_mul": ("sigmoid", "out"),  # sigmoid(gate) is a bf16 tensor before the product
     "gated_delta_rule": ("beta", "out"),  # sigmoid(b) is rounded before the fp32 recurrence
     "gated_rmsnorm": ("norm", "scale", "out"),  # bf16(x-hat), bf16(x-hat * w), then the fp32 gate product
 }
 VIEW_OPS = frozenset({"reshape", "split"})
-REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention", "gated_rmsnorm"})
+REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention", "attention_read", "gated_rmsnorm"})
 _LIMIT_SUFFIXES = ("_multiple", "_in", "_max", "_min")
 
 
@@ -104,6 +108,7 @@ class Cap:
     constants: Callable | None = None  # (Match, Analysis) -> dict of graph constants the limits and the cost model read
     info: Callable | None = None  # (constants) -> Verdict; None = limits only
     check: Callable | None = None  # semantic predicate (Match, Analysis) -> reason string or None
+    operand_cap: int | None = None  # None: fuse.OPERAND_CAP
 
     def __post_init__(self):
         for key in self.limits:

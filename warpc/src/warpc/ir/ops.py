@@ -11,9 +11,16 @@ from .graph import OPS, Graph, OpDef, StateDecl, TType, WeightDecl
 __all__ = ["OPS"]
 
 
-def _op(name: str, *, weights: tuple[str, ...] = ("weight",), states: tuple[str, ...] = (), state_kind: str = ""):
+def _op(
+    name: str,
+    *,
+    weights: tuple[str, ...] = ("weight",),
+    states: tuple[str, ...] = (),
+    state_kind: str = "",
+    reads: tuple[str, ...] = (),
+):
     def register(fn):
-        OPS[name] = OpDef(name, fn, weights, states, state_kind)
+        OPS[name] = OpDef(name, fn, weights, states, state_kind, reads)
         return fn
 
     return register
@@ -40,7 +47,8 @@ def _need(cond: bool, msg: str) -> None:
 
 @_op("embed")
 def _embed(g, a, ins):
-    """tokens i32[T] -> rows of the [V, H] table, bf16 [T, H]."""
+    """tokens i32[T] -> rows of the [V, H] table times attrs["scale"] (default 1.0; the scale is rounded to the
+    activation dtype first, then the product), bf16 [T, H]."""
     (t,) = ins
     w = _weight(g, a)
     _need(t.dtype == "i32" and len(t.shape) == 1 and len(w.shape) == 2, "embed: tokens i32[T], table [V, H]")
@@ -50,8 +58,11 @@ def _embed(g, a, ins):
 @_op("rmsnorm")
 def _rmsnorm(g, a, ins):
     """x * rsqrt(mean(x^2, -1) + eps) * (offset + w) over the last dim (attrs["offset"], default 0.0); fp32 inside,
-    result in x dtype."""
+    result in x dtype. Without attrs["weight"] the result is x-hat alone (no offset either)."""
     (x,) = ins
+    if "weight" not in a:
+        _need("offset" not in a, "rmsnorm: an offset needs the weight")
+        return [x]
     w = _weight(g, a)
     _need(w.shape == (x.shape[-1],), f"rmsnorm: weight {w.shape} vs last dim {x.shape[-1]}")
     return [x]
@@ -79,6 +90,32 @@ def _silu_mul(g, a, ins):
     """silu(gate) * up."""
     x, y = ins
     _need(x == y, f"silu_mul: {x} vs {y}")
+    return [x]
+
+
+@_op("gelu_mul", weights=())
+def _gelu_mul(g, a, ins):
+    """gelu_tanh(gate) * up: gelu_tanh(gate) is rounded to the activation dtype before the product."""
+    x, y = ins
+    _need(x == y, f"gelu_mul: {x} vs {y}")
+    return [x]
+
+
+@_op("scale", weights=("weight",))
+def _scale(g, a, ins):
+    """x * attrs["factor"] (a float) xor x * w[0] (attrs["weight"], a [1] weight), fp32 inside, one rounding."""
+    (x,) = ins
+    _need(("factor" in a) != ("weight" in a), "scale: exactly one of factor and weight")
+    if "weight" in a:
+        _need(_weight(g, a).shape == (1,), "scale: weight must be a [1] weight")
+    return [x]
+
+
+@_op("softcap", weights=())
+def _softcap(g, a, ins):
+    """cap * tanh(x / cap), fp32 inside, one rounding to x's dtype (an fp32 x stays fp32)."""
+    (x,) = ins
+    _need(a["cap"] > 0, f"softcap: cap {a['cap']}")
     return [x]
 
 
@@ -141,8 +178,9 @@ def _argmax(g, a, ins):
 def _rope(g, a, ins):
     """Rotate the first rotary_dim dims of q [T, Hq, D] and k [T, Hkv, D] (half-split pairs) at positions pos i32[T]:
     pair j (dims j and j + rotary_dim / 2) by the angle pos * inv_freq[j], inv_freq a tuple of rotary_dim / 2 fp32
-    values."""
-    q, k, pos = ins
+    values. (q, pos) rotates q alone: the same function of one tensor."""
+    q, *k, pos = ins
+    _need(len(k) <= 1, "rope: (q, k, pos) or (q, pos)")
     _need(
         pos.dtype == "i32"
         and pos.shape == (q.shape[0],)
@@ -151,14 +189,22 @@ def _rope(g, a, ins):
         and len(a["inv_freq"]) == a["rotary_dim"] // 2,
         f"rope: q {q.shape}, pos {pos.shape}, rotary_dim {a['rotary_dim']}, {len(a['inv_freq'])} inverse frequencies",
     )
-    return [q, k]
+    return [q, *k]
+
+
+def _window(a: dict, s: StateDecl, op: str) -> None:
+    window = a.get("window")
+    _need(window is None or (isinstance(window, int) and window > 0), f"{op}: window {window!r}")
+    _need(window is None or s.cache == "bf16", f"{op}: a window needs a bf16 cache, not {s.cache}")
 
 
 @_op("attention", weights=("k_scale", "v_scale"), states=("state",), state_kind="kv")
 def _attention(g, a, ins):
     """Write k, v at positions pos into the KV state (in its cache format), then causal softmax attention of row t
     over cache[0..pos_t]; GQA; fp32 softmax. Cache format fp8 reads its per-tensor scales from the [1] weights
-    attrs["k_scale"] / attrs["v_scale"], which no other format takes."""
+    attrs["k_scale"] / attrs["v_scale"], which no other format takes. attrs["window"] (int, default None): row t sees
+    only the positions p with 0 <= pos_t - p < window. A state with R rows holds position p in slot p mod R; the step
+    needs R >= window + rows - 1 (the write precedes the read), else the reference raises."""
     q, k, v, pos = ins
     s = _state(g, a)
     hq, d = q.shape[1], q.shape[2]
@@ -172,6 +218,7 @@ def _attention(g, a, ins):
         and pos.dtype == "i32",
         f"attention: state {s.shape}, q {q.shape}, k {k.shape}, v {v.shape}",
     )
+    _window(a, s, "attention")
     scales = [key for key in ("k_scale", "v_scale") if key in a]
     if s.cache == "fp8":
         _need(len(scales) == 2, "attention: cache fp8 needs the k_scale and v_scale weights")
@@ -179,6 +226,22 @@ def _attention(g, a, ins):
             _need(_weight(g, a, key).shape == (1,), f"attention: {key} must be a [1] weight")
     else:
         _need(not scales, f"attention: cache {s.cache} takes no scales")
+    return [TType((q.shape[0], hq * d), q.dtype)]
+
+
+@_op("attention_read", weights=(), reads=("state",), state_kind="kv")
+def _attention_read(g, a, ins):
+    """`attention` without the write: row t attends over a bf16 state an earlier node of the graph wrote (the owner
+    of a layer that shares its KV), same attrs["scale"] / attrs["window"]."""
+    q, pos = ins
+    s = _state(g, a)
+    hq, d = q.shape[1], q.shape[2]
+    _need(
+        len(s.shape) == 4 and s.shape[0] == 2 and s.shape[3] == d and hq % s.shape[2] == 0 and pos.dtype == "i32",
+        f"attention_read: state {s.shape}, q {q.shape}",
+    )
+    _need(s.cache == "bf16", f"attention_read: cache {s.cache} (only bf16)")
+    _window(a, s, "attention_read")
     return [TType((q.shape[0], hq * d), q.dtype)]
 
 

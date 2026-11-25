@@ -97,12 +97,11 @@ __global__ void __launch_bounds__(GEMV_WARPS * 32) k_dg(const __grid_constant__ 
       bf16* hr = reinterpret_cast<bf16*>(p.out[0]) + r;
       *hr = tb(bf(*hr) + rb(g));
     } else if constexpr (MODE == 1) {
-      const float u = acc2[MODE == 1 ? i : 0];
-      const float a = rb(g);
-      const float sl = rb(a / (1.f + __expf(-a)));
-      reinterpret_cast<bf16*>(p.out[0])[r] = tb(sl * rb(u));
+      reinterpret_cast<bf16*>(p.out[0])[r] = tb(gate_act(g, p.act) * rb(acc2[MODE == 1 ? i : 0]));
+    } else if constexpr (MODE == 4) {
+      reinterpret_cast<bf16*>(p.out[0])[r] = tb(gate_act(g, p.act) * bf(p.row[r]));
     } else {
-      reinterpret_cast<float*>(p.out[0])[r] = g;
+      reinterpret_cast<float*>(p.out[0])[r] = logit_out(g, p.cap);
     }
   }
 }
@@ -114,3 +113,4 @@ int warpc_dec_gemv_m0(const GemvP& p, int rpw, bool norm, cudaStream_t st);
 int warpc_dec_gemv_m1(const GemvP& p, int rpw, bool norm, cudaStream_t st);
 int warpc_dec_gemv_m2(const GemvP& p, int rpw, bool norm, cudaStream_t st);
 int warpc_dec_gemv_m3(const GemvP& p, int rpw, bool norm, cudaStream_t st);
+int warpc_dec_gemv_m4(const GemvP& p, int rpw, bool norm, cudaStream_t st);
