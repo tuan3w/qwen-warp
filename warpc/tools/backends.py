@@ -5,16 +5,17 @@ from __future__ import annotations
 BACKENDS = ("composite", "cuda", "swiftmk")
 
 
-def make_backend(name: str, head: str, kernels: str | None):
+def make_backend(name: str, head: str, kernels: str | None, window: bool = False):
     """`composite`: warpc kernels first, the hand engine's as fallback; `kernels` names the warpc kernels admitted,
-    comma-separated (None: all). `head`: the lm_head kernel of every backend (bf16 or int4_refine)."""
+    comma-separated (None: all). `head`: the lm_head kernel of every backend (bf16 or int4_refine).
+    `window`: the swiftmk side also has the window prefill kernels."""
     from warpc.composite import CompositeBackend
     from warpc.cuda import CudaBackend
     from warpc.swiftmk import SwiftmkBackend
 
     if name == "swiftmk":
-        return SwiftmkBackend(head)
+        return SwiftmkBackend(head, window=window)
     if name == "cuda":
         return CudaBackend(head)
     admitted = [k for k in kernels.split(",") if k] if kernels is not None else None
-    return CompositeBackend(CudaBackend(head), SwiftmkBackend(head), kernels=admitted)
+    return CompositeBackend(CudaBackend(head), SwiftmkBackend(head, window=window), kernels=admitted)

@@ -69,7 +69,7 @@ def reference_logits(source, prompts: list[list[int]]) -> list[torch.Tensor]:
 def teacher_forced(model: warpc.Model, ids: list[int]) -> torch.Tensor:
     """fp32 [len(ids), vocab]: the logits after each prompt token, fed one step at a time."""
     model.reset()
-    model.prefill(ids[:1])
+    model.append(ids[:1])
     rows = [model.logits.cpu()]
     for token in ids[1:]:
         model.step(token)
@@ -93,7 +93,7 @@ def agreement(model: warpc.Model, prompts: list[list[int]], ours: list[list[int]
         matched.append(k)
         if k < min(len(a), len(b)):
             model.reset()
-            model.prefill(ids + a[:k])
+            model.append(ids + a[:k])
             margins.append(float(model.logits[a[k]] - model.logits[b[k]]))
     return {"matched": matched, "compared": [len(b) for b in theirs], "margins": margins}
 

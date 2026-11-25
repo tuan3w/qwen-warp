@@ -59,6 +59,7 @@ _SIGNATURES: dict[str, tuple[list, type]] = {
     "swiftmk_deltanet_ws_bytes": ([], _sz),
     "swiftmk_deltanet_dbuf_floats": ([], _sz),
     "swiftmk_deltanet_step_lazy2": ([_i, *[_vp] * 10, _vp, _i, _i, _vp, _vp, _vp, _vp, _vp, _vp], _i),
+    "swiftmk_deltanet_materialize": ([_vp, _vp, _i, _vp, _vp, _i, _vp], _i),
     "swiftmk_attn_ws_bytes": ([], _sz),
     "swiftmk_attn_kv_bytes": ([_i, _i], _sz),
     "swiftmk_attn_step": ([_i, *[_vp] * 6, _i, _i, _f, _f, _vp, _vp, _vp, _vp, _vp], _i),

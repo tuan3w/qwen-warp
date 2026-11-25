@@ -79,6 +79,16 @@ class Packer:
     def __init__(self, weights: dict[str, WeightDecl], source: Source, device: str = "cuda"):
         self.weights, self.source, self.device = weights, source, device
 
+    def nbytes(self, pack: Pack) -> int:
+        """Device bytes of `pack` (build() allocates exactly this), from the declarations alone."""
+        shapes = [self.weights[p].shape for p in pack.parts]
+        if pack.kind in ("dense", "dense_cat"):
+            return sum(2 * math.prod(s) for s in shapes)
+        if pack.kind in ("w4r", "w4r_cat", "w4r_gateup", "head_i4r"):
+            n, k = sum(s[0] for s in shapes), shapes[0][1]
+            return w4_scale_offset(n, k) + n * (k // W4G128_GROUP) * 2
+        raise ValueError(f"pack {pack.name}: kind {pack.kind!r} is not one of {KINDS}")
+
     def _decl(self, name: str, scheme: str) -> WeightDecl:
         d = self.weights[name]
         if d.scheme != scheme:

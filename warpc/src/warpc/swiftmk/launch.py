@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from ..compiler import Task
 from ..runtime import Memory
-from .lib import EPI_SEGS, EPI_SILU, HEADQ_I4R, KV_DTYPE, Epi
+from .lib import EPI_F32, EPI_SEGS, EPI_SILU, HEADQ_I4R, KV_DTYPE, Epi
 from .pack import w4_scale_offset
 from .table import HEAD_R
 
@@ -120,6 +120,24 @@ def _attention(ex: SwiftmkExecutor, mem: Memory, t: Task, T: int) -> Enqueue:
     return lambda st: lib.check(lib.swiftmk_attn_step(*args, st), t.kernel)
 
 
+def _w4_head(ex: SwiftmkExecutor, mem: Memory, t: Task, T: int) -> Enqueue:
+    lib = ex.lib
+    n, k = t.attrs["N"], t.attrs["K"]
+    w = mem.packs[t.weights["w"]]
+    logits, ids = mem.buffer(t.outs["logits"]), mem.buffer(t.outs["ids"])
+    epi = Epi()
+    epi.kind = EPI_F32
+    epi.out[0] = logits
+    args = (w, w + w4_scale_offset(n, k), mem.buffer(t.ins["x"]), n, k, T, C.byref(epi))
+    ws = mem.scratch("argmax_ws", lib.smk_argmax_ws_bytes())  # zeroed once; the kernel re-zeroes it
+
+    def run(st: int) -> None:
+        lib.check(lib.smk_w4r_gemv(*args, st), t.kernel)
+        lib.check(lib.smk_argmax(logits, T, n, ids, None, ws, st), t.kernel)
+
+    return run
+
+
 def _head(ex: SwiftmkExecutor, mem: Memory, t: Task, T: int) -> Enqueue:
     lib, n, k = ex.lib, t.attrs["N"], t.attrs["K"]
     w, x = mem.packs[t.weights["w"]], mem.buffer(t.ins["x"])
@@ -155,6 +173,7 @@ LAUNCHERS: dict[str, Callable[[SwiftmkExecutor, Memory, Task, int], Enqueue]] = 
     "s_ab_gemv": _ab,
     "s_deltanet": _deltanet,
     "s_attn": _attention,
+    "s_w4_head": _w4_head,
     "s_head": _head,
     "s_head_refine": _head_refine,
 }

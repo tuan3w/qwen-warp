@@ -174,6 +174,39 @@ def _argmax(g, a, ins):
     return [TType(x.shape[:-1], "i32")]
 
 
+@_op("concat", weights=())
+def _concat(g, a, ins):
+    """x[T, a], y[T, b] -> [T, a + b]: the columns of x, then those of y (same dtype, same row count)."""
+    x, y = ins
+    _need(
+        len(x.shape) == 2 and len(y.shape) == 2 and x.shape[0] == y.shape[0] and x.dtype == y.dtype,
+        f"concat: {x} vs {y}",
+    )
+    return [TType((x.shape[0], x.shape[1] + y.shape[1]), x.dtype)]
+
+
+@_op("select_row", weights=())
+def _select_row(g, a, ins):
+    """x[T, D], i i32[1] -> [1, D]: row i[0] of x (a device-valued index; no bounds check)."""
+    x, i = ins
+    _need(len(x.shape) == 2 and i == TType((1,), "i32"), f"select_row: x {x}, i {i}")
+    return [TType((1, x.shape[1]), x.dtype)]
+
+
+@_op("take", weights=())
+def _take(g, a, ins):
+    """i i32[1] -> i32[1]: attrs["table"][i[0]], a non-empty tuple of ints in [0, 2**24) (an fp32 constant on the
+    device holds them exactly; no bounds check on i)."""
+    (i,) = ins
+    table = a["table"]
+    _need(i == TType((1,), "i32"), f"take: i {i}")
+    _need(
+        isinstance(table, tuple) and len(table) > 0 and all(isinstance(v, int) and 0 <= v < 1 << 24 for v in table),
+        "take: table must be a non-empty tuple of ints in [0, 2**24)",
+    )
+    return [i]
+
+
 @_op("rope", weights=())
 def _rope(g, a, ins):
     """Rotate the first rotary_dim dims of q [T, Hq, D] and k [T, Hkv, D] (half-split pairs) at positions pos i32[T]:

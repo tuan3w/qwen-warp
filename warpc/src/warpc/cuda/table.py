@@ -12,7 +12,7 @@ from __future__ import annotations
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
 from ..ir import Q4_0_BLOCK_ELEMS
 from ..kvcache import FORMATS, RotatedInt4Format
-from . import attn_gated, deltanet, head_refine, hybrid, inkling, schedule, w4
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, move, schedule, w4
 
 # GeForce RTX 3090 (sm_86): measured launch cost inside a CUDA graph, DRAM bandwidth, SM count. The cost model uses
 # these on any GPU; the kernels themselves are built for the device the runtime runs on.
@@ -628,6 +628,7 @@ CAPS = [
     *deltanet.CAPS,
     *w4.CAPS,
     *head_refine.CAPS,
+    *move.CAPS,
     Cap(
         "g_attn",
         "attention",
@@ -798,6 +799,7 @@ CAPS = [
         limits={"H_multiple": 8},
         rounds={"embed": ("out",)},
         constants=lambda m, A: {"H": A.graph.weights[A.node(m.anchors[0]).attrs["weight"]].shape[1]},
+        gather=("table",),
         emit=_emit_embed,
     ),
     Cap(

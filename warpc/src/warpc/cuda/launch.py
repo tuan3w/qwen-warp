@@ -13,7 +13,7 @@ from collections.abc import Callable
 from ..compiler import Task
 from ..kvcache import FORMATS
 from ..runtime import Memory
-from . import attn_gated, deltanet, head_refine, hybrid, inkling, schedule, w4
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, move, schedule, w4
 
 
 def _check(L: C.CDLL, rc: int, what: str) -> None:
@@ -222,7 +222,7 @@ LAUNCHERS: dict[str, Callable[[C.CDLL, Memory, Task, int, int], None]] = {
     "g_head": _head,
     "g_ple": _ple,
 }
-for _family in (inkling, hybrid, w4, attn_gated, deltanet, head_refine):
+for _family in (inkling, hybrid, w4, attn_gated, deltanet, head_refine, move):
     LAUNCHERS.update(_family.LAUNCHERS)
 
 

@@ -17,6 +17,8 @@ A `Cap` is one kernel:
              bit-exact
   operand_cap  operands (inputs, outputs, weights, states) one launch can bind when that differs from the pass's
                default: a kernel that writes one buffer per layer (the PLE row kernel, 35) takes them as an array
+  gather     the weight roles the kernel reads only by row gather, never scanning the table (the embedding rows, the
+             rescored head rows): `lower` copies it to `Task.gather`, and a runtime may keep such a pack in host memory
 
 The legality tiers live in the pass (structural, memory) and in `Cap.check` / `Cap.info` (semantic).
 """
@@ -137,6 +139,7 @@ class Cap:
     info: Callable | None = None  # (constants) -> Verdict; None = limits only
     check: Callable | None = None  # semantic predicate (Match, Analysis) -> reason string or None
     operand_cap: int | None = None  # None: fuse.OPERAND_CAP
+    gather: tuple[str, ...] = ()  # see above
 
     def __post_init__(self):
         for key in self.limits:

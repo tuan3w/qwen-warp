@@ -82,16 +82,16 @@ class Tap:
             i, last = 0, len(ids) - 1
             while i < last:
                 T = min(rt._rows_max, last - i)
-                rt._tokens[:T].copy_(torch.tensor(ids[i : i + T], dtype=torch.int32))
+                rt.inputs["tokens"][:T].copy_(torch.tensor(ids[i : i + T], dtype=torch.int32))
                 self.pos = i
-                rt._run(T, False)
+                rt.enqueue(T, ())
                 i += T
-            rt._tokens[:1].fill_(ids[-1])
+            rt.inputs["tokens"][:1].fill_(ids[-1])
             out = []
             for step in range(n + 1):
                 self.pos = last + step
-                rt._run(1, True)
-                out.append(rt._ids[:1].clone())
+                rt.enqueue(1, ("ids",))
+                out.append(rt.outputs["ids"][:1].clone())
             torch.cuda.synchronize()
         finally:
             self.active = False

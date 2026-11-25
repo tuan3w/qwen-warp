@@ -193,6 +193,20 @@ class QuantizedCache:
 
 
 @dataclass(frozen=True)
+class RowSection:
+    """`heads` planes of `rows` rows of `row_bytes` bytes each, contiguous from byte `offset` of a layer's buffer."""
+
+    offset: int
+    heads: int
+    rows: int
+    row_bytes: int
+
+    @property
+    def nbytes(self) -> int:
+        return self.heads * self.rows * self.row_bytes
+
+
+@dataclass(frozen=True)
 class KVFormat:
     """A KV cache format; bits 16 = bf16 rows as given, 8 / 4 = rotated symmetric codes with one fp16 scale per row."""
 
@@ -244,6 +258,31 @@ class KVFormat:
         if not self.quantized:
             return 2 * nkv * ctx * hd * 2
         return self.layout(ctx, nkv, hd, rows_max)["total"]
+
+    def row_sections(self, rows: int, nkv: int, hd: int, rows_max: int) -> dict[str, RowSection]:
+        """The per-position planes of one layer's buffer, [Hkv][rows][row_bytes] each: the bytes a position owns, for
+        export and import of KV rows. `rows` is the row count of the layout as allocated (a bf16 buffer's rows may be
+        rounded up by its backend; a quantised buffer's are the context)."""
+        if not self.quantized:
+            plane = nkv * rows * hd * 2
+            return {"k": RowSection(0, nkv, rows, hd * 2), "v": RowSection(plane, nkv, rows, hd * 2)}
+        at = self.layout(rows, nkv, hd, rows_max)
+        planes = {"kc": hd * self.k_bits // 8, "vc": hd * self.v_bits // 8, "ks": self.meta_row_bytes(hd)}
+        planes["vs"] = planes["ks"]
+        return {n: RowSection(at[n], nkv, rows, b) for n, b in planes.items()}
+
+    def meta_row_bytes(self, hd: int) -> int:
+        """Bytes of the scale row of one (token, KV head) in `ks` / `vs`."""
+        return 2
+
+    def aux_range(self, ctx: int, nkv: int, hd: int, rows_max: int) -> tuple[int, int] | None:
+        """(offset, bytes) of the fixed-size exact rows (sink and ring) at the end of a quantised buffer: state that
+        is not positional, so a restore must write it. None for a format without exact rows."""
+        if not self.exact_rows:
+            return None
+        at = self.layout(ctx, nkv, hd, rows_max)
+        first = min(at[n] for n in ("kr", "vr", "kx", "vx") if n in at)
+        return first, at["total"] - first
 
     def reference_cache(self, shape: tuple[int, ...], *, device, dtype: torch.dtype) -> ExactCache | QuantizedCache:
         """The interpreter's storage for a state of this format; dtype is the activation dtype (bf16 format only)."""
@@ -502,6 +541,9 @@ class RotatedInt4Format(KVFormat):
     def ring(self, rows_max: int) -> int:
         return _ROT_RING
 
+    def meta_row_bytes(self, hd: int) -> int:
+        return hd // 64
+
     def layout(self, ctx: int, nkv: int, hd: int, rows_max: int) -> dict[str, int]:
         _rot_check(hd)
         offset, sections = 0, {}
@@ -561,6 +603,10 @@ class Fp8Format(KVFormat):
     def nbytes(self, ctx: int, nkv: int, hd: int, rows_max: int) -> int:
         return 2 * nkv * ctx * hd
 
+    def row_sections(self, rows: int, nkv: int, hd: int, rows_max: int) -> dict[str, RowSection]:
+        plane = nkv * rows * hd
+        return {"k": RowSection(0, nkv, rows, hd), "v": RowSection(plane, nkv, rows, hd)}
+
     def reference_cache(self, shape: tuple[int, ...], *, device, dtype: torch.dtype) -> Fp8Cache:
         return Fp8Cache(shape, device=device)
 
@@ -576,3 +622,18 @@ FORMATS: dict[str, KVFormat] = {
         Fp8Format("fp8", 8, 8),
     )
 }
+
+
+@dataclass
+class KVChunk:
+    """Rows [start, stop) of every KV state of a decoder in the byte layout of the state's format, in pinned host
+    memory: `planes["<state>/<section>"]` is uint8 [Hkv, stop - start, row_bytes] (sections: `KVFormat.row_sections`).
+    Positional rows only: the exact rows of a quantised format (`KVFormat.aux_range`) travel in a Snapshot."""
+
+    start: int
+    stop: int
+    planes: dict[str, torch.Tensor]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(p.numel() for p in self.planes.values())

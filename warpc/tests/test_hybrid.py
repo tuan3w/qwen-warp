@@ -112,7 +112,8 @@ def test_head_against_the_dense_gemv_on_dense_shapes():
         a, b = (torch.empty(1, n, dtype=torch.float32, device="cuda") for _ in range(2))
         ends, outs = (C.c_int * 3)(), (C.c_void_p * 3)(a.data_ptr(), None, None)
         rpw = schedule.gemv_rows_per_warp(n, k, 2)
-        old = _call(L.warpc_gemv, w, None, x, n, k, 1, 2, ends, outs, None, C.c_float(0.0), rpw)
+        zero = C.c_float(0.0)
+        old = _call(L.warpc_gemv, w, None, x, n, k, 1, 2, ends, outs, None, zero, rpw, None, 0, zero, 0, 1)
         new = _call(L.warpc_head_gemv, w, x, n, k, b)
         assert old() == 0 and new() == 0
         torch.cuda.synchronize()
@@ -162,7 +163,7 @@ def test_norm_speed():
     out_a = torch.empty(3, H, dtype=torch.bfloat16, device="cuda")
     out_b = torch.empty_like(out_a)
     S.check(S.smk_embed(table.data_ptr(), tok.data_ptr(), out_a.data_ptr(), 3, H, stream()), "smk embed")
-    assert L.warpc_embed(table.data_ptr(), tok.data_ptr(), out_b.data_ptr(), 3, H, stream()) == 0
+    assert L.warpc_embed(table.data_ptr(), tok.data_ptr(), out_b.data_ptr(), 3, H, C.c_float(1.0), stream()) == 0
     torch.cuda.synchronize()
     assert torch.equal(out_a, out_b)
 

@@ -14,6 +14,10 @@ Gate: (a) all --tokens ids equal; (b) the fp32 logits of each of the first --tra
 the int4_refine head, (b) compares the logits buffer the refine kernels leave (approximate int4 logits, exact on the
 rescored candidates): equal only because both sides run the same kernels. Exit status 0 iff both hold. DIR receives
 both traces and summary.json (first differing id, per-step logits equality and max |delta|).
+
+--mtp K [--host-tables]: greedy MTP speculation with K drafts per cycle, the hand's SpecEngine as the oracle (the same
+cell check as `gate27.py check --mtp`: drafts, the head's hidden rows, verify logits, every cycle's tokens and accepted
+count, bitwise); the hand side runs first and warpc is judged against its trace.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ def warpc_trace(args) -> None:
     t0 = time.perf_counter()
     m = warpc.compile(args.model, ctx_max=args.ctx_max, rows_max=8, kv=args.kv, backend=SwiftmkBackend(args.head))
     compile_s = time.perf_counter() - t0
-    out = [m.prefill(ids)]
+    out = [m.append(ids)]
     logits = [m.logits.clone()]
     for _ in range(1, args.trace_steps):
         out += m.decode(1)
@@ -51,6 +55,56 @@ def warpc_trace(args) -> None:
     library = lib.load()
     meta = {"lib": str(library.path), "lib_sha256": library.sha256, "plan": m.plan.summary(), "compile_s": compile_s}
     args.meta_out.write_text(json.dumps(meta))
+
+
+def warpc_mtp(args) -> None:
+    """The warpc child of --mtp: the hand's cell in --trace-out, the verdict and tokens per cycle to --meta-out."""
+    import gate27
+    import warpc
+    from backends import make_backend
+    from warpc.swiftmk import lib
+
+    (cell,) = torch.load(args.trace_out)
+    backend = make_backend("composite", args.head, gate27.GLUE_KERNELS)
+    t0 = time.perf_counter()
+    kwargs = {"ctx_max": args.ctx_max, "rows_max": 8, "kv": args.kv, "backend": backend, "speculate": args.mtp}
+    m = warpc.compile(args.model, host_tables=args.host_tables, **kwargs)
+    compile_s = time.perf_counter() - t0
+    r = gate27.mtp_cell(m, cell, args.mtp, args.tokens)
+    stats = m.decoder.stats
+    meta = {"lib": str(lib.load().path), "lib_sha256": lib.load().sha256, "plan": m.plan.summary(), "cell": r}
+    meta |= {"compile_s": compile_s, "tokens_per_cycle": stats.emitted / stats.cycles, "accepted": stats.accepted}
+    args.meta_out.write_text(json.dumps(meta))
+
+
+def compare_mtp(args, prompt: list[str]) -> int:
+    th = args.out / "hand-mtp.pt"
+    mode = ["mtp-traces", *prompt, "--slices", "1", "--tokens", str(args.tokens), "--mtp", str(args.mtp), "--forces"]
+    hand = swift_worker.spawn(
+        args.model,
+        kv=args.kv,
+        head=args.head,
+        ctx_max=args.ctx_max,
+        mode=[*mode, "--trace-out", str(th)],
+        engine_dir=args.engine_dir,
+        host_tables=args.host_tables,
+    )
+    common = [str(args.model), "--ctx-max", str(args.ctx_max), "--kv", args.kv, "--head", args.head, *prompt]
+    side = ["--side", "warpc-mtp", "--trace-out", str(th), "--meta-out", str(args.out / "warpc.json")]
+    mtp = ["--mtp", str(args.mtp), "--tokens", str(args.tokens), *(["--host-tables"] if args.host_tables else [])]
+    subprocess.run([sys.executable, __file__, *common, *mtp, "--out", str(args.out), *side], check=True)
+    meta = json.loads((args.out / "warpc.json").read_text())
+    if meta["lib_sha256"] != hand["lib_sha256"]:
+        sys.exit("compare27: the two sides loaded different libraries")
+    r = meta["cell"]
+    (args.out / "summary.json").write_text(json.dumps(meta, indent=1))
+    probes = "".join("=" if p["ids_equal"] and p["logits_equal"] else "X" for p in r["probes"])
+    print(
+        f"compare27 MTP k={args.mtp} kv={args.kv} head={args.head} prompt={args.prompt_len[0]}: first {r['first']}"
+        f" start {r['start']} verify probes [T=2,3,4,8] {probes} cycles {r['cycles']} bad {r['bad_cycles']},"
+        f" {meta['tokens_per_cycle']:.3f} tokens per cycle -> {'BITWISE' if r['pass'] else 'MISMATCH'}"
+    )
+    return 0 if r["pass"] else 1
 
 
 def compare(warpc_t: dict, hand_t: dict) -> dict:
@@ -79,7 +133,9 @@ def main():
     ap.add_argument("--trace-steps", type=int, default=16)
     ap.add_argument("--out", type=Path, required=True, help="output directory")
     ap.add_argument("--engine-dir", type=Path, default=swift_worker.ENGINE_DIR)
-    ap.add_argument("--side", choices=("warpc",), help=argparse.SUPPRESS)  # internal: the warpc child
+    ap.add_argument("--mtp", type=int, default=0, help="compare greedy MTP speculation with K drafts per cycle")
+    ap.add_argument("--host-tables", action="store_true", help="--mtp: embedding and rescoring head in host memory")
+    ap.add_argument("--side", choices=("warpc", "warpc-mtp"), help=argparse.SUPPRESS)  # internal: the warpc child
     ap.add_argument("--trace-out", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--meta-out", type=Path, help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -87,6 +143,9 @@ def main():
         ap.error("one --prompt-len per comparison")
     if args.side == "warpc":
         warpc_trace(args)
+        return
+    if args.side == "warpc-mtp":
+        warpc_mtp(args)
         return
     from warpc.swiftmk import lib
 
@@ -97,8 +156,10 @@ def main():
     if sha_w != sha_h:
         sys.exit(f"compare27: library mismatch: {ours} {sha_w} vs {theirs} {sha_h} (rebuild or point both at one file)")
     args.out.mkdir(parents=True, exist_ok=True)
-    common = [str(args.model), "--ctx-max", str(args.ctx_max), "--kv", args.kv, "--head", args.head]
     prompt = ["--prompt-files", *map(str, args.prompt_files), "--prompt-len", str(args.prompt_len[0])]
+    if args.mtp:
+        sys.exit(compare_mtp(args, prompt))
+    common = [str(args.model), "--ctx-max", str(args.ctx_max), "--kv", args.kv, "--head", args.head]
     steps = ["--tokens", str(args.tokens), "--trace-steps", str(args.trace_steps)]
     tw, th = args.out / "warpc.pt", args.out / "hand.pt"
     side = ["--side", "warpc", "--trace-out", str(tw), "--meta-out", str(args.out / "warpc.json")]

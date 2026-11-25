@@ -9,6 +9,7 @@ from ..sources import Source
 from . import lib
 from .executor import SwiftmkExecutor
 from .table import HEADS, table
+from .window import with_windows
 
 
 class SwiftmkBackend:
@@ -17,11 +18,12 @@ class SwiftmkBackend:
 
     name = "swiftmk"
 
-    def __init__(self, head: str = "bf16"):
+    def __init__(self, head: str = "bf16", *, window: bool = False):
+        """window: the table also has the window prefill kernels (`swiftmk.window`; fla and vllm at run time)."""
         if head not in HEADS:
             raise ValueError(f"unknown head {head!r} (known: {', '.join(HEADS)})")
         self.head = head
-        self.caps = table(head)
+        self.caps = with_windows(table(head)) if window else table(head)
 
     def executor(self, graph: Graph, plan: Plan, source: Source) -> SwiftmkExecutor:
         return SwiftmkExecutor(lib.load(), graph, plan, source)

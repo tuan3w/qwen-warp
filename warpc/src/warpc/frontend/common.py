@@ -52,8 +52,9 @@ def text_prefix(source: Source) -> str:
 def head(
     g: Graph, source: Source, missing: list[str], x: str, prefix: str, *, softcap: float | None = None, **norm
 ) -> None:
-    """Final norm, lm_head (the embedding if tied), fp32 logits (softcapped if `softcap`) and their argmax as the
-    graph outputs; then the missing-tensor report and the verification every family ends with."""
+    """Final norm, lm_head (the embedding if tied), fp32 logits (softcapped if `softcap`) and their argmax; the graph
+    outputs are those and the final-norm rows `hidden`; then the missing-tensor report and the verification every
+    family ends with."""
     c = source.config
     x = rmsnorm(g, source, missing, x, "final_norm", f"{prefix}norm.weight", c.hidden_size, name="hidden", **norm)
     tensor = f"{prefix}embed_tokens.weight" if c.tie_embeddings else "lm_head.weight"
@@ -61,7 +62,7 @@ def head(
     logits = g.op("cast", [lm], dtype="f32", name="logits")
     if softcap:
         logits = g.op("softcap", [logits], cap=float(softcap), name="logits")
-    g.output(logits=logits, ids=g.op("argmax", [logits], name="ids"))
+    g.output(hidden=x, logits=logits, ids=g.op("argmax", [logits], name="ids"))
     finish(g, missing)
 
 

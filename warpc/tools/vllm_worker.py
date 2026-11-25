@@ -9,7 +9,10 @@ MODEL is an HF checkpoint directory or a GGUF file (then --tokenizer names the H
 the tokenizer and the config). Everything else is vLLM's default: torch.compile and CUDA graphs, as `vllm serve` runs.
 The options of the 27B protocol: --kv-cache-dtype (fp8 takes the checkpoint's scales), --language-model-only (no
 vision tower), --mtp K (the checkpoint's MTP head drafting K tokens); a run with any of them also uses max_num_seqs 1
-and no prefix caching, and reports the served KV capacity (num_gpu_blocks x block_size).
+and no prefix caching, and reports the served KV capacity (num_gpu_blocks x block_size). With --mtp every bench cell
+also reports the speculation of its timed rounds (tokens_per_cycle = 1 + accepted drafts per draft step, cycles,
+accepted_per_position = accepted / cycles at each draft position, all from vLLM's spec-decode counters) and the GiB of
+device memory of the engine-core process (device_gib).
 
 bench: greedy decode of --tokens tokens (EOS ignored), one warm-up round, then --repeats rounds, per prompt. The rate of
 a round is vLLM's own decode time: (tokens - 1) / (last_token_ts - first_token_ts) from RequestOutput.metrics, the
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import tempfile
@@ -95,19 +99,66 @@ def capacity(llm) -> dict:
     }
 
 
-def bench(llm, prompt: list[int], tokens: int, repeats: int) -> dict:
+def spec_counters(llm) -> list[int]:
+    """vLLM's cumulative [draft steps, accepted drafts, accepted at draft position 0, 1, ...] over all requests."""
+    drafts = accepted = 0
+    per_pos: list[int] = []
+    for m in llm.get_metrics():
+        if m.name == "vllm:spec_decode_num_drafts":
+            drafts += m.value
+        elif m.name == "vllm:spec_decode_num_accepted_tokens":
+            accepted += m.value
+        elif m.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            per_pos = m.values
+    return [drafts, accepted, *per_pos]
+
+
+def engine_memory(worker) -> dict:
+    """Runs inside the engine-core worker process: GiB resident for this process on the device (NVML: CUDA context,
+    weights, KV cache, graphs, scratch) and torch's allocator figures; the peak is the allocator's since the start
+    of the KV sizing profile run."""
+    import os
+
+    import pynvml
+    import torch
+
+    gib = 2.0**30
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{torch.cuda.get_device_properties(worker.device).uuid}")
+    resident = next(
+        p.usedGpuMemory for p in pynvml.nvmlDeviceGetComputeRunningProcesses(handle) if p.pid == os.getpid()
+    )
+    return {
+        "resident": resident / gib,
+        "torch_allocated": torch.cuda.memory_allocated(worker.device) / gib,
+        "torch_peak_reserved": torch.cuda.max_memory_reserved(worker.device) / gib,
+    }
+
+
+def bench(llm, prompt: list[int], tokens: int, repeats: int, mtp: int = 0) -> dict:
     from vllm import SamplingParams
 
     params = SamplingParams(max_tokens=tokens, temperature=0.0, ignore_eos=True)
     rates = []
-    for _ in range(repeats + 1):
+    for i in range(repeats + 1):
         (out,) = llm.generate([{"prompt_token_ids": prompt}], params, use_tqdm=False)
         m = out.metrics
         if m is None:
             raise RuntimeError("vLLM returned no request metrics")
         n = len(out.outputs[0].token_ids)
         rates.append((n - 1) / (m.last_token_ts - m.first_token_ts))
-    return {"rates": rates[1:]}
+        if i == 0 and mtp:
+            before = spec_counters(llm)  # the warm-up round is not counted
+    result = {"rates": rates[1:]}
+    if mtp:
+        drafts, accepted, *per_pos = (a - b for a, b in zip(spec_counters(llm), before, strict=True))
+        result |= {
+            "tokens_per_cycle": 1 + accepted / drafts,
+            "cycles": drafts,
+            "accepted_per_position": [n / drafts for n in per_pos],
+            "device_gib": llm.collective_rpc(engine_memory)[0],
+        }
+    return result
 
 
 def greedy(llm, prompts: list[list[int]], tokens: int) -> dict:
@@ -138,15 +189,17 @@ def main():
     g.add_argument("--prompts", type=json.loads, required=True, help="JSON list of token id lists")
     g.add_argument("--tokens", type=int, required=True)
     args = ap.parse_args()
+    if args.mtp:
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"  # engine_memory is shipped to the engine-core process
     llm = engine(args.model, args.tokenizer, args.ctx_max, args)
     if args.mode == "bench" and args.prompts_file:
         cells = {}
         for name, ids in json.loads(args.prompts_file.read_text()).items():
-            cell = bench(llm, ids, args.tokens, args.repeats)
+            cell = bench(llm, ids, args.tokens, args.repeats, args.mtp)
             cells[name] = {**cell, "tok_s": statistics.median(cell["rates"]), "max_model_len": args.ctx_max}
         result = {"cells": cells, "capacity": capacity(llm)}
     elif args.mode == "bench":
-        result = bench(llm, args.prompt, args.tokens, args.repeats)
+        result = bench(llm, args.prompt, args.tokens, args.repeats, args.mtp)
     else:
         result = greedy(llm, args.prompts, args.tokens)
     args.out.write_text(json.dumps({"vllm": version("vllm"), **result}))

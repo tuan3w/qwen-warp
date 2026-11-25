@@ -140,6 +140,7 @@ CAPS = [
         tolerance=("linear.out", "argmax.out"),
         launches=5,
         constants=_consts,
+        gather=("w",),  # warpc_headq_select rescores the candidate rows only; the int4 copy wq is scanned
         emit=_emit,
     ),
 ]

@@ -234,6 +234,21 @@ def _emit_head(kernel: str):
     return emit
 
 
+def _emit_w4_head(m, A):
+    ln, cast, amax = A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[1])
+    w = A.graph.weights[ln.attrs["weight"]]
+    return Region(
+        "s_w4_head",
+        set(m.covers),
+        ins={"x": ln.ins[0]},
+        outs={"logits": cast.outs[0], "ids": amax.outs[0]},
+        weights={"w": w.name},
+        packs=[Pack(w.name, "w4r", [w.name])],
+        attrs={"N": w.shape[0], "K": w.shape[1]},
+        numerics=NUM_W4 + "; fp32 logits = the fp32 accumulator, argmax lowest index on ties",
+    )
+
+
 # ------------------------------------------------------------------------------------------------ DeltaNet
 
 
@@ -543,6 +558,18 @@ CAPS = [
         emit=_emit_w4,
     ),
     Cap(
+        "s_w4_head",
+        "linear",
+        anchor_schemes=("w4g128",),
+        post=_HEAD_POST,
+        limits=_W4_LIMITS,
+        rounds={"cast": ("out",)},
+        tolerance=("linear.out",),
+        launches=2,
+        constants=_head_consts,
+        emit=_emit_w4_head,
+    ),
+    Cap(
         "s_head",
         "linear",
         anchor_schemes=("dense",),
@@ -564,6 +591,7 @@ CAPS = [
         tolerance=("linear.out", "argmax.out"),
         launches=2,
         constants=_head_consts,
+        gather=("w",),  # smk_headq_select_rescore reads only the candidate rows; the int4 copy wq is scanned
         emit=_emit_head("s_head_refine"),
     ),
     Cap(
@@ -600,6 +628,7 @@ CAPS = [
         limits={"H_multiple": 8},
         rounds={"embed": ("out",)},
         constants=_embed_consts,
+        gather=("table",),
         emit=_emit_embed,
     ),
 ]

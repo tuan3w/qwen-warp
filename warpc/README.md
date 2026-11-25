@@ -21,7 +21,7 @@ model = warpc.compile("Qwen3-0.6B-Q4_0.gguf", ctx_max=4096)  # or an HF checkpoi
 tokens = model.generate([785, 6722, 315, 9625, 374], max_new_tokens=24)
 ```
 
-Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits` and `reset` give step-level control.
+Token ids in, token ids out (no tokenizer). `append`, `step`, `decode`, `logits` and `reset` give step-level control.
 `compile(..., backend=...)` lowers onto another backend (default `CudaBackend()`).
 
 ## Scope
@@ -42,7 +42,10 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
   dequantising GEMV; every other weight is bf16.
 - KV cache: `bf16`, `k8v8`, `k8v8w`, `k8v4w`, `int4_rot` (the hand engine's 4-bit format, bit-identical bytes at head dim
   256); `fp8` (the checkpoint's per-layer scales) in the reference only.
-- Greedy decode of one sequence; prompt steps of up to 8 rows.
+- Greedy decode of one sequence; prompt steps of up to 8 rows, or with `compile(window_rows=N)` on the swiftmk backend
+  windows of up to 4,096 rows ([Long-context agent loops](#long-context-agent-loops)).
+- Qwen3.5 27B only: greedy speculation with the checkpoint's MTP head, `compile(speculate=3)`
+  ([MTP speculative decoding](#mtp-speculative-decoding)).
 - Built and measured on an RTX 3090 (sm_86). Kernels compile for the GPU present; the fusion cost model uses the 3090's
   numbers.
 
@@ -58,9 +61,12 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 | `compiler/` | target-independent: the fusion pass over a capability table, lowering to a `Plan`; the `Backend` protocol |
 | `runtime.py` | `Runtime`: buffers, states, CUDA graphs, position and token feedback; the `Executor` protocol a backend implements |
 | `cuda/` | the CUDA backend: capability table, executor (launchers, weight packing), kernels; `cuda/inkling/` holds the four Inkling kernel families, one module per Qwen3.5 kernel family (`hybrid`, `w4`, `deltanet`, `attn_gated`, `head_refine`) |
-| `swiftmk/` | the `swiftmk` backend: the hand engine's kernel library behind a capability table (ctypes binding, packing) |
+| `swiftmk/` | the `swiftmk` backend: the hand engine's kernel library behind a capability table (ctypes binding, packing); `swiftmk/window.py`: the window prefill caps and launchers |
 | `composite.py` | `CompositeBackend`: two backends behind one table, the primary's kernels preferred, each task run by its owner |
 | `model.py` | `compile()` and `Model` |
+| `speculate.py`, `memory.py` | `Speculator` (the MTP cycle program, rollback, snapshots, the `Decoder` of `compile(speculate=k)`), the pre-flight memory estimate (torch's cached-free device memory counts as free) |
+| `prefix.py`, `windows.py`, `windowrt.py` | `PrefixCache` (snapshots, device lineage, pinned-host store), `plan_windows` (the prefill segmentation), `WindowVariant` (the eager window plan of a `Runtime`; keeps no reference back to it) |
+| `pinned.py` | every pinned host allocation (host tables, snapshots, KV chunks): exact size, unpinned and unmapped when the last reference goes; `live_bytes()` |
 
 The kernel library is built with nvcc on first use and cached by source digest and GPU architecture.
 
@@ -92,6 +98,14 @@ uv run --package warpc python warpc/tests/test_w4.py
 uv run --package warpc python warpc/tests/test_deltanet.py
 uv run --package warpc python warpc/tests/test_attn_gated.py
 uv run --package warpc python warpc/tests/test_head_refine.py
+uv run --package warpc python warpc/tests/test_prefix.py    # CPU: the prefix cache against a fake decoder
+uv run --package warpc python warpc/tests/test_windows.py   # CPU: plan_windows against the hand engine's planner
+uv run --package warpc python warpc/tests/test_window.py    # CPU, $WARPC_TEST_SWIFT27: the 27B lowers onto the window caps
+uv run --package warpc python warpc/tests/test_longctx.py   # GPU, $WARPC_SWIFTMK_LIB, $WARPC_TEST_SWIFT27: resume == cold, models dropped and rebuilt (one process)
+uv run --package warpc python warpc/tests/test_pinned.py    # GPU: pinned host memory of exact size, released by refcount
+uv run --package warpc python warpc/tests/test_requantize.py  # CPU; GPU, $WARPC_SWIFTMK_LIB: the MTP head's packs == the hand packer's
+uv run --package warpc python warpc/tests/test_glue.py        # GPU: the concat / select_row / take kernels
+uv run --package warpc python warpc/tests/test_speculate.py   # GPU, $WARPC_SWIFTMK_LIB, $WARPC_TEST_SWIFT27: accept program, exactness, resume
 ```
 
 | Variable | Effect |
@@ -123,6 +137,212 @@ side stream beside the qkv|z GEMV. KV caches: `bf16`, `fp8` (checkpoint scales),
 library file, prompt ids, `ctx_max` and 8-row prompt steps, and checks all 256 greedy ids and the fp32 logits of the
 first 16 head steps for equality. `warpc/tools/bench.py` measures warpc, the hand engine (`swift-engine`) and vLLM on long
 prompts (`--prompt-files`, `--prompt-len`).
+
+## MTP speculative decoding
+
+`warpc.compile(path, ..., speculate=3)` loads the checkpoint's MTP head and returns a `Model` whose decoder is a
+`Speculator`: greedy decode in which the head drafts k <= 3 tokens, the target verifies k + 1 rows in one step, the
+accepted prefix stays and the rest is rolled back by not advancing. The head (`mtp.*`: `fc` and one full-attention layer,
+re-quantised to W4G128 by `sources/requantize.py`, the hand engine's packer; the draft head is `lm_head` restricted to
+the engine's 68,864-id draft vocabulary, shipped in `sources/data/`) is a second graph in the same IR with its own KV
+state. It needs a backend whose DeltaNet keeps pending rows: the hand kernels do all model compute and
+warpc owns the cycle (`CompositeBackend(CudaBackend("int4_refine"), SwiftmkBackend("int4_refine"), kernels=["g_select_row",
+"g_take", "g_concat"])`, the three warpc data-movement kernels).
+
+```python
+GLUE = ["g_select_row", "g_take", "g_concat"]
+backend = CompositeBackend(CudaBackend("int4_refine"), SwiftmkBackend("int4_refine", window=True), kernels=GLUE)
+m = warpc.compile(
+    path, ctx_max=131_072, kv="int4_rot", backend=backend, speculate=3, host_tables=True, window_rows=4096
+)
+first = m.append(ids, ends=plan_windows(ids))  # target prefill, the MTP pair of every row, the first drafts
+out = [first, *m.decode(255, stop=[eos])]  # exactly 255 tokens, or up to the first stop id
+snap = m.snapshot()  # the turn boundary: states, anchor, hidden row (179 MiB; the KV rows are positional)
+m.append([m.decoder.anchor, *tool_ids])  # the next turn continues the cache, no re-prefill
+m.restore(snap)  # back to the boundary (the KV rows below it must be this lineage's, else `kv_import`)
+m.decoder.k = 1  # drafts per cycle, 0 = plain steps; m.decoder.stats: cycles, tokens, accepted drafts
+```
+
+One cycle is one captured CUDA graph (verify, accept, draft; the host launches 8 and reads the output ring once).
+Acceptance, the clamp to the token budget and stop ids, the positions and the ring cursors are device scalars, so a
+cycle that keeps `a` rows only advances them by `a`: KV is positional, the DeltaNet state is lazy (the hand kernel keeps
+the rows of a step as rank-1 updates until they are accepted) and the conv ring is a cursor. `decode(n)` returns exactly
+n tokens and leaves the cache holding every token before the last (`position + n`); a cycle writes target and head KV up
+to 2k - 1 rows past the clamp, so `position + n + 2k - 1 <= ctx_max` or it raises `ValueError`. `compile` estimates the
+device memory before it allocates and raises `ValueError` for a context that cannot fit.
+
+**Exactness.** Against the hand engine's MTP the cycle is bitwise: the drafts, the head's hidden rows, the verify logits
+of T = 2, 3, 4, 8 rows and every cycle's tokens and accepted count, on 60 cells (bf16 and `int4_rot` KV, 385 and 4,096
+tokens, natural acceptance and four forced-acceptance patterns; `tools/gate27.py reference|check --mtp 3`,
+`tools/compare27.py --mtp 3`). With a window prefill (`gate27.py reference|check --mtp 3 --window 4096`; the oracle is
+`FastPrefill(fold=False).prefill_spec`, 225 / 385 / 4,096 / 16,384 tokens, 120 cells) the target is still bitwise (first
+token, the verify logits of T = 2, 3, 4, 8 rows) and so are the first drafts (120 of 120 cells), but the head's KV rows
+are not: warpc commits the pairs of a window chunk through the head's 8-row graphs, the hand's fast prefill through its
+prefill kernels (the W4 mma kernel up to 240 rows, dequantisation + cuBLAS above). 0.47% of the elements of a 225-token
+prompt's rows differ (by 0.0625 at most), 57% of a 385-token one's (by 0.25 at most); which stage of the chain rounds
+differently is not isolated. The head's hidden rows are not equal in any cell and the 256 emitted tokens and accepted
+counts are equal in 80 of the 120.
+Against warpc's own plain decode the cycle is not bitwise: a verify row is computed inside a
+(k + 1)-row step, the hand kernels' rounding depends on the step's row count, and a near-tie can flip, for every k (the
+hand engine does the same: its k = 1 diverges from its own plain decode at the same token). What stays exact: k = 1 is
+bitwise equal to plain decode for as long as a T = 2 step attends the same keys with the same split-KV geometry as a
+T = 1 step (bf16: until the geometry of the kv length changes, every 80 - 320 positions; `int4_rot`: below position 495,
+where a T = 2 row reads one more key as int4 that the T = 1 step reads from the exact ring), and a cycle clamped to one
+row is the same step. Divergences at 256 tokens x 3 prompts at 385 and 3 at 4,096 tokens (`tools/near_tie.py`; a flip is
+listed with its logit margin and the shift of the verify row against the plain step, the rule being margin <= shift of
+the two best logits):
+
+| k | KV | cells equal to plain | divergences (margin of the plain top-2 logits) |
+|---|---|---|---|
+| 1 | bf16 | 5 of 6 | token 230 at 385 (0.51), after the first geometry change |
+| 1 | `int4_rot` | 4 of 6 | tokens 53 and 191 at 4,096 (0.063, 0.088) |
+| 2 | bf16 | 3 of 6 | 0.007, 0.037, 0.018 (all inside the rule) |
+| 2 | `int4_rot` | 4 of 6 | 4,096: 0.063 and 0.088 against shifts of 0.041 and 0.057: outside the rule |
+| 3 | bf16 | 2 of 6 | 0.51, 0.002, 0.037, 0.018 (all inside the rule) |
+| 3 | `int4_rot` | 3 of 6 | 385: 0.009 (inside); 4,096: 0.061 and 0.063 against 0.060 and 0.037: outside the rule |
+
+The margins are 0.09 or less except the 385-token cell at token 230,
+which the hand engine's MTP reproduces. The rule probes the plain run's state and cannot see the rounding history of
+the earlier cycles (the run's own verify row is up to 0.65 away from the plain logits there), so the cells outside it are
+listed, not explained away: an application that needs plain decode's tokens uses `decoder.k = 0`.
+
+**Memory** (`compile(host_tables=True)`: the 4.7 GiB bf16 `embed` and rescoring `lm_head` packs stay in pinned host
+memory, read by row gather only; never chosen automatically, 0 to 2% of decode speed). Device memory as the driver shows
+it (total - free, CUDA context included), `int4_rot` target KV (16,896 B per position over 16 layers) and bf16 head KV
+(4,096 B), RTX 3090:
+
+| `ctx_max` | decode only (no window plan) | with window plan (4,096 rows), after prefill and decode | the hand engine |
+|---|---|---|---|
+| 16,384 | 13.93 GiB | 15.57 GiB (19,617 positions) | |
+| 131,072 | 16.17 GiB | 18.25 GiB (134,305 positions) | 16.94 (134,072) |
+| 262,144 | 18.73 GiB | 20.92 GiB (no window has run: about 21.3 once one has) | 19.42 (261,000) |
+
+20.5 KiB per position, 13.6 GiB fixed; the window plan adds 1.2 GiB and 4 KiB per position, and 0.33 GiB when its first
+window runs. With the tables on the device (+4.7 GiB) 262,144 positions need 24.2 GiB and `compile` refuses them. The card
+has 24.0 GiB: 262,144 positions leave 5.3 GiB decode only and about 2.7 GiB with the window plan.
+
+**Speed** (RTX 3090, int4 head, `int4_rot`, host tables from 16k, 255 tokens after the first, median of 5 rounds, two
+A/B/A/B visits per cell against the hand engine's `SpecEngine` (prompt-lookup off, `state_slots=1`), both in whole groups
+of 8 cycles so that both decode the same tokens; prefill: 8-row steps up to 4,096, the window plan (warpc) / `FastPrefill`
+(hand) beyond; `tools/ab.py`):
+
+| prompt | tokens / cycle | warpc tok/s | hand tok/s | warpc / hand | cycle ms warpc / hand | plain tok/s warpc / hand | vLLM 0.34.0 MTP k=3 |
+|---|---|---|---|---|---|---|---|
+| 385 | 2.921 | 149.9 | 151.0 | 0.993 | 19.48 / 19.34 | 57.4 / 57.4 | 63.5 |
+| 4,096 | 3.238 | 165.3 | 166.5 | 0.993 | 19.59 / 19.45 | 57.1 / 57.1 | 91.0 |
+| 16,384 | 3.516 | 173.9 | 175.1 | 0.993 | 20.22 / 20.07 | 56.3 / 56.3 | 97.5 |
+| 32,768 | 3.828 | 186.6 | 188.1 | 0.992 | 20.51 / 20.35 | | refused |
+| 65,536 | 3.750 | 169.0 | 170.4 | 0.992 | 22.19 / 22.01 | | refused |
+| 131,072 | 3.216 / 3.196 | 130.5 | 131.4 | 0.993 | 24.64 / 24.32 | | refused |
+| 258,000 (position forged) | 2.882 | 99.8 | 100.3 | 0.995 (cycle time) | 28.89 / 28.73 | | refused |
+
+warpc is 0.7% behind per cycle (0.13 to 0.18 ms: the 60-launch torch accept program and three glue launches that the
+hand engine fuses into its cycle graph), 1.3% at 131,072; it decodes 2.6 to 3.1 times plain decode's speed. vLLM refuses
+a `max_model_len` above about 17.6k with MTP. The 258k cell is timing only: 385 real tokens, the position moved over the
+empty cache (the same on both sides), so acceptance means nothing there and the ratio is of the cycle time. At 131,072
+the two prefills leave head KV rows that are not equal and the acceptance differs by 0.6% (see Exactness).
+
+**Long context** (`tools/mtp_long.py`, window prefill, host tables, `int4_rot`): prefill 8.6 s at 16,384, 42.6 s at
+65,536, 107 s at 131,072; MTP decode 166 - 181 tok/s at 16k, 149 - 169 at 64k, 148 - 150 at 128k, 3.3 to 3.8 tokens per
+cycle; the agent turn (snapshot at the boundary, decode 64, restore, decode 64: equal; append the anchor and a 600-token
+tool result, decode 64, restore, repeat: equal) holds bitwise on the `Speculator` at all three.
+
+`tools/bench.py warpc --mtp 3 [--window] [--forge-position]`, `tools/ab.py`, `tools/gate27.py reference|check --mtp 3`,
+`tools/near_tie.py`, `tools/mtp_long.py` and `tests/test_speculate.py` / `test_requantize.py` / `test_glue.py` are the
+gates and measurements above.
+
+## Long-context agent loops
+
+An agent loop sends a 16k to 200k token prompt, then appends a tool result of 0.5k to 2k tokens every few seconds. Two
+things make it fast: a prefill at the hand engine's rate, and not prefilling what is already cached.
+
+```python
+from warpc.prefix import PrefixCache
+from warpc.swiftmk import SwiftmkBackend
+from warpc.windows import plan_windows
+
+backend = SwiftmkBackend("bf16", window=True)
+model = warpc.compile(path, ctx_max=131_072, kv="int4_rot", backend=backend, window_rows=4096)
+# one lineage on the device, the others in a pinned-host store of 8 GiB
+cache = PrefixCache(model.decoder, host_bytes=8 << 30, plan=plan_windows)
+first = cache.run(prompt_ids)  # restores the longest valid prefix, prefills the rest, returns the next token
+rest = cache.decode(255)  # decode through the cache: the next prompt may extend what it holds
+```
+
+**Window prefill** (`compile(window_rows=N)`, 17 to 4,096, swiftmk backend; `pip install warpc[prefill]` for the two
+libraries it calls, imported when the first window runs). The graph is lowered a second time at N rows against window
+caps (`swiftmk/window.py`), which are the hand engine's fast prefill: the repacked W4 weights are dequantised per window
+and multiplied by cuBLAS (windows of up to 240 rows use the W4 mma kernel, the MLP in blocks of 2,048 rows), the gate|up
+projection and SiLU run in the CUTLASS DualGemm, DeltaNet is fla's chunked scan, attention is FlashAttention-2 over a
+token-major bf16 copy of the history. It shares the packs, the states and the ring cursors with the decode plan and runs
+eagerly (`WindowVariant`); `append(ids, ends=...)` cuts a prompt at the absolute positions `ends` and sends every chunk
+of more than 8 rows through it (the rest, and the last token, through the 8-row graphs), calling `on_hidden` per chunk
+for the MTP pairs. Its buffers and scratch are 1.2 GiB at 4,096 rows plus 4 KiB per context position (the pre-flight
+counts them).
+
+**Exactness.** A window prefill's bits depend on the chunks (cuBLAS picks its kernel by the row count, the DeltaNet scan
+is bit-stable only across cuts at multiples of 64), so the chunks are a function of the prompt tokens:
+`plan_windows(ids)` is the hand engine's `Runner._plan` (segments of at most 4,096 rows, cut at a chat-turn header
+`<|im_start|>` + 2 when that is more than 240 rows after the previous cut; the last token is a head step). A
+`PrefixCache` snapshots only at the ends of that plan (the system checkpoint, the last turn boundary, the last ends:
+`device_snapshots` of them on the device lineage), records the plan's ends with each snapshot, and resumes a new prompt
+only at the largest snapshot at or below its common prefix - 1 whose recorded ends equal its own plan's: a resumed turn
+is bit-equal to a cold prefill of the same prompt, whatever the cache held. Spilled lineages go to a pinned-host store
+(`host_bytes`, LRU, KV rows exported in chunks that end at snapshot positions, an entry that cannot fit is refused,
+`stats.host_bytes` reports the pinned bytes). The Qwen template re-renders every earlier assistant message without its
+think tail, so each turn's prompt parts from the previous one right after the assistant header: that is why the state is
+snapshotted at the turn boundary and the lineage cannot just be appended to. `PrefixCache(exact=False)` additionally
+appends to a lineage that the new prompt extends (a loop that feeds back its own output, `Resume.source == "append"`):
+no restore, but the decoded rows were 8-row steps, so it is not bit-equal to a cold prefill. Without a window variant
+the plan is `class_d_plan` (8-row chunks from position 0, snapshots at multiples of 8, same exactness rule).
+
+**Gates** (RTX 3090, 27B INT4, `WARPC_SWIFTMK_LIB=engine/build/libswiftmk.so`):
+
+- `warpc/tools/gate_window.py reference MODEL --kv bf16|int4_rot --prompt-files engine/src/*.cu --out DIR`, then
+  `check` with the same arguments: against `FastPrefill(fold=False)`, 385 / 4,096 / 16,384 tokens x 3 disjoint slices x
+  both KV formats, the KV bytes of the 16 attention layers, every DeltaNet and conv state, the fp32 logits of the last
+  row and 256 greedy ids are all bitwise equal (18 of 18 cells). Prefill 0.32 / 1.91 / 8.1 s against the hand engine's
+  0.31 / 1.89 / 8.04 s (ratio 1.007 to 1.014).
+- `tests/test_longctx.py`: resume == cold (KV rows, states, logits, tokens) for the window plan, the 8-row plan, the host
+  tier and the MTP `Speculator`; snapshot / `kv_export` / `kv_import` / `restore` round trip byte-equal; and a model, a
+  speculator and a `PrefixCache` built and dropped four times in one process with the cyclic collector off: the device
+  memory returns to within 50 MiB of the first drop's and the pinned bytes to zero (the whole file runs in one process,
+  one 17 GiB model at a time, 2 min 43 s). A dropped model is freed by refcount: no reference cycle (a `WindowVariant`
+  keeps no reference to its `Runtime`), and every pinned allocation is `warpc.pinned`, not torch's pinned pool, which
+  rounds each block up to a power of two (two 2.4 GiB host tables held 8 GiB) and never returns one; the MTP case after
+  five other cases used to be killed by the kernel's out-of-memory killer, with no output.
+- `warpc/tools/agentloop.py` (AL-64k-20: `trace`, then `run ENGINE MODEL --trace T --mode chat`): a 65.7k-token prefix
+  (`engine/src/*.cu`), then 20 turns, each appending an assistant message and a 500 to 2,000 token tool result and
+  decoding 100 to 299 tokens; the last prompt has 92.4k tokens. `--verify-last` runs the last turn again from an empty
+  cache. Turns 1 to 19 (vLLM: 1 to 13, its cache holds 99k positions), `int4_rot` everywhere:
+
+| engine | turn 0 TTFT s | TTFT p50 / p95 s | turn p50 s (TTFT + decode) | decode tok/s | peak GPU GiB | last turn resumed == cold |
+|---|---|---|---|---|---|---|
+| warpc, window prefill + `PrefixCache`, plain decode, int4 head | 39.7 | 1.34 / 2.06 | 5.29 | 52.6 | 21.3 | yes |
+| warpc, the same with the bf16 head (`--head bf16`) | 39.8 | 1.34 / 2.06 | 5.68 | 47.4 | 20.7 | not run |
+| warpc, the same with MTP k = 3 (host tables, int4 head) | 43.0 | 1.47 / 2.27 | 3.05 | 130.7 | 17.5 | yes |
+| warpc, `exact=False` (appends to the lineage, `--mode linear`), int4 head | 39.9 | 1.09 / 1.68 | 5.13 | 52.6 | 21.3 | not claimed |
+| hand engine, snapshots, plain | 39.5 | 1.39 / 2.15 | 5.47 | 51.6 | 22.3 | yes |
+| hand engine, snapshots, MTP k = 3 | 39.4 | 1.42 / 2.17 | 3.03 | 131.1 | 22.3 | not run |
+| vLLM 0.34.0, prefix caching, fp8 KV | 43.7 | 1.93 / 3.12 | 7.81 | 41.8 | 22.2 | no (ids differ from token 217) |
+
+Plain decode against the hand engine is at parity once the conditions are equal. The 47.4 tok/s of the bf16-head row is
+the head (2.88 ms per token against 0.77 ms for the int4 head that the hand engine's `SpecEngine` always uses: 9% to 11%
+of the step at 67k to 92k positions). With the same head, KV format and positions, A/B/A/B in alternating processes
+(`tools/ab.py --mtp 0 --forge-position`, median of 5 rounds, two visits): int4 head 56.4 / 56.4 tok/s warpc / hand at
+16,384, 53.5 / 53.4 at 65,536 and 52.1 / 51.9 at 92,000 (ratio 0.999, 1.002, 1.003); bf16 head on both sides 50.4 / 50.4,
+48.1 / 48.0, 47.0 / 46.8 (1.000, 1.002, 1.003). The loop's 51.6 for the hand engine is low by its harness: the `Runner`
+decodes in groups of 8 tokens, and a turn whose token count is not a multiple of 8 pays for the rest of its last group
+(the three turns with a multiple read 52.6 to 53.1, the others 49.9 to 52.8); per decoded token its median is 52.4,
+warpc's 52.6.
+
+A turn re-prefills 0.7k to 2.1k tokens (98.2% of each prompt is cached) at about 1,400 tokens/s; in a profile of a
+resumed 1.5k-token turn at a 17k context the GPU is busy 98.7% of its wall time, so what is left to gain is in the
+kernels (the dequantisation per window is 12% of that turn), not in the host. Peak memory at a 131k-token context (a window of 4,096 rows at position
+125,000, then decode): 21.3 GiB with the bf16 head and the tables on the device, 17.2 GiB with `host_tables=True` and the
+int4 head, 18.2 GiB with MTP k = 3 on top of that. A window of 4,096 rows takes 3.8 s that deep (attention over 125k keys).
+`warpc/tools/agentloop.py run warpc` takes `--window-rows`, `--mtp`, `--host-tables`, `--backend`, `--cache
+prefix|lineage|none`; one process per engine, the GPU is exclusive.
 
 ## Inkling-2-Mini
 
@@ -216,6 +436,7 @@ match the same nodes and the second's elsewhere (`kernels=` admits a subset: the
 | `g_deltanet` (`deltanet`) | `swiftmk_deltanet_step_lazy2` | conv + SiLU in fp32, the hand's summation trees; plain in-place state | bitwise, T 1..8, 1,025 real decode steps on 3 layers |
 | `g_attn_gated` (`attn_gated`) | `swiftmk_attn_step` (bf16 and `int4_rot` caches) | fp64 rope angles, the hand's split geometry and, for `int4_rot`, its fp16 score accumulation | KV buffers equal byte for byte, outputs bitwise, T 1..8, ctx 385 to 16k |
 | `g_head_refine` (`head_refine`) | `smk_headq_gemv` + `smk_headq_select_rescore` | int4 head, top 16 rescored exactly | candidates, exact logits, logits buffer and ids bitwise |
+| `g_concat`, `g_select_row`, `g_take` (`move`) | the MTP draft graph's data movement (`concat`, `select_row`, `take`) | bytes copied; an id is an exact fp32 integer (ids < 2^24) | bitwise against torch indexing, T 1..8, every id of a 68,864-entry table |
 
 `warpc/tools/gate27.py` is the end-to-end gate: `reference` records the hand engine's ids and logits on 3 disjoint prompts
 of 385 and 4,096 tokens (256 greedy ids, fp32 logits of the first 16 head steps), `check --backend cuda|composite

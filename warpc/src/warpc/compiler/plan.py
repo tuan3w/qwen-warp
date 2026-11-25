@@ -43,6 +43,7 @@ class Task:
     covers: list[int] = field(default_factory=list)  # graph nodes this task implements
     numerics: str = ""  # the kernel's numerics, prose
     tolerance: tuple[str, ...] = ()  # reference rounding points ("op.point") the kernel does not reproduce
+    gather: tuple[str, ...] = ()  # weight roles the kernel reads only by row gather (its Cap's `gather`)
 
 
 @dataclass
