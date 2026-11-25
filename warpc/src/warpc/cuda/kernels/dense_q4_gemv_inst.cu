@@ -1,18 +1,19 @@
-// The k_q4_gemv instantiations, one object per (T set, mode): the Makefile compiles this file once for each with
-// -DQ4GEMV_SET=T1|T2|T3_5|T6_8 -DQ4GEMV_MODE=0|1|3. The launched set is what launch_q4_gemv_t (dense_q4_gemv.cu) reaches:
-// T 1..8, rows per warp 1, 2, 4, K-loop unroll 4.
+// The k_q4_gemv instantiations, one object per (format, T set, mode): the Makefile compiles this file once for each with
+// -DQ4GEMV_FMT=0|1 -DQ4GEMV_SET=T1|T2|T3_5|T6_8 -DQ4GEMV_MODE=0|1|3. The launched set is what launch_q4_gemv_t (dense_q4_gemv.cu) reaches:
+// T 1..8, rows per warp 1 and 2 with 1 / 2 pairs of rounds in flight per lane (measured on the Llama-3.1-8B and Qwen3-4B shapes at T = 1: 2 rows
+// need the second pair to hide the load latency, one row is best without it).
 #include "dense_q4_gemv.cuh"
 
-template <int T, int RPW, int MODE>
+template <int FMT, int T, int RPW, int MODE>
 void warpc_inst_q4_gemv(const Q4GemvP& p, int grid, cudaStream_t st) {
-  k_q4_gemv<T, RPW, MODE, 4><<<grid, GEMV_WARPS * 32, 0, st>>>(p);
+  k_q4_gemv<FMT, T, RPW, MODE, RPW><<<grid, GEMV_WARPS * 32, 0, st>>>(p);
 }
 
-#ifndef Q4GEMV_SET
-#error "compile with -DQ4GEMV_SET=T1|T2|T3_5|T6_8 -DQ4GEMV_MODE=0|1|3"
+#if !defined(Q4GEMV_SET) || !defined(Q4GEMV_MODE) || !defined(Q4GEMV_FMT)
+#error "compile with -DQ4GEMV_FMT=0|1 -DQ4GEMV_SET=T1|T2|T3_5|T6_8 -DQ4GEMV_MODE=0|1|3"
 #endif
-#define Q4INST(T, R, M) template void warpc_inst_q4_gemv<T, R, M>(const Q4GemvP&, int, cudaStream_t);
-#define Q4INST_R(T, M) Q4INST(T, 1, M) Q4INST(T, 2, M) Q4INST(T, 4, M)
+#define Q4INST(T, R, M) template void warpc_inst_q4_gemv<Q4GEMV_FMT, T, R, M>(const Q4GemvP&, int, cudaStream_t);
+#define Q4INST_R(T, M) Q4INST(T, 1, M) Q4INST(T, 2, M)
 #define Q4GEMV_SET_T1(M) Q4INST_R(1, M)
 #define Q4GEMV_SET_T2(M) Q4INST_R(2, M)
 #define Q4GEMV_SET_T3_5(M) Q4INST_R(3, M) Q4INST_R(4, M) Q4INST_R(5, M)

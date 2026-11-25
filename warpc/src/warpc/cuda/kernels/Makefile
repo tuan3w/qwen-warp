@@ -22,13 +22,15 @@ HDR := $(wildcard *.cuh)
 SRC := $(filter-out %_inst.cu,$(wildcard *.cu))
 OBJS := $(patsubst %.cu,$(OBJ)/%.o,$(SRC))
 
-# k_gemv, k_ks and k_q4_gemv: one object per (T set, mode), rows per warp 1, 2, 4 in each (k_ks: per T set)
+# k_gemv, k_ks and k_q4_gemv: one object per (T set, mode) (k_q4_gemv: and format), rows per warp 1, 2, 4 in each
+# (k_ks: per T set)
 GEMV_SETS := T1 T2 T3_5 T6_8
 GEMV_MODES := 0 1 2 3 4
 GEMV_OBJS := $(foreach m,$(GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_gemv_inst_$(s)_m$(m).o))
 KS_OBJS := $(foreach s,$(GEMV_SETS),$(OBJ)/dense_ks_gemv_inst_$(s).o)
 Q4GEMV_MODES := 0 1 3
-Q4GEMV_OBJS := $(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_q4_gemv_inst_$(s)_m$(m).o))
+Q4GEMV_FMTS := 0 1
+Q4GEMV_OBJS := $(foreach f,$(Q4GEMV_FMTS),$(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_q4_gemv_inst_$(s)_m$(m)_f$(f).o)))
 
 # attention: one object per (head dim, part); parts 1 bf16 split + reduce, 2 chunked bf16, 4 quantised prep + merge,
 # 8 / 16 quantised split with 8-bit / 4-bit V, 32 int4_rot prep + split, 64 the one-row decode of head dims 256 / 512
@@ -57,8 +59,8 @@ $(foreach s,$(GEMV_SETS),$(eval $(OBJ)/dense_ks_gemv_inst_$(s).o: DEFS = -DGEMV_
 
 $(Q4GEMV_OBJS): $(OBJ)/%.o: dense_q4_gemv_inst.cu $(HDR)
 	@$(CC_CACHED)
-$(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),\
-  $(eval $(OBJ)/dense_q4_gemv_inst_$(s)_m$(m).o: DEFS = -DQ4GEMV_SET=$(s) -DQ4GEMV_MODE=$(m))))
+$(foreach f,$(Q4GEMV_FMTS),$(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),\
+  $(eval $(OBJ)/dense_q4_gemv_inst_$(s)_m$(m)_f$(f).o: DEFS = -DQ4GEMV_SET=$(s) -DQ4GEMV_MODE=$(m) -DQ4GEMV_FMT=$(f)))))
 
 $(ATTN_OBJS): $(OBJ)/%.o: dense_attn_inst.cu $(HDR)
 	@$(CC_CACHED)

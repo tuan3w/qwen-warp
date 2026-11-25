@@ -1,8 +1,8 @@
 """The semantic graph and its op vocabulary."""
 
 from .graph import (
-    Q4_0_BLOCK_BYTES,
-    Q4_0_BLOCK_ELEMS,
+    BLOCK_FORMATS,
+    K_MULTIPLE,
     STATE_DTYPE,
     W4G128_GROUP,
     Graph,
@@ -18,9 +18,9 @@ from .graph import (
 from .ops import OPS
 
 __all__ = [
+    "BLOCK_FORMATS",
+    "K_MULTIPLE",
     "OPS",
-    "Q4_0_BLOCK_BYTES",
-    "Q4_0_BLOCK_ELEMS",
     "STATE_DTYPE",
     "W4G128_GROUP",
     "Graph",

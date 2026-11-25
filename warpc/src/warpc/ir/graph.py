@@ -11,10 +11,12 @@ from dataclasses import dataclass, field
 
 Dim = int | str
 DTYPES = ("bf16", "f32", "i32")
-SCHEMES = ("dense", "q4_0", "w4g128", "f32")
-# GGUF Q4_0 block: one fp16 scale and 32 4-bit codes
-Q4_0_BLOCK_ELEMS = 32
-Q4_0_BLOCK_BYTES = 18
+# GGUF block formats the fused kernels read, by scheme: (elements, bytes) per block. q4_0: an fp16 scale and 32 4-bit
+# codes; q4_1: scale, minimum and 32 codes; q6_k: 256 6-bit codes, 16 int8 sub-scales and an fp16 scale
+BLOCK_FORMATS = {"q4_0": (32, 18), "q4_1": (32, 20), "q6_k": (256, 210)}
+# the columns a fused kernel takes at a time: a matrix of another width is widened to bf16 instead
+K_MULTIPLE = {"q4_0": 512, "q4_1": 512, "q6_k": 256}
+SCHEMES = ("dense", *BLOCK_FORMATS, "w4g128", "f32")
 # compressed-tensors pack-quantized int4, symmetric: one bf16 scale per 128 columns, no zero point
 W4G128_GROUP = 128
 STATE_KINDS = ("kv", "conv", "recurrent")
@@ -36,10 +38,10 @@ class TType:
 class WeightDecl:
     """A read-only tensor of logical shape `shape`, read from `source` (a full HF tensor name).
 
-    scheme "dense": the source tensor in bf16; "q4_0": the source's on-disk GGUF Q4_0 blocks (`Source.raw`);
-    "w4g128": the source's int4 codes packed 8 per int32 word and bf16 scales of 128 columns (`Source.raw`); "f32": the
-    source's exact fp32 values (`Source.get(name, torch.float32)`), 4 bytes per element on the device. "dense" and
-    "w4g128" may be rank 3, [E, N, K]: E stacked expert matrices.
+    scheme "dense": the source tensor in bf16; a `BLOCK_FORMATS` scheme: the source's on-disk GGUF blocks
+    (`Source.raw`); "w4g128": the source's int4 codes packed 8 per int32 word and bf16 scales of 128 columns
+    (`Source.raw`); "f32": the source's exact fp32 values (`Source.get(name, torch.float32)`), 4 bytes per element on
+    the device. "dense" and "w4g128" may be rank 3, [E, N, K]: E stacked expert matrices.
     """
 
     name: str
@@ -56,8 +58,9 @@ class WeightDecl:
     @property
     def nbytes(self) -> int:
         """Bytes of the weight on device in its scheme."""
-        if self.scheme == "q4_0":
-            return self.shape[0] * self.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
+        if self.scheme in BLOCK_FORMATS:
+            elems, nbytes = BLOCK_FORMATS[self.scheme]
+            return self.shape[0] * self.shape[1] // elems * nbytes
         if self.scheme == "w4g128":
             k = self.shape[-1]
             return math.prod(self.shape[:-1]) * (k // 2 + k // W4G128_GROUP * 2)

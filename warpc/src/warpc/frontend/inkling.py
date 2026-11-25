@@ -39,7 +39,14 @@ def build(source: Source, *, ctx_max: int, rows_max: int, kv: str) -> Graph:
         """Each weight is declared once; the three passes share it."""
         if decl not in declared:
             declared[decl] = common.weight(
-                g, source, missing, decl, PREFIX + tensor, shape, linear=linear, scheme="f32" if exact else None
+                g,
+                source,
+                missing,
+                decl,
+                PREFIX + tensor,
+                shape,
+                schemes=common.LINEAR_SCHEMES if linear else (),
+                scheme="f32" if exact else None,
             )
         return declared[decl]
 

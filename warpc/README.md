@@ -38,8 +38,9 @@ Token ids in, token ids out (no tokenizer). `append`, `step`, `decode`, `logits`
   and a sliding window, short convolutions, a 128-expert W4G128 MoE): compiled and run on the CUDA backend from the INT4
   checkpoint, with the reference interpreter checked against the official implementation ([Inkling-2-Mini](#inkling-2-mini)).
 - GGUF: F32, F16, BF16, Q8_0, Q4_0 and Q4_1 are decoded by warpc, bit-identical to ggml; other block formats go through the
-  `gguf` package; IQ formats are rejected. Q4_0 linears stay in their 18-byte blocks on the device and run a fused
-  dequantising GEMV; every other weight is bf16.
+  `gguf` package; IQ formats are rejected. Q4_0 and Q4_1 linears (K a multiple of 512) and a Q6_K lm_head (K a multiple
+  of 256) are repacked at load time into 16-byte-aligned planes of the bytes they have on disk and run fused dequantising
+  GEMVs; every other weight is bf16.
 - KV cache: `bf16`, `k8v8`, `k8v8w`, `k8v4w`, `int4_rot` (the hand engine's 4-bit format, bit-identical bytes at head dim
   256); `fp8` (the checkpoint's per-layer scales) in the reference only.
 - Greedy decode of one sequence; prompt steps of up to 8 rows, or with `compile(window_rows=N)` on the swiftmk backend
@@ -517,26 +518,26 @@ results into `$WARPC_MODELS/matrix.json`; a failing measurement is recorded with
 | model | format | top-1 | rel. L2 | greedy = vLLM 0.34.0 | greedy = llama.cpp | warpc 512 | warpc 4096 | llama.cpp 512 | llama.cpp 4096 | vLLM 0.34.0 512 | vLLM 0.34.0 4096 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-0.6B | HF bf16 | 97.4% | 0.0244 | 9/64 13/64 12/64 64/64, margin ≤ 0.26 | – | 585 | 577 | – | – | 424 | 412 |
-| Qwen3-0.6B | GGUF Q4_0 | 98.3% | 0.0193 | – | 0/64 1/64 6/64 16/64, margin ≤ 0.67 | 699 | 689 | 563 | 559 | [1] | [1] |
+| Qwen3-0.6B | GGUF Q4_0 | 98.3% | 0.0207 | – | 0/64 1/64 6/64 16/64, margin ≤ 1.03 | 938 | 922 | 564 | 560 | [1] | [1] |
 | Qwen3-0.6B | GGUF Q8_0 | 99.1% | 0.0170 | – | 14/64 12/64 64/64 64/64, margin ≤ 0.16 | 585 | 577 | 498 | 496 | [1] | [1] |
 | Qwen3-1.7B | HF bf16 | 97.4% | 0.0273 | 64/64 15/64 54/64 50/64, margin ≤ 0.09 | – | 231 | 230 | – | – | 194 | 191 |
-| Qwen3-1.7B | GGUF Q4_0 | 100.0% | 0.0292 | – | 7/64 13/64 54/64 61/64, margin ≤ 0.35 | 334 | 331 | 390 | 390 | [1] | [1] |
+| Qwen3-1.7B | GGUF Q4_0 | 100.0% | 0.0238 | – | 7/64 13/64 54/64 61/64, margin ≤ 0.28 | 504 | 498 | 390 | 391 | [1] | [1] |
 | Qwen3-1.7B | GGUF Q8_0 | 100.0% | 0.0398 | – | 13/64 10/64 27/64 64/64, margin ≤ 0.70 | 231 | 230 | 290 | 290 | [1] | [1] |
 | Qwen3-4B | HF bf16 | 100.0% | 0.0297 | 64/64 40/64 64/64 64/64, margin ≤ 0.04 | – | 102 | 101 | – | – | 88 | 88 |
-| Qwen3-4B | GGUF Q4_0 | 99.1% | 0.0237 | – | 13/64 64/64 21/64 64/64, margin ≤ 0.38 | 163 | 161 | 219 | 218 | [1] | [1] |
+| Qwen3-4B | GGUF Q4_0 | 99.1% | 0.0220 | – | 13/64 64/64 21/64 64/64, margin ≤ 0.42 | 253 | 251 | 219 | 219 | [1] | [1] |
 | Qwen3-4B | GGUF Q8_0 | 100.0% | 0.0255 | – | 17/64 34/64 0/64 64/64, margin ≤ 0.17 | 102 | 101 | 148 | 147 | [1] | [1] |
 | Qwen3-8B | HF bf16 | 99.1% | 0.0208 | 56/64 64/64 19/64 64/64, margin ≤ 0.10 | – | 55 | 54 | – | – | 51 | 51 |
-| Qwen3-8B | GGUF Q4_0 | 100.0% | 0.0144 | – | 64/64 64/64 18/64 64/64, margin ≤ 0.08 | 95 | 95 | 145 | 144 | [1] | [1] |
+| Qwen3-8B | GGUF Q4_0 | 100.0% | 0.0157 | – | 64/64 64/64 18/64 64/64, margin ≤ 0.05 | 154 | 153 | 145 | 145 | [1] | [1] |
 | Llama-3.2-1B-Instruct | HF bf16 | 98.3% | 0.0190 | 64/64 64/64 64/64 64/64 | – | 322 | 321 | – | – | 278 | 274 |
-| Llama-3.2-1B-Instruct | GGUF Q4_0 | 99.2% | 0.0157 | – | 17/64 58/64 64/64 64/64, margin ≤ 0.35 | 460 | 459 | 598 | 597 | [1] | [1] |
+| Llama-3.2-1B-Instruct | GGUF Q4_0 | 100.0% | 0.0156 | – | 17/64 58/64 64/64 64/64, margin ≤ 0.48 | 703 | 700 | 598 | 597 | [1] | [1] |
 | Llama-3.2-1B-Instruct | GGUF Q8_0 | 99.2% | 0.0145 | – | 32/64 64/64 64/64 64/64, margin ≤ 0.08 | 322 | 321 | 438 | 437 | [1] | [1] |
 | Llama-3.2-3B-Instruct | HF bf16 | 99.2% | 0.0136 | 64/64 64/64 64/64 64/64 | – | 128 | 127 | – | – | 113 | 112 |
-| Llama-3.2-3B-Instruct | GGUF Q4_0 | 100.0% | 0.0156 | – | 48/64 64/64 11/64 64/64, margin ≤ 0.18 | 210 | 209 | 284 | 284 | [1] | [1] |
+| Llama-3.2-3B-Instruct | GGUF Q4_0 | 100.0% | 0.0166 | – | 48/64 64/64 11/64 64/64, margin ≤ 0.14 | 312 | 309 | 284 | 284 | [1] | [1] |
 | Llama-3.2-3B-Instruct | GGUF Q8_0 | 100.0% | 0.0151 | – | 64/64 39/64 64/64 64/64, margin ≤ 0.03 | 128 | 128 | 190 | 190 | [1] | [1] |
 | Llama-3.1-8B-Instruct | HF bf16 | 100.0% | 0.0154 | 64/64 64/64 11/64 64/64, margin ≤ 0.03 | – | 56 | 56 | – | – | 53 | 53 |
-| Llama-3.1-8B-Instruct | GGUF Q4_0 | 99.2% | 0.0128 | – | 64/64 8/64 64/64 30/64, margin ≤ 0.61 | 98 | 98 | 153 | 153 | [1] | [1] |
+| Llama-3.1-8B-Instruct | GGUF Q4_0 | 100.0% | 0.0128 | – | 64/64 8/64 11/64 30/64, margin ≤ 0.70 | 160 | 158 | 153 | 153 | [1] | [1] |
 | Mistral-7B-Instruct-v0.3 | HF bf16 | 100.0% | 0.0057 | 64/64 64/64 64/64 21/64, margin ≤ 0.02 | – | 59 | 59 | – | – | 56 | 55 |
-| Mistral-7B-Instruct-v0.3 | GGUF Q4_0 | 100.0% | 0.0044 | – | 64/64 64/64 64/64 64/64 | 110 | 109 | 165 | 165 | [1] | [1] |
+| Mistral-7B-Instruct-v0.3 | GGUF Q4_0 | 100.0% | 0.0043 | – | 64/64 64/64 64/64 64/64 | 174 | 172 | 166 | 165 | [1] | [1] |
 
 [1] `RuntimeError: vLLM: huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or
 'namespace/repo_name': 'MODEL'.` vLLM 0.34.0 has no GGUF loader: it takes the file (passed as `model`, with the HF
@@ -547,11 +548,13 @@ directory as `tokenizer` and `hf_config_path`) for a Hub repository id.
   products rounding the activations to 8 bits.
 - bf16: warpc decodes 6 to 40% faster than vLLM (Llama-3.1-8B: 56 against 53 tok/s, about 15 GB of weights per token,
   850 GB/s).
-- GGUF: llama.cpp is 1.17 to 1.56 times faster on every file but Qwen3-0.6B's, where warpc is 1.2 times faster. A Q8_0
-  file runs as bf16 in warpc, at the bf16 checkpoint's speed. On a Q4_0 file the tensors in other formats are widened to
-  bf16 (the Q6_K output or embedding matrix, a few Q4_1 matrices), and the fused Q4_0 GEMV streams far below the bf16
-  path: Llama-3.1-8B reads about 5.3 GB per token at 98 tok/s, 520 GB/s.
-- `ctx_max` 4096 costs warpc at most 1.5% against 512.
+- GGUF Q4_0: warpc decodes 1.05 to 1.66 times faster than llama.cpp on every file. Llama-3.1-8B reads 4.37 GB per
+  token (Q4_0 linears 3.79, Q4_1 0.15, Q6_K head 0.43) at 160 tok/s, 700 GB/s of the card's 936 (at most 214 tok/s);
+  Qwen3-4B, 2.37 GB, 253 tok/s, 600 GB/s. The GEMVs run at 780 to 850 GB/s on the large matrices and 600 to 700 on the
+  small ones (a read-only kernel with the same access pattern reaches 800 to 850), the rest is the launch gaps and
+  attention. A Q8_0 file runs as bf16 in warpc, at the bf16 checkpoint's speed: llama.cpp is 1.26 to 1.48 times faster
+  there (warpc is 1.17 times faster on Qwen3-0.6B's).
+- `ctx_max` 4096 costs warpc at most 2% against 512.
 
 ### Qwen3.5 27B against the hand engine
 

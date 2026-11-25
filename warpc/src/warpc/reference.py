@@ -3,8 +3,9 @@
 Norms, softmax, the KV cache numerics and the Gated DeltaNet recurrence are fp32 inside; everything else runs in the
 activation dtype (bf16 for real models, fp32 in tests where it makes the comparison with transformers tight).
 
-Weights: dense and q4_0 weights are the source's (dequantised) values in the declared shape; a w4g128 weight stays
-packed on the device and is dequantised to fp32 per use, so a large checkpoint's reference holds about its packed size.
+Weights: dense and GGUF block-format (q4_0, q4_1, q6_k) weights are the source's (dequantised) values in the declared
+shape; a w4g128 weight stays packed on the device and is dequantised to fp32 per use, so a large checkpoint's reference
+holds about its packed size.
 """
 
 from __future__ import annotations

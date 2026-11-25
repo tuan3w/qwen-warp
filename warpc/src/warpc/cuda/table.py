@@ -3,14 +3,14 @@ launcher's roles.
 
 Nothing here hard-codes a model: head counts, head dim, rotary dim, rope frequencies, hidden and FFN widths come from
 the graph and reach the kernels as arguments. A match is declined only where a kernel's real limits are not met (K a
-multiple of 256 for bf16 weights and of 32 for Q4_0, head dim 64 / 128 / 256, at most 8 query heads per KV head, at
-most STEP_ROWS rows, a KV cache format with a kernel).
+multiple of 256 for bf16 weights and Q6_K, 512 for Q4_0 / Q4_1, head dim 64 / 128 / 256, at most 8 query heads per KV
+head, at most STEP_ROWS rows, a KV cache format with a kernel).
 """
 
 from __future__ import annotations
 
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
-from ..ir import Q4_0_BLOCK_ELEMS
+from ..ir import K_MULTIPLE
 from ..kvcache import FORMATS, RotatedInt4Format
 from . import attn_gated, deltanet, head_refine, hybrid, inkling, move, schedule, w4
 
@@ -19,7 +19,15 @@ from . import attn_gated, deltanet, head_refine, hybrid, inkling, move, schedule
 RTX3090 = Target(launch_us=4.0, dram_bandwidth=936e9, sms=82)
 
 NUM_GEMV = "bf16 weights, fp32 accumulation, 32-lane butterfly sum (order depends on K only), one bf16 rounding"
-NUM_Q4GEMV = NUM_GEMV.replace("bf16 weights", "Q4_0 weights dequantized in the kernel (fp32)")
+NUM_Q4GEMV = NUM_GEMV.replace(
+    "bf16 weights", "Q4_0 weights dequantized in the kernel (fp32; Q4_1: rounded to bf16 as the dense path widens them)"
+)
+Q4_FORMATS = {"q4_0": 0, "q4_1": 1}  # the kernel's `fmt` argument by scheme
+Q4_SCHEMES = tuple(Q4_FORMATS)
+NUM_Q6HEAD = (
+    "Q6_K weights dequantized in the kernel and rounded to bf16 (the dense path's widening), fp32 accumulation in"
+    " k_gemv's order, fp32 logits = the fp32 accumulator, not rounded to bf16, argmax lowest index on ties"
+)
 HEAD_NUMERICS = (
     "fp32 logits = the fp32 accumulator, not rounded to bf16 (the interpreter rounds first),"
     " argmax lowest index on ties"
@@ -70,6 +78,25 @@ def _gemv_consts(mode: int):
 
 def _gemv_info(c: dict) -> Verdict:
     return Verdict(ctas=schedule.gemv_ctas(c["N"], c["K"], c["mode"]))
+
+
+def _q4gemv_info(c: dict) -> Verdict:
+    return Verdict(ctas=schedule.q4_gemv_ctas(c["N"], c["K"], c["mode"]))
+
+
+def _q6gemv_info(c: dict) -> Verdict:
+    return Verdict(ctas=schedule.q6_gemv_ctas(c["N"]))
+
+
+def _scheme(A, i) -> str:
+    return A.graph.weights[A.node(i).attrs["weight"]].scheme
+
+
+def _uniform_scheme_check(m, A):
+    """One packed matrix feeds the kernel: its anchors must share the block format."""
+    if len({_scheme(A, i) for i in m.anchors}) != 1:
+        return "the linears differ in weight scheme"
+    return None
 
 
 def _norm_prologue_check(m, A):
@@ -163,6 +190,14 @@ def _ple_check(m, A):
     if emb.ins != ["tokens"] or list(split.attrs["sizes"]) != [D] * L:
         return "the embedding is not of the step's tokens, or the split is not L slices of D"
     return None
+
+
+def _q4_segments_check(m, A):
+    return _uniform_scheme_check(m, A) or _gemv_check(m, A)
+
+
+def _q4_dual_check(m, A):
+    return _uniform_scheme_check(m, A) or _dual_check(m, A)
 
 
 def _norm_consts(m, A):
@@ -413,20 +448,31 @@ def _emit_ple(m, A):
     )
 
 
-def _emit_segments(kernel: str, cat_kind: str, one_kind: str, numerics: str):
+def _kind(A, anchor: int, packed: bool) -> str:
+    """The pack kind a kernel reads the linear at node `anchor` as: the weight's block format, or bf16."""
+    return _scheme(A, anchor) if packed else "dense"
+
+
+def _fmt(A, anchor: int) -> dict:
+    """The kernel argument of a Q4 kernel's block format (0 Q4_0, 1 Q4_1), or nothing for the bf16 kernels."""
+    return {"fmt": Q4_FORMATS[_scheme(A, anchor)]} if _scheme(A, anchor) in Q4_FORMATS else {}
+
+
+def _emit_segments(kernel: str, packed: bool, numerics: str):
     def emit(m, A):
         lins = [A.node(i) for i in m.anchors]
         ws = [n.attrs["weight"] for n in lins]
         ns = [A.graph.weights[w].shape[0] for w in ws]
         name = "|".join(ws)
+        kind = _kind(A, m.anchors[0], packed)
         r = Region(
             kernel,
             set(m.covers),
             ins={"x": lins[0].ins[0]},
             outs={f"o{j}": n.outs[0] for j, n in enumerate(lins)},
             weights={"w": name},
-            packs=[Pack(name, cat_kind if len(ws) > 1 else one_kind, ws)],
-            attrs={"N": sum(ns), "K": A.graph.weights[ws[0]].shape[1], "segs": ns},
+            packs=[Pack(name, kind + "_cat" if len(ws) > 1 else kind, ws)],
+            attrs={"N": sum(ns), "K": A.graph.weights[ws[0]].shape[1], "segs": ns, **_fmt(A, m.anchors[0])},
             numerics=numerics,
         )
         return _with_norm(m, A, r)
@@ -434,10 +480,11 @@ def _emit_segments(kernel: str, cat_kind: str, one_kind: str, numerics: str):
     return emit
 
 
-def _emit_dual(kernel: str, kind: str, numerics: str):
+def _emit_dual(kernel: str, packed: bool, numerics: str):
     def emit(m, A):
         lg, lu = A.node(m.anchors[0]), A.node(m.anchors[1])
         wg, wu = lg.attrs["weight"], lu.attrs["weight"]
+        kind = _kind(A, m.anchors[0], packed)
         r = Region(
             kernel,
             set(m.covers),
@@ -449,6 +496,7 @@ def _emit_dual(kernel: str, kind: str, numerics: str):
                 "N": A.graph.weights[wg].shape[0],
                 "K": A.graph.weights[wg].shape[1],
                 **({"act": ACT_CODES[_act_of(m, A)]} if _act_of(m, A) != "silu" else {}),
+                **_fmt(A, m.anchors[0]),
             },
             numerics=numerics + f"; {_act_of(m, A)} emulated at bf16 between the two roundings",
         )
@@ -457,7 +505,7 @@ def _emit_dual(kernel: str, kind: str, numerics: str):
     return emit
 
 
-def _emit_resadd(kernel: str, kind: str, numerics: str):
+def _emit_resadd(kernel: str, packed: bool, numerics: str):
     def emit(m, A):
         ln, ad = A.node(m.anchors[0]), A.node(m.post[0])
         w = A.graph.weights[ln.attrs["weight"]]
@@ -467,8 +515,8 @@ def _emit_resadd(kernel: str, kind: str, numerics: str):
             ins={"x": ln.ins[0], "h": m.h},
             outs={"h_out": ad.outs[0]},
             weights={"w": w.name},
-            packs=[Pack(w.name, kind, [w.name])],
-            attrs={"N": w.shape[0], "K": w.shape[1]},
+            packs=[Pack(w.name, _kind(A, m.anchors[0], packed), [w.name])],
+            attrs={"N": w.shape[0], "K": w.shape[1], **_fmt(A, m.anchors[0])},
             inplace=("h_out", "h"),
             numerics=numerics + "; residual add in the epilogue",
         )
@@ -494,20 +542,23 @@ def _emit_row(kernel: str, kind: str, numerics: str):
     return emit
 
 
-def _emit_head(m, A):
-    ln, cast, amax = A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[-1])
-    cap = A.node(m.post[1]) if len(m.post) == 3 else None
-    w = A.graph.weights[ln.attrs["weight"]]
-    return Region(
-        "g_head",
-        set(m.covers),
-        ins={"x": ln.ins[0]},
-        outs={"logits": (cap or cast).outs[0], "ids": amax.outs[0]},
-        weights={"w": w.name},
-        packs=[Pack(w.name, "dense", [w.name])],
-        attrs={"N": w.shape[0], "K": w.shape[1], **({"cap": cap.attrs["cap"]} if cap else {})},
-        numerics=HEAD_NUMERICS + ("; softcap in fp32 on the accumulator" if cap else ""),
-    )
+def _emit_head(kernel: str, packed: bool, numerics: str):
+    def emit(m, A):
+        ln, cast, amax = A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[-1])
+        cap = A.node(m.post[1]) if len(m.post) == 3 else None
+        w = A.graph.weights[ln.attrs["weight"]]
+        return Region(
+            kernel,
+            set(m.covers),
+            ins={"x": ln.ins[0]},
+            outs={"logits": (cap or cast).outs[0], "ids": amax.outs[0]},
+            weights={"w": w.name},
+            packs=[Pack(w.name, _kind(A, m.anchors[0], packed), [w.name])],
+            attrs={"N": w.shape[0], "K": w.shape[1], **({"cap": cap.attrs["cap"]} if cap else {})},
+            numerics=numerics + ("; softcap in fp32 on the accumulator" if cap else ""),
+        )
+
+    return emit
 
 
 def _emit_attn(m, A):
@@ -586,16 +637,12 @@ _NORM_PRO = Absorb("rmsnorm", min=0, max=1)
 # h = bf16(h + bf16(y)), the stream written back in place
 _RESADD = Absorb("add", min=1, max=1, exposes=True, inplace=True)
 _ROWS = schedule.STEP_ROWS
-# K: k_gemv reads 8 bf16 per lane and 32 lanes per iteration; k_q4_gemv one Q4_0 block per lane. offset: the norms
-# compute x-hat * w (a folded prologue norm included), not the zero-centred x-hat * (1 + w)
-_GEMV_LIMITS = {
-    "K_multiple": 256,
-    "T_max": _ROWS,
-    "dtype_in": ("bf16",),
-    "offset_in": (0.0,),
-    "weighted_in": (True,),
-}
-_Q4GEMV_LIMITS = {"K_multiple": Q4_0_BLOCK_ELEMS, "T_max": _ROWS, "dtype_in": ("bf16",)}
+# K: k_gemv reads 8 bf16 per lane and 32 lanes per iteration; k_q4_gemv 8 columns per lane and two rounds per load.
+# offset: the norms compute x-hat * w (a folded prologue norm included), not the zero-centred x-hat * (1 + w)
+_GEMV_LIMITS = {"K_multiple": 256, "T_max": _ROWS, "dtype_in": ("bf16",), "offset_in": (0.0,), "weighted_in": (True,)}
+_Q4GEMV_LIMITS = {"K_multiple": K_MULTIPLE["q4_0"], "T_max": _ROWS, "dtype_in": ("bf16",)}
+# the Q6_K head: dense GGUF models only (no softcap, no norm prologue)
+_Q6GEMV_LIMITS = {"K_multiple": K_MULTIPLE["q6_k"], "T_max": _ROWS, "dtype_in": ("bf16",)}
 _NORM_LIMITS = {
     "H_multiple": 8,
     "T_max": _ROWS,
@@ -666,7 +713,7 @@ CAPS = [
         rounds={"linear": ("out",), "add": ("out",)},
         constants=_gemv_consts(3),
         info=_gemv_info,
-        emit=_emit_resadd("g_gemv_resadd", "dense", NUM_GEMV),
+        emit=_emit_resadd("g_gemv_resadd", False, NUM_GEMV),
     ),
     Cap(
         "g_gemv_dual",
@@ -675,16 +722,11 @@ CAPS = [
         pair=("silu_mul", "gelu_mul"),
         pre=(_NORM_PRO,),
         limits={**_GEMV_LIMITS, "act_in": tuple(ACT_CODES)},
-        rounds={
-            "linear": ("out",),
-            "rmsnorm": ("out",),
-            "silu_mul": ("silu", "out"),
-            "gelu_mul": ("gelu", "out"),
-        },
+        rounds={"linear": ("out",), "rmsnorm": ("out",), "silu_mul": ("silu", "out"), "gelu_mul": ("gelu", "out")},
         constants=_gemv_consts(1),
         info=_gemv_info,
         check=_dual_check,
-        emit=_emit_dual("g_gemv_dual", "dense", NUM_GEMV),
+        emit=_emit_dual("g_gemv_dual", False, NUM_GEMV),
     ),
     Cap(
         "g_gemv_row",
@@ -715,42 +757,58 @@ CAPS = [
         constants=_gemv_consts(2),
         info=_gemv_info,
         check=_head_check,
-        emit=_emit_head,
+        emit=_emit_head("g_head", False, HEAD_NUMERICS),
+    ),
+    Cap(
+        "g_head_q6k",
+        "linear",
+        anchor_schemes=("q6_k",),
+        post=(
+            Absorb("cast", min=1, max=1, exposes=True, attrs={"dtype": "f32"}),
+            Absorb("argmax", min=1, max=1, exposes=True, reduction_ok=True),
+        ),
+        limits=_Q6GEMV_LIMITS,
+        rounds={"cast": ("out",)},
+        tolerance=("linear.out",),
+        launches=3,
+        constants=_gemv_consts(2),
+        info=_q6gemv_info,
+        emit=_emit_head("g_head_q6k", True, NUM_Q6HEAD),
     ),
     Cap(
         "g_q4gemv_resadd",
         "linear",
-        anchor_schemes=("q4_0",),
+        anchor_schemes=Q4_SCHEMES,
         post=(_RESADD,),
         limits=_Q4GEMV_LIMITS,
         rounds={"linear": ("out",), "add": ("out",)},
         constants=_gemv_consts(3),
-        info=_gemv_info,
-        emit=_emit_resadd("g_q4gemv_resadd", "q4_0", NUM_Q4GEMV),
+        info=_q4gemv_info,
+        emit=_emit_resadd("g_q4gemv_resadd", True, NUM_Q4GEMV),
     ),
     Cap(
         "g_q4gemv_dual",
         "linear",
-        anchor_schemes=("q4_0",),
+        anchor_schemes=Q4_SCHEMES,
         pair=("silu_mul",),
         limits=_Q4GEMV_LIMITS,
         rounds={"linear": ("out",), "silu_mul": ("silu", "out")},
         constants=_gemv_consts(1),
-        info=_gemv_info,
-        check=_dual_check,
-        emit=_emit_dual("g_q4gemv_dual", "q4_0", NUM_Q4GEMV),
+        info=_q4gemv_info,
+        check=_q4_dual_check,
+        emit=_emit_dual("g_q4gemv_dual", True, NUM_Q4GEMV),
     ),
     Cap(
         "g_q4gemv",
         "linear",
-        anchor_schemes=("q4_0",),
+        anchor_schemes=Q4_SCHEMES,
         segments=3,
         limits=_Q4GEMV_LIMITS,
         rounds={"linear": ("out",)},
         constants=_gemv_consts(0),
-        info=_gemv_info,
-        check=_gemv_check,
-        emit=_emit_segments("g_q4gemv", "q4_0_cat", "q4_0", NUM_Q4GEMV),
+        info=_q4gemv_info,
+        check=_q4_segments_check,
+        emit=_emit_segments("g_q4gemv", True, NUM_Q4GEMV),
     ),
     Cap(
         "g_gemv",
@@ -763,7 +821,7 @@ CAPS = [
         constants=_gemv_consts(0),
         info=_gemv_info,
         check=_gemv_check,
-        emit=_emit_segments("g_gemv", "dense_cat", "dense", NUM_GEMV),
+        emit=_emit_segments("g_gemv", False, NUM_GEMV),
     ),
     Cap(
         "g_rmsnorm_post",

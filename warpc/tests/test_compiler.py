@@ -26,7 +26,7 @@ from warpc.compiler.caps import ref_points
 from warpc.compiler.fuse import Analysis, _candidates, fuse
 from warpc.cuda import CudaBackend, glue, schedule
 from warpc.cuda.backend import state_nbytes
-from warpc.cuda.pack import Packer
+from warpc.cuda.pack import Packer, repack_q4, repack_q6_k
 from warpc.cuda.table import HEAD_NUMERICS, RTX3090, TABLE
 from warpc.errors import LoweringError
 from warpc.ir import Graph, StateDecl, TType, WeightDecl
@@ -61,7 +61,8 @@ LAYER = ["g_gemv", "g_attn", "g_gemv_resadd", "g_gemv_dual", "g_gemv_resadd"]
 
 
 class ShapeSource:
-    """A source that only has a config: every tensor exists, linears inside the layers are Q4_0 if `q4`."""
+    """A source that only has a config: every tensor exists; if `q4`, the linears inside the layers are Q4_0 (the down
+    projection of layer 0 Q4_1) and the lm_head Q6_K, as in llama.cpp's Q4_0 files."""
 
     def __init__(self, config: ModelConfig, q4: bool):
         self.config, self.q4 = config, q4
@@ -70,7 +71,13 @@ class ShapeSource:
         return True
 
     def quant(self, name: str) -> str | None:
-        return "Q4_0" if self.q4 and "layers." in name else None
+        if not self.q4:
+            return None
+        if name == "lm_head.weight":
+            return "Q6_K"
+        if "layers." in name and name.endswith("proj.weight"):
+            return "Q4_1" if name == "model.layers.0.mlp.down_proj.weight" else "Q4_0"
+        return None
 
 
 def build(cfg: dict, family: str = "qwen3", ctx: int = 2048, kv: str = "bf16", q4: bool = False) -> Graph:
@@ -278,15 +285,25 @@ def test_llama_plan_folds_the_norm_into_qkv_and_updates_the_stream_in_place():
             assert t.ins["h"] == t.outs["h_out"] and t.ins["x"] != t.ins["h"]
 
 
-def test_q4_0_linears_lower_to_the_fused_dequant_kernels():
+def test_gguf_block_formats_lower_to_the_fused_dequant_kernels():
     plan = lower(build({**QWEN3_06B, "num_layers": 2}, q4=True), BACKEND, rows_max=8)
     layer = ["g_rmsnorm", "g_q4gemv", "g_attn", "g_q4gemv_resadd", "g_rmsnorm", "g_q4gemv_dual", "g_q4gemv_resadd"]
-    assert [t.kernel for t in plan.tasks] == ["g_embed"] + layer * 2 + ["g_rmsnorm", "g_head"]
+    assert [t.kernel for t in plan.tasks] == ["g_embed"] + layer * 2 + ["g_rmsnorm", "g_head_q6k"]
     kinds = Counter(p.kind for p in plan.packs.values())
-    assert kinds == {"dense": 11, "q4_0_cat": 2, "q4_0": 8}, kinds
-    g = build({**QWEN3_06B, "num_layers": 1, "hidden_size": 1040}, q4=True)  # K % 32 != 0: no Q4_0 kernel
+    assert kinds == {"dense": 10, "q4_0_cat": 2, "q4_0": 7, "q4_1": 1, "q6_k": 1}, kinds
+    formats = [t.attrs["fmt"] for t in plan.tasks if t.kernel == "g_q4gemv_resadd"]
+    assert formats == [0, 1, 0, 0], formats  # layer 0's down projection is Q4_1
+    # K = 1280 is a multiple of 256 but not of the Q4 kernels' 512: those linears are widened to bf16, the rest stay
+    # fused
+    g = build({**QWEN3_06B, "num_layers": 1, "hidden_size": 1280}, q4=True)
+    schemes = {w.name: w.scheme for w in g.weights.values()}
+    assert schemes["L0.q"] == schemes["L0.gate"] == "dense" and schemes["L0.o"] == "q4_0", schemes
+    assert schemes["lm_head"] == "q6_k"
+    kernels = {t.kernel for t in lower(g, BACKEND, rows_max=8).tasks}
+    assert {"g_gemv", "g_gemv_dual", "g_q4gemv_resadd"} <= kernels, kernels
+    g = build({**QWEN3_06B, "num_layers": 1, "hidden_size": 1040}, q4=True)  # K % 256 != 0: no kernel at all
     res = fuse(g, TABLE, 8)
-    assert any("K=1040 is not a multiple of 32" in r for r in res.unclaimed.values()), res.unclaimed
+    assert any("K=1040 is not a multiple of 256" in r for r in res.unclaimed.values()), res.unclaimed
 
 
 def test_lowering_error_names_the_ops_and_reasons():
@@ -724,26 +741,37 @@ class TensorSource:
 def test_packer_builds_its_kinds():
     torch.manual_seed(0)
     a, b, e = (torch.randn(s).bfloat16() for s in ((8, 64), (4, 64), (16, 64)))
-    qa, qb = (torch.randint(0, 256, (n, 2 * 18), dtype=torch.uint8) for n in (8, 4))
+    blocks = {
+        "qa": torch.randint(0, 256, (8, 16 * 18), dtype=torch.uint8),
+        "qb": torch.randint(0, 256, (4, 16 * 18), dtype=torch.uint8),
+        "qc": torch.randint(0, 256, (6, 16 * 20), dtype=torch.uint8),
+        "qh": torch.randint(0, 256, (5, 2 * 210), dtype=torch.uint8),
+    }
     weights = {
         "a": WeightDecl("a", (8, 64), "dense", "a.weight"),
         "b": WeightDecl("b", (4, 64), "dense", "b.weight"),
         "embed": WeightDecl("embed", (16, 64), "dense", "embed.weight"),
         "lm_head": WeightDecl("lm_head", (16, 64), "dense", "embed.weight"),
-        "qa": WeightDecl("qa", (8, 64), "q4_0", "qa.weight"),
-        "qb": WeightDecl("qb", (4, 64), "q4_0", "qb.weight"),
+        "qa": WeightDecl("qa", (8, 512), "q4_0", "qa.weight"),
+        "qb": WeightDecl("qb", (4, 512), "q4_0", "qb.weight"),
+        "qc": WeightDecl("qc", (6, 512), "q4_1", "qc.weight"),
+        "qh": WeightDecl("qh", (5, 512), "q6_k", "qh.weight"),
         "norm": WeightDecl("norm", (64,), "dense", "norm.weight"),
         "query": WeightDecl("query", (2, 64), "f32", "query"),
     }
     query = torch.randn(2, 64) * 1e-3 + 1  # not bf16-representable
     dense = {"a.weight": a, "b.weight": b, "embed.weight": e, "norm.weight": e[0], "query": query}
-    raw = {"qa.weight": {"blocks": qa}, "qb.weight": {"blocks": qb}}
+    raw = {f"{k}.weight": {"blocks": v} for k, v in blocks.items()}
     pk = Packer(weights, TensorSource(dense, raw), device="cpu")
     assert torch.equal(pk.build(Pack("a|b", "dense_cat", ["a", "b"])), torch.cat([a, b]))
     tied = pk.build(Pack("lm_head", "dense", ["lm_head"]))
     assert pk.build(Pack("embed", "dense", ["embed"])) is tied  # one device tensor
-    assert torch.equal(pk.build(Pack("qa|qb", "q4_0_cat", ["qa", "qb"])), torch.cat([qa, qb]))
-    assert torch.equal(pk.build(Pack("qa", "q4_0", ["qa"])), qa)
+    q4 = {k: repack_q4(blocks[k], "q4_1" if k == "qc" else "q4_0") for k in ("qa", "qb", "qc")}
+    assert torch.equal(pk.build(Pack("qa|qb", "q4_0_cat", ["qa", "qb"])), torch.cat([q4["qa"], q4["qb"]]))
+    assert torch.equal(pk.build(Pack("qa", "q4_0", ["qa"])), q4["qa"])
+    assert torch.equal(pk.build(Pack("qc", "q4_1", ["qc"])), q4["qc"])
+    assert torch.equal(pk.build(Pack("qh", "q6_k", ["qh"])), repack_q6_k(blocks["qh"]))
+    assert pk.build(Pack("qa", "q4_0", ["qa"])).shape == (8, schedule.packed_row_bytes("q4_0", 512))
     assert pk.build(Pack("norm", "dense", ["norm"])).shape == (64,)
     assert torch.equal(pk.build(Pack("a.t", "dense_t", ["a"])), a.t())
     assert pk.build(Pack("a.t", "dense_t", ["a"])).is_contiguous()
@@ -752,6 +780,7 @@ def test_packer_builds_its_kinds():
     for bad in (
         Pack("qa", "dense", ["qa"]),
         Pack("a", "q4_0", ["a"]),
+        Pack("qa", "q4_1", ["qa"]),
         Pack("a", "f32", ["a"]),
         Pack("norm", "dense_t", ["norm"]),
         Pack("x", "w4r_cat", ["x"]),

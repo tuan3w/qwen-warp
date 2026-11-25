@@ -26,7 +26,7 @@ import warpc.sources
 from harness import Skip, run
 from warpc import frontend
 from warpc.errors import UnsupportedModel
-from warpc.ir import Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS
+from warpc.ir import BLOCK_FORMATS
 from warpc.sources import ModelConfig, w4g128
 from warpc.sources.gguf import DECODERS, GGUFSource, hf_name
 
@@ -143,9 +143,10 @@ def gguf_name(name: str) -> str:
     return f"blk.{i}.{table[rest]}"
 
 
-def write_gguf(path: Path, model, arch: str, *, extra=()) -> None:
+def write_gguf(path: Path, model, arch: str, *, extra=(), types=None, blocks=None) -> None:
     """Convert an HF model the way llama.cpp's converter lays it out (names, metadata, llama q / k permute, Llama 3.1
-    rope scaling as rope_freqs)."""
+    rope scaling as rope_freqs). `types` replaces TYPES; `blocks` maps an HF tensor name to (uint8 block rows, format),
+    written as given instead of the model's weights (formats `gguf.quantize` cannot produce)."""
     c = model.config
     w = gguf.GGUFWriter(str(path), arch)
     w.add_block_count(c.num_hidden_layers)
@@ -161,8 +162,11 @@ def write_gguf(path: Path, model, arch: str, *, extra=()) -> None:
             x = permute_for_ggml(x, c.num_attention_heads)
         if arch == "llama" and name.endswith("k_proj.weight"):
             x = permute_for_ggml(x, c.num_key_value_heads)
-        qtype = next((q for suffix, q in TYPES.items() if name.endswith(suffix)), Q.F32)
-        if qtype == Q.F32:
+        qtype = next((q for suffix, q in (types or TYPES).items() if name.endswith(suffix)), Q.F32)
+        if name in (blocks or {}):
+            rows, raw_type = blocks[name]
+            w.add_tensor(gguf_name(name), rows, raw_dtype=raw_type)
+        elif qtype == Q.F32:
             w.add_tensor(gguf_name(name), x)
         else:
             w.add_tensor(gguf_name(name), gguf.quantize(x, qtype), raw_dtype=qtype)
@@ -261,7 +265,7 @@ def test_gguf_matches_safetensors():
                     assert torch.equal(source.get(name), hf.get(name)), (family, name)
             gate = "model.layers.1.mlp.gate_proj.weight"
             raw = source.raw(gate)["blocks"]
-            assert raw.dtype == torch.uint8 and raw.shape == (96, 64 // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES), raw.shape
+            assert raw.dtype == torch.uint8 and raw.shape == (96, 64 // 32 * 18), raw.shape
             assert torch.equal(torch.from_numpy(DECODERS["Q4_0"](raw.numpy())).bfloat16(), source.get(gate))
             q = "model.layers.0.self_attn.q_proj.weight"
             try:
@@ -274,7 +278,7 @@ def test_gguf_matches_safetensors():
 
 def test_gguf_guards():
     model = tiny_model("qwen3")
-    iq = ("blk.0.attn_extra.weight", np.zeros((64, 64 // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES), np.uint8), Q.IQ4_NL)
+    iq = ("blk.0.attn_extra.weight", np.zeros((64, 64 // 32 * 18), np.uint8), Q.IQ4_NL)
     cases = {
         "IQ* block formats": {"arch": "qwen3", "extra": (iq,)},
         "GGUF architecture 'qwen2' (supported: llama, qwen3)": {"arch": "qwen2"},
@@ -315,10 +319,14 @@ def test_real_gguf():
     graph = frontend.build(source, ctx_max=64)
     for decl in graph.weights.values():
         assert tuple(source.get(decl.source).shape) == decl.shape, (decl.name, decl.shape)
-        assert (decl.scheme == "q4_0") == (source.quant(decl.source) == "Q4_0"), decl.name
-        if decl.scheme == "q4_0":
-            row_bytes = decl.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
-            assert source.raw(decl.source)["blocks"].shape == (decl.shape[0], row_bytes), decl.name
+        fused = {"Q4_0": "q4_0", "Q4_1": "q4_1", "Q6_K": "q6_k"}.get(source.quant(decl.source))
+        if decl.scheme != "dense":
+            assert decl.scheme == fused, decl.name
+            elems, nbytes = BLOCK_FORMATS[decl.scheme]
+            blocks = source.raw(decl.source)["blocks"]
+            assert blocks.shape == (decl.shape[0], decl.shape[1] // elems * nbytes), decl.name
+        elif decl.name != "embed" and fused in ("q4_0", "q4_1"):
+            assert decl.shape[1] % 512, decl.name  # only a width the kernels cannot take is widened
 
 
 def test_safetensors_source():

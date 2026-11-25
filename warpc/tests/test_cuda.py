@@ -1,6 +1,7 @@
-"""The CUDA backend end to end: the fused Q4_0 GEMV against its CPU reference (kernels/tests/test_q4_gemv.c), compiled
-greedy decode of tiny random models of every family (and every KV format) against the reference interpreter, the
-runtime's and the facade's contract, and a real GGUF file.
+"""The CUDA backend end to end: the fused Q4_0 / Q4_1 and Q6_K GEMVs against their CPU references (kernels/tests), the
+repacked weight layouts, compiled greedy decode of tiny random models of every family (and every KV format) and of a
+tiny GGUF file in the fused block formats against the reference interpreter, the runtime's and the facade's contract,
+and a real GGUF file.
 
   uv run --package warpc python warpc/tests/test_cuda.py
 
@@ -18,15 +19,20 @@ import tempfile
 import weakref
 from pathlib import Path
 
+import gguf
+import numpy as np
 import torch
+from gguf import GGMLQuantizationType as Q
 from transformers import LlamaConfig, LlamaForCausalLM, MistralConfig, MistralForCausalLM, Qwen3Config, Qwen3ForCausalLM
 from transformers.utils import logging as transformers_logging
 
 import warpc
 from harness import Skip, run
+from test_sources import write_gguf
 from warpc import frontend, sources
-from warpc.cuda import glue, schedule
+from warpc.cuda import glue, pack, schedule
 from warpc.reference import Interpreter
+from warpc.sources.gguf import DECODERS
 
 transformers_logging.disable_progress_bar()
 
@@ -155,21 +161,113 @@ def expect(error: type[Exception], fn, *args) -> str:
     raise AssertionError(f"{fn.__name__}{args} must raise {error.__name__}")
 
 
-def test_q4_gemv_kernel_is_bit_identical_to_its_cpu_reference():
+def test_fused_dequant_kernels_are_bit_identical_to_their_cpu_references():
     require_gpu()
     major, minor = torch.cuda.get_device_capability()
     lib = glue.build(10 * major + minor)
+    for name in ("test_q4_gemv", "test_q6_gemv"):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / name
+            src = glue.KERNELS / "tests" / f"{name}.c"
+            link = [f"-L{lib.parent}", f"-l:{lib.name}", "-lm"]
+            subprocess.run(
+                [glue.nvcc(), "-O2", "-Xcompiler", "-ffp-contract=off", "-o", str(exe), str(src), *link], check=True
+            )
+            env = {**os.environ, "LD_LIBRARY_PATH": str(lib.parent)}
+            r = subprocess.run([str(exe)], capture_output=True, text=True, env=env)
+        print(r.stdout.strip())
+        assert r.returncode == 0 and r.stdout.strip().endswith("PASS"), r.stdout + r.stderr
+
+
+def unpack_q4(planes: torch.Tensor, K: int, minimums: bool) -> torch.Tensor:
+    """The fp32 weights [N, K] of rows repacked by pack.repack_q4, read back by the layout of dense_q4_gemv.cuh."""
+    n, pairs, kb = planes.shape[0], K // 512, K // 32
+    words = planes[:, : K // 2].reshape(n, pairs, 32, 2, 4).permute(0, 1, 3, 2, 4).reshape(n, K // 8, 4)
+    codes = torch.stack([words & 15, words >> 4], -1).reshape(n, K).float()  # column order
+
+    def head(h: int) -> torch.Tensor:
+        plane = planes[:, K // 2 + h * (K // 16) : K // 2 + (h + 1) * (K // 16)]
+        values = plane.reshape(n, pairs, 8, 2, 2).permute(0, 1, 3, 2, 4).reshape(n, kb, 2).contiguous()
+        return values.view(torch.float16).float().expand(n, kb, 32).reshape(n, K)
+
+    return head(0) * codes + head(1) if minimums else head(0) * (codes - 8)
+
+
+def unpack_q6_k(planes: torch.Tensor, K: int) -> torch.Tensor:
+    """The fp32 weights [N, K] of rows repacked by pack.repack_q6_k, read back by the layout of dense_q6_gemv.cuh."""
+    n, kb = planes.shape[0], K // 256
+    ql = planes[:, : 128 * kb].reshape(n, kb, 32, 4)
+    low = torch.stack([ql & 15, ql >> 4], -1).reshape(n, kb, 32, 8)
+    qh = planes[:, 128 * kb : 192 * kb].reshape(n, kb, 32, 2)
+    high = torch.stack([(qh >> 2 * m) & 3 for m in range(4)], -1).reshape(n, kb, 32, 8)
+    codes = (low | (high << 4)).reshape(n, kb, 16, 16).float() - 32
+    sc = planes[:, 192 * kb : 208 * kb].reshape(n, kb, 16).contiguous().view(torch.int8).float()
+    d = planes[:, 208 * kb : 210 * kb].reshape(n, kb, 2).contiguous().view(torch.float16).float()
+    return ((d * sc).reshape(n, kb, 16, 1) * codes).reshape(n, K)
+
+
+def test_repacked_rows_hold_the_gguf_weights():
+    rng = np.random.default_rng(0)
+    for qtype, scheme in ((Q.Q4_0, "q4_0"), (Q.Q4_1, "q4_1")):
+        K = 1536
+        raw = gguf.quantize(rng.standard_normal((5, K)).astype(np.float32), qtype)
+        planes = pack.repack_q4(torch.from_numpy(raw), scheme)
+        assert planes.shape == (5, schedule.packed_row_bytes(scheme, K)) and planes.shape[1] == raw.shape[1]
+        got = unpack_q4(planes, K, scheme == "q4_1")
+        assert torch.equal(got, torch.from_numpy(DECODERS[qtype.name](raw))), scheme
+    K = 2560
+    raw = rng.integers(0, 256, (7, K // 256 * 210), dtype=np.uint8)
+    raw.reshape(7, -1, 210)[:, :, 208:] = np.array([0x40, 0x1C], dtype=np.uint8)  # a finite d
+    planes = pack.repack_q6_k(torch.from_numpy(raw))
+    assert planes.shape == (7, schedule.packed_row_bytes("q6_k", K))
+    want = torch.from_numpy(np.asarray(gguf.dequantize(raw, Q.Q6_K), dtype=np.float32))
+    assert torch.equal(unpack_q6_k(planes, K), want)
+
+
+def block_format_model():
+    """A tiny llama whose linears are Q4_0 (down_proj Q4_1) and whose head is Q6_K, written as a GGUF file; the
+    widths are the fused kernels' (K a multiple of 512)."""
+    config = LlamaConfig(
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=2,
+        vocab_size=1024,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=1024,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(config)
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            p.copy_((torch.randn_like(p) * (0.3 if "norm" in n else p.shape[-1] ** -0.5)).bfloat16().float())
+    rng = np.random.default_rng(1)
+    head = rng.integers(0, 256, (1024, 512 // 256 * 210), dtype=np.uint8)
+    head.reshape(1024, -1, 210)[:, :, 208:] = np.array([0x00, 0x14], dtype=np.uint8)  # d ~ 6.1e-4, scales up to 127
+    types = dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"), Q.Q4_0)
+    types = {f"{k}.weight": v for k, v in types.items()} | {"down_proj.weight": Q.Q4_1}
+    return model, types, {"lm_head.weight": (head, Q.Q6_K)}
+
+
+def test_block_formats_decode_like_the_reference():
+    require_gpu()
+    model, types, blocks = block_format_model()
     with tempfile.TemporaryDirectory() as d:
-        exe = Path(d) / "test_q4_gemv"
-        src = glue.KERNELS / "tests" / "test_q4_gemv.c"
-        link = [f"-L{lib.parent}", f"-l:{lib.name}", "-lm"]
-        subprocess.run(
-            [glue.nvcc(), "-O2", "-Xcompiler", "-ffp-contract=off", "-o", str(exe), str(src), *link], check=True
-        )
-        env = {**os.environ, "LD_LIBRARY_PATH": str(lib.parent)}
-        r = subprocess.run([str(exe)], capture_output=True, text=True, env=env)
-    print(r.stdout.strip())
-    assert r.returncode == 0 and r.stdout.strip().endswith("PASS"), r.stdout + r.stderr
+        path = Path(d) / "model.gguf"
+        write_gguf(path, model, "llama", types=types, blocks=blocks)
+        source = sources.open(path)
+        compiled = warpc.compile(source, ctx_max=64)
+        summary = compiled.plan.summary()
+        got = compiled.generate(TINY_PROMPT, 16)
+        want = reference_tokens(source, TINY_PROMPT, 16)
+    print(f"  {summary}\n  {got}")
+    kinds = {t.kernel for t in compiled.plan.tasks}
+    assert {"g_q4gemv", "g_q4gemv_dual", "g_q4gemv_resadd", "g_head_q6k"} <= kinds, summary
+    assert {t.attrs["fmt"] for t in compiled.plan.tasks if t.kernel == "g_q4gemv_resadd"} == {0, 1}, summary
+    assert got == want, (got, want)
 
 
 def test_tiny_models_decode_like_the_reference():
