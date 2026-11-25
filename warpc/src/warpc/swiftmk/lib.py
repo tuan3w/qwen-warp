@@ -1,5 +1,5 @@
-"""ctypes binding of the hand engine's kernel library (libswiftmk.so, built by `make engine`), loaded from
-$WARPC_SWIFTMK_LIB only: warpc shares no code with engine/ and bakes in no path.
+"""ctypes binding of the hand engine's kernel library (libswiftmk.so, built from the v0.12.0 checkout), loaded
+from $WARPC_SWIFTMK_LIB only: warpc shares no code with the hand engine and bakes in no path.
 
 The library is refused when its size queries disagree with the layouts this package was written against (ABI_SIZES, the
 KV cache sizes per format): a changed workspace or state layout would otherwise corrupt memory silently. A signature
@@ -147,7 +147,9 @@ def load() -> Library:
     """The library named by $WARPC_SWIFTMK_LIB (one load per process and path)."""
     p = os.environ.get(ENV)
     if not p:
-        raise RuntimeError(f"${ENV} is not set: point it at libswiftmk.so (built by `make engine`)")
+        raise RuntimeError(
+            f"${ENV} is not set: point it at libswiftmk.so (built from the v0.12.0 checkout, see warpc/README.md)"
+        )
     path = Path(p).resolve()
     if not path.is_file():
         raise RuntimeError(f"${ENV}={p}: no such file")

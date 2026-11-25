@@ -9,7 +9,7 @@ hand engine's smk_headq_gemv(I4R) + smk_headq_select_rescore.
            bitwise, T = 1..8
   speed:   graph time of the pair and of the select alone, against the hand's
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint dir> \\
+  WARPC_SWIFTMK_LIB=<libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint dir> \\
       uv run --package warpc python warpc/tests/test_head_refine.py
 
 The GPU tests need a CUDA device and $WARPC_SWIFTMK_LIB; they skip without. The speed test needs $WARPC_HEAD_SPEED.

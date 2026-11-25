@@ -1,5 +1,5 @@
 // Stage 2 families 1-3 of the Qwen3.5 hybrid: the zero-centred RMSNorm, the T = 1 bf16 lm_head GEMV and the small a|b GEMV.
-// Each kernel's floating-point order is its spec (it is the order the checked-in hand engine, libswiftmk, uses, so that the
+// Each kernel's floating-point order is its spec (it is the order the hand engine, libswiftmk (v0.12.0), uses, so that the
 // swiftmk and warpc kernels can be swapped task by task with bit-identical results); the launch structure is free.
 #include "dense_common.cuh"
 

@@ -1,11 +1,13 @@
 """Bit-identity of warpc's swiftmk backend with the hand engine on the 27B checkpoint (design gate §4.1).
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tools/compare27.py MODEL \
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
+  uv run --package warpc python warpc/tools/compare27.py MODEL \
       --ctx-max N --kv bf16|fp8|int4_rot --head bf16|int4_refine --prompt-files F... --prompt-len L \
-      [--tokens 256] [--trace-steps 16] --out DIR [--engine-dir DIR]
+      [--tokens 256] [--trace-steps 16] --out DIR
 
 Both sides run the same configuration from this one argument set: the same library file (its sha256 is checked before
-anything runs: the warpc side loads $WARPC_SWIFTMK_LIB, the hand side <engine-dir>/<$SMK_BUILD or build>/libswiftmk.so),
+anything runs: the warpc side loads $WARPC_SWIFTMK_LIB, the hand side
+$WARPC_LEGACY_DIR/engine/<$SMK_BUILD or build>/libswiftmk.so),
 the same ctx_max, 8-row prompt steps then a head step (warpc rows_max 8, hand Engine(tmax=8, state_slots=1),
 prefill(chunk=8)), the same head and KV format, the same prompt ids, EOS ignored. Each side is a process of its own,
 run one after the other (each holds the 17 GB of weights).
@@ -32,6 +34,7 @@ from pathlib import Path
 
 import torch
 
+import legacy
 import prompts
 import swift_worker
 
@@ -86,7 +89,6 @@ def compare_mtp(args, prompt: list[str]) -> int:
         head=args.head,
         ctx_max=args.ctx_max,
         mode=[*mode, "--trace-out", str(th)],
-        engine_dir=args.engine_dir,
         host_tables=args.host_tables,
     )
     common = [str(args.model), "--ctx-max", str(args.ctx_max), "--kv", args.kv, "--head", args.head, *prompt]
@@ -132,7 +134,6 @@ def main():
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--trace-steps", type=int, default=16)
     ap.add_argument("--out", type=Path, required=True, help="output directory")
-    ap.add_argument("--engine-dir", type=Path, default=swift_worker.ENGINE_DIR)
     ap.add_argument("--mtp", type=int, default=0, help="compare greedy MTP speculation with K drafts per cycle")
     ap.add_argument("--host-tables", action="store_true", help="--mtp: embedding and rescoring head in host memory")
     ap.add_argument("--side", choices=("warpc", "warpc-mtp"), help=argparse.SUPPRESS)  # internal: the warpc child
@@ -149,7 +150,7 @@ def main():
         return
     from warpc.swiftmk import lib
 
-    ours, theirs = Path(os.environ.get(lib.ENV, "")), swift_worker.library(args.engine_dir)
+    ours, theirs = Path(os.environ.get(lib.ENV, "")), legacy.library()
     if not ours.is_file() or not theirs.is_file():
         sys.exit(f"compare27: missing library: ${lib.ENV}={ours}, hand side {theirs}")
     sha_w, sha_h = lib.sha256(ours.resolve()), swift_worker.sha256(theirs)
@@ -172,7 +173,6 @@ def main():
         head=args.head,
         ctx_max=args.ctx_max,
         mode=["trace", *prompt, *steps, "--trace-out", str(th)],
-        engine_dir=args.engine_dir,
     )
     t2 = time.perf_counter()
     meta = json.loads((args.out / "warpc.json").read_text())

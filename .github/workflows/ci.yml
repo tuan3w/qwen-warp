@@ -1,6 +1,6 @@
 name: ci
-# No GPU and no checkpoint on GitHub runners: this only checks that the sources compile, uv.lock matches pyproject.toml, markdown links resolve and no
-# personal paths or keys are committed.  The engine tests (make test) need an RTX 3090 and the gated checkpoint and are run by hand before a release.
+# No GPU and no checkpoint on GitHub runners: this only checks that warpc compiles and lints, uv.lock matches pyproject.toml, markdown links resolve and no
+# personal paths or keys are committed.  The warpc tests that need a GPU, a checkpoint or the legacy checkout are run by hand.
 on:
   push:
     branches: [main]

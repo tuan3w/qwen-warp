@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Checks that need neither a GPU nor the checkpoint (run by CI, runnable locally): sources compile, uv.lock matches pyproject.toml,
+# Checks that need neither a GPU nor the checkpoint (run by CI, runnable locally): warpc compiles and lints, uv.lock matches pyproject.toml,
 # relative links in the markdown files resolve, no personal paths or key-like strings are committed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python3 -m py_compile engine/*.py server/*.py tests/*.py && echo "py_compile ok"
 python3 -m compileall -q warpc/src warpc/tests warpc/tools && echo "warpc compile ok"
 uv run --package warpc --only-group dev ruff check warpc && uv run --package warpc --only-group dev ruff format --check warpc && echo "warpc ruff ok"
 uv lock --check && echo "uv.lock ok"

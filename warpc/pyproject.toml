@@ -10,11 +10,12 @@ dependencies = ["torch>=2.14", "numpy>=2.3", "safetensors>=0.8", "gguf>=0.19"]
 
 [project.optional-dependencies]
 # the window prefill (swiftmk backend, `compile(window_rows=...)`): fla's chunked DeltaNet scan and vLLM's FlashAttention-2,
-# the versions the window kernels were checked bit for bit against the hand engine's fast prefill
-prefill = ["flash-linear-attention==0.5.2", "vllm==0.34.0"]
+# the versions the window kernels were checked bit for bit against the hand engine's fast prefill (v0.12.0)
+# torchvision and torchaudio are vLLM's own requirements, named here so that the workspace's torch index pin (root pyproject.toml) applies to them too
+prefill = ["flash-linear-attention==0.5.2", "vllm==0.34.0", "torchvision==0.29.0", "torchaudio==2.11.0"]
 
 [dependency-groups]
-dev = ["ruff==0.17.6", "transformers>=5.18"]
+dev = ["ruff==0.17.6", "transformers>=5.18", "huggingface-hub"]  # huggingface-hub: tools/fetch.py
 
 [build-system]
 requires = ["hatchling"]

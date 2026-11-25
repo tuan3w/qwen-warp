@@ -1,11 +1,13 @@
 """The stage 2 end-to-end gate on the 27B checkpoint (design 5.1 #4): warpc kernels against the hand engine, per family.
 
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
   # once per (kv, head): the hand engine's traces of every cell, one process
-  WARPC_SWIFTMK_LIB=... uv run --package warpc python warpc/tools/gate27.py reference MODEL --kv bf16 --head bf16 \
-      --prompt-files engine/src/*.cu --out DIR
+  uv run --package warpc python warpc/tools/gate27.py reference MODEL --kv bf16 --head bf16 \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu --out DIR
   # per backend configuration: warpc over the same cells, judged against DIR
-  WARPC_SWIFTMK_LIB=... uv run --package warpc python warpc/tools/gate27.py check MODEL --kv bf16 --head bf16 \
-      --prompt-files engine/src/*.cu --out DIR [--backend composite|cuda|swiftmk] [--kernels g_rmsnorm_zc,...]
+  uv run --package warpc python warpc/tools/gate27.py check MODEL --kv bf16 --head bf16 \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu --out DIR \
+      [--backend composite|cuda|swiftmk] [--kernels g_rmsnorm_zc,...]
 
 Cells: prompt lengths --prompt-len (385 and 4096) x --slices (3) disjoint slices of the text, ctx_max 4608, 8-row steps,
 the hand engine as Engine(tmax=8, state_slots=1) (swift_worker.py). A cell passes iff all --tokens (256) ids equal the
@@ -62,7 +64,6 @@ def reference(args) -> None:
         head=args.head,
         ctx_max=args.ctx_max,
         mode=mode,
-        engine_dir=args.engine_dir,
         host_tables=args.host_tables,
     )
     _reference_file(args).with_suffix(".json").write_text(json.dumps(result))
@@ -233,13 +234,12 @@ def main():
     ap.add_argument("--kv", choices=swift_worker.KV_FP8, default="bf16")
     ap.add_argument("--head", choices=swift_worker.HEADS, default="bf16")
     ap.add_argument("--ctx-max", type=int, default=4608)
-    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help="text the prompts are cut from")
+    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help=prompts.PROMPT_FILES_HELP)
     ap.add_argument("--prompt-len", type=int, nargs="+", default=[385, 4096], help="prompt length(s) in tokens")
     prompts.add_slices(ap)
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--trace-steps", type=int, default=16)
     ap.add_argument("--out", type=Path, required=True, help="directory of the hand traces and the verdicts")
-    ap.add_argument("--engine-dir", type=Path, default=swift_worker.ENGINE_DIR)
     ap.add_argument("--backend", choices=BACKENDS, default="composite")
     ap.add_argument(
         "--kernels", help="composite: the warpc kernels admitted, comma-separated (default: all; MTP: glue)"

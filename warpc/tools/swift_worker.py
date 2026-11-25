@@ -1,8 +1,8 @@
-"""The hand engine (engine/engine.py of this repository, or --engine-dir) on the 27B checkpoint, in a process of its
-own, writing its result to --out. bench.py and compare27.py start it through `spawn`.
+"""The hand engine (engine/engine.py of the v0.12.0 checkout $WARPC_LEGACY_DIR) on the 27B checkpoint, in a process of
+its own, writing its result to --out. bench.py and compare27.py start it through `spawn`.
 
   uv run --package warpc python warpc/tools/swift_worker.py MODEL --kv bf16|fp8|int4_rot --head bf16|int4_refine \
-      --ctx-max N --out FILE [--engine-dir DIR] MODE ...
+      --ctx-max N --out FILE MODE ...
     bench --prompt-files F... --prompt-len L... --tokens N --repeats R
     trace --prompt-files F... --prompt-len L --tokens N --trace-steps S
     traces --prompt-files F... --prompt-len L... --slices K --tokens N --trace-steps S  (every length x slice)
@@ -10,7 +10,7 @@ own, writing its result to --out. bench.py and compare27.py start it through `sp
 
 The engine is `Engine(ctx_max, kv_fp8, head, tmax=8, state_slots=1)` with 8-row prefill chunks: the configuration
 warpc's swiftmk backend reproduces (rows_max 8, one DeltaNet state slot). The library it loads is
-<engine-dir>/<$SMK_BUILD or build>/libswiftmk.so; its sha256 is in every result.
+$WARPC_LEGACY_DIR/engine/<$SMK_BUILD or build>/libswiftmk.so; its sha256 is in every result.
 
 bench: see bench.py (decode rounds continuing one prefill per prompt length). trace: the ids of a greedy continuation
 (EOS ignored) and the fp32 logits of its first S head steps, saved with torch.save. ring: the DeltaNet ring cursors
@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import child
+import legacy
 import measure
 import prompts
 
@@ -37,11 +38,6 @@ HEADS = {"bf16": "bf16", "int4_refine": "int4"}
 KV_BYTES_PER_TOKEN = {"bf16": 64 * 1024, "fp8": 32 * 1024, "int4_rot": 16896}  # 16 attention layers
 DS_CUR, DS_PEND, DS_N = 1, 35, 37
 SHORT = 385  # the real prompt of a forged-position cell (bench.py --forge-position)
-ENGINE_DIR = Path(__file__).resolve().parents[2] / "engine"
-
-
-def library(engine_dir: Path) -> Path:
-    return engine_dir / os.environ.get("SMK_BUILD", "build") / "libswiftmk.so"
 
 
 def sha256(path: Path) -> str:
@@ -55,14 +51,14 @@ def spawn(
     head: str,
     ctx_max: int,
     mode: list[str],
-    engine_dir: Path = ENGINE_DIR,
     host_tables: bool = False,
 ) -> dict:
     """Run this file with the mode arguments `mode`: its JSON result, or RuntimeError with why it failed."""
+    legacy.root()
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "result.json"
         command = [sys.executable, __file__, str(model), "--kv", kv, "--head", head, "--ctx-max", str(ctx_max)]
-        command += ["--engine-dir", str(engine_dir), "--out", str(out), *(["--host-tables"] if host_tables else [])]
+        command += ["--out", str(out), *(["--host-tables"] if host_tables else [])]
         command += mode
         if error := child.run(command):
             raise RuntimeError(f"hand engine: {error}")
@@ -71,7 +67,7 @@ def spawn(
 
 def engine(args):
     os.environ["SWIFT_MODEL"] = str(args.model)  # read by the hand engine's weights.py at import
-    sys.path.insert(0, str(args.engine_dir))
+    sys.path.insert(0, str(legacy.engine_dir()))
     kv = KV_FP8[args.kv]
     if getattr(args, "mtp", 0):
         # the hand engine's speculative decoder: the MTP head drafting k tokens, int4 head, one DeltaNet state slot
@@ -266,7 +262,6 @@ def main():
     ap.add_argument("--kv", choices=KV_FP8, default="bf16")
     ap.add_argument("--head", choices=HEADS, default="bf16")
     ap.add_argument("--ctx-max", type=int, required=True)
-    ap.add_argument("--engine-dir", type=Path, default=ENGINE_DIR)
     ap.add_argument("--out", type=Path, required=True, help="where to write the JSON result")
     modes = ap.add_subparsers(dest="mode", required=True)
     b = modes.add_parser("bench")
@@ -304,7 +299,7 @@ def main():
         "--host-tables", action="store_true", help="hand engine: embedding and head tables in pinned memory"
     )
     args = ap.parse_args()
-    lib = library(args.engine_dir)
+    lib = legacy.library()
     e = engine(args)
     modes_fn = {"bench": bench, "trace": trace, "traces": traces, "ring": ring, "mtp-traces": mtp_traces}
     result = modes_fn[args.mode](e, args)

@@ -1,9 +1,12 @@
 """The MTP head's re-quantisation (sources/requantize.py) against the hand engine's pack_mtp.
 
 uv run --package warpc python warpc/tests/test_requantize.py                     # CPU tests
-WARPC_TEST_SWIFT27=<27B checkpoint directory> uv run --package warpc python warpc/tests/test_requantize.py
+WARPC_LEGACY_DIR=<v0.12.0> uv run --package warpc python warpc/tests/test_requantize.py
+    # the CPU tests also run the hand engine's pack_mtp.quant_w4 and compare the draft vocabulary with its file
+WARPC_LEGACY_DIR=<v0.12.0> WARPC_TEST_SWIFT27=<27B checkpoint directory> \\
+    uv run --package warpc python warpc/tests/test_requantize.py
     # adds the real-data q|k|v check and G1 (design 4.1): every MTP pack of warpc's swiftmk Packer, built from
-    # Requantized.mtp, is byte-equal to the hand engine's (needs a CUDA device and engine/ importable)
+    # Requantized.mtp, is byte-equal to the hand engine's (needs a CUDA device)
 """
 
 import hashlib
@@ -14,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from harness import Skip, run
+from harness import Skip, legacy, run
 from warpc import sources
 from warpc.compiler import Pack
 from warpc.errors import UnsupportedModel
@@ -23,13 +26,12 @@ from warpc.sources import ModelConfig, Requantized, draft_vocab, quantize_w4
 from warpc.sources.requantize import DRAFT_HEAD, MTP_MATRICES
 from warpc.swiftmk.pack import Packer, w4_scale_offset
 
-REPO = Path(__file__).resolve().parents[2]
 VOCAB_SHA256 = "e05393340fbd26043a9641f3a84036f8db37f165580df2bffc76a0384cded2ec"
 GROUP = 128
 
 
 def _hand_quant_w4(w, clip=True, rows_per_chunk=None, device="cuda"):
-    """engine/pack_mtp.py:quant_w4 verbatim (used when engine/ is not importable)."""
+    """engine/pack_mtp.py:quant_w4 of v0.12.0 verbatim (used when $WARPC_LEGACY_DIR is not set)."""
     N, K = w.shape
     out_w = torch.empty(N, K // 8, dtype=torch.int32, device=device)
     out_s = torch.empty(N, K // GROUP, dtype=torch.bfloat16, device=device)
@@ -61,16 +63,15 @@ def _hand_quant_w4(w, clip=True, rows_per_chunk=None, device="cuda"):
 
 
 def _hand_modules():
-    """(pack_mtp, pack) of the hand engine, or None when engine/ is not importable."""
-    engine = REPO / "engine"
-    if not (engine / "pack_mtp.py").is_file():
+    """(pack_mtp, pack) of the hand engine (the v0.12.0 checkout's engine/), or None when $WARPC_LEGACY_DIR is unset."""
+    try:
+        engine = legacy().engine_dir()
+    except Skip:
         return None
     sys.path.insert(0, str(engine))
     try:
         import pack
         import pack_mtp
-    except ImportError:
-        return None
     finally:
         sys.path.remove(str(engine))
     return pack_mtp, pack
@@ -106,9 +107,11 @@ def test_draft_vocab():
     assert ids.dtype == np.int64 and ids.shape == (68864,) and bool(np.all(np.diff(ids) > 0))
     path = Path(sources.requantize.__file__).parent / "data" / "draft_vocab_ext_68864.npy"
     assert hashlib.sha256(path.read_bytes()).hexdigest() == VOCAB_SHA256
-    hand = REPO / "engine" / "draft_vocab_ext_68864.npy"
-    if hand.is_file():
-        assert hand.read_bytes() == path.read_bytes()
+    try:
+        hand = legacy().engine_dir() / "draft_vocab_ext_68864.npy"
+    except Skip:
+        return
+    assert hand.read_bytes() == path.read_bytes()
 
 
 def test_quantize_matches_hand_on_cpu():
@@ -332,7 +335,7 @@ def test_g1_mtp_packs_equal_the_hand_engine():
         raise Skip("no CUDA device")
     mods = _hand_modules()
     if mods is None:
-        raise Skip("engine/ is not importable")
+        raise Skip("WARPC_LEGACY_DIR unset")
     hand_mtp, hand_pack = mods
     src = sources.open(path)
     H, INTER = 5120, 17408

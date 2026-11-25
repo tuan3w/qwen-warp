@@ -2,7 +2,7 @@
 RMSNorm with and without the residual add, the T = 1 bf16 head GEMV, the small a|b GEMV. All three are bit-identical by
 contract; the A/B also times each pair as a decode step runs it (CUDA graph, median of 200 replays).
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tests/test_hybrid.py
+  WARPC_SWIFTMK_LIB=<libswiftmk.so> uv run --package warpc python warpc/tests/test_hybrid.py
   WARPC_TEST_SWIFT27=<27B checkpoint dir>  also runs the plan test (CPU)
 
 Needs a CUDA device and $WARPC_SWIFTMK_LIB; the GPU tests skip without either.

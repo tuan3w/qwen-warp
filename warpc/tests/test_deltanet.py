@@ -1,7 +1,7 @@
 """Family 6, the Gated DeltaNet step `g_deltanet` (cuda/deltanet.py, kernels/qwen35_deltanet*): capability match on
 CPU, then the kernel gates against the hand engine's `swiftmk_deltanet_step_lazy2` on the GPU (design 5.2 row 6).
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> [WARPC_TEST_SWIFT27=<27B checkpoint dir>] \\
+  WARPC_LEGACY_DIR=<v0.12.0> WARPC_SWIFTMK_LIB=<libswiftmk.so> [WARPC_TEST_SWIFT27=<27B checkpoint dir>] \\
       [WARPC_DN_TRACE=<trace.pt>] uv run --package warpc python warpc/tests/test_deltanet.py
 
 Inputs: the real shapes (Hk 16, Hv 48, dk = dv = 128, C 10240, W 4). The layer weights are the checkpoint's when
@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from ab_util import graph_us, stream
-from harness import Skip, run
+from harness import Skip, legacy, run
 from warpc import frontend
 from warpc.compiler.fuse import fuse
 from warpc.cuda import deltanet, glue
@@ -526,11 +526,10 @@ def capture(model_dir: str, out: str, layers=(0, 20, 46), steps: int = 1024) -> 
     from ab_util import Tap
     from warpc.swiftmk import SwiftmkBackend
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    corpus = legacy().corpus()
     from prompts import prompt_ids
 
-    files = sorted(Path(__file__).resolve().parents[2].glob("engine/src/*.cu"), key=str)
-    ids = prompt_ids(Path(model_dir), files, 385)
+    ids = prompt_ids(Path(model_dir), corpus, 385)
     tap = Tap(SwiftmkBackend("bf16"), ("s_deltanet",), layers=tuple(layers))
     m = warpc.compile(model_dir, ctx_max=2048, rows_max=8, kv="bf16", backend=tap.backend)
     tap.run(m, ids, steps)

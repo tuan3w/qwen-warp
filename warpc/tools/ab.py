@@ -1,8 +1,10 @@
 """The A/B/A/B speed protocol of the speculative gate (design mtp-design.md §4.1 G6, §7.1): warpc against the hand
 engine, same prompts, same configuration, alternating processes so that clock and thermal drift hit both sides alike.
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> uv run --package warpc python warpc/tools/ab.py MODEL \
-      --mtp 3 --kv int4_rot --head int4_refine --prompt-files engine/src/*.cu --prompt-len 385 4096 16384 \
+  # WARPC_LEGACY_DIR: a v0.12.0 checkout (hand engine, prompt corpus); WARPC_SWIFTMK_LIB: its libswiftmk.so
+  uv run --package warpc python warpc/tools/ab.py MODEL \
+      --mtp 3 --kv int4_rot --head int4_refine --prompt-len 385 4096 16384 \
+      --prompt-files "$WARPC_LEGACY_DIR"/engine/src/*.cu \
       [--visits 2] [--repeats 5] [--tokens 256] [--host-tables] [--forge-position] [--plain] [--wrap CMD ...] --out FILE
 
 One visit = one `bench.py` process per side (the two hold 17 - 19 GB each and cannot share the card), each decoding
@@ -24,6 +26,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import prompts
 
 BENCH = Path(__file__).resolve().parent / "bench.py"
 
@@ -52,7 +56,7 @@ def main() -> None:
     ap.add_argument("--mtp", type=int, default=3)
     ap.add_argument("--kv", default="int4_rot")
     ap.add_argument("--head", default="int4_refine")
-    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True)
+    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help=prompts.PROMPT_FILES_HELP)
     ap.add_argument("--prompt-len", type=int, nargs="+", required=True)
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--repeats", type=int, default=5)

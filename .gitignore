@@ -1,4 +1,3 @@
-engine/build/
 __pycache__/
 *.pyc
 *.so

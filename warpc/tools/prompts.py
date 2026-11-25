@@ -32,6 +32,12 @@ def add_slices(ap) -> None:
     ap.add_argument("--slices", type=int, default=3, help="disjoint prompts per length")
 
 
+PROMPT_FILES_HELP = (
+    "text the prompt is cut from; the 27B protocol's corpus is engine/src/*.cu of the v0.12.0 checkout: "
+    '"$WARPC_LEGACY_DIR"/engine/src/*.cu'
+)
+
+
 def add_arguments(ap) -> None:
-    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help="text the prompt is cut from")
+    ap.add_argument("--prompt-files", type=Path, nargs="+", required=True, help=PROMPT_FILES_HELP)
     ap.add_argument("--prompt-len", type=int, nargs="+", required=True, help="prompt length(s) in tokens")

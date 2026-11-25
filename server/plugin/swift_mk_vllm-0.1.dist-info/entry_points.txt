@@ -1,2 +1,0 @@
-[vllm.general_plugins]
-swift_mk = swift_mk_vllm:register

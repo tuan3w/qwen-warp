@@ -2477,43 +2477,11 @@ name = "qwen-warp"
 version = "0.12.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "flash-linear-attention" },
-    { name = "httpx" },
-    { name = "numpy" },
-    { name = "safetensors" },
-    { name = "torch" },
-    { name = "torchaudio" },
-    { name = "torchvision" },
-    { name = "transformers" },
-    { name = "uvloop" },
-    { name = "vllm" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "huggingface-hub" },
-    { name = "openai" },
+    { name = "warpc", extra = ["prefill"] },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "flash-linear-attention", specifier = "==0.5.2" },
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "numpy", specifier = "==2.3.5" },
-    { name = "safetensors", specifier = "==0.8.0" },
-    { name = "torch", specifier = "==2.14.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchaudio", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchvision", specifier = "==0.29.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "transformers", specifier = "==5.18.0" },
-    { name = "uvloop", specifier = "==0.23.0" },
-    { name = "vllm", specifier = "==0.34.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "huggingface-hub" },
-    { name = "openai", specifier = "==3.24.0" },
-]
+requires-dist = [{ name = "warpc", extras = ["prefill"], editable = "warpc" }]
 
 [[package]]
 name = "referencing"
@@ -3273,11 +3241,14 @@ dependencies = [
 [package.optional-dependencies]
 prefill = [
     { name = "flash-linear-attention" },
+    { name = "torchaudio" },
+    { name = "torchvision" },
     { name = "vllm" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "huggingface-hub" },
     { name = "ruff" },
     { name = "transformers" },
 ]
@@ -3289,12 +3260,15 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.3" },
     { name = "safetensors", specifier = ">=0.8" },
     { name = "torch", specifier = ">=2.14", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchaudio", marker = "extra == 'prefill'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchvision", marker = "extra == 'prefill'", specifier = "==0.29.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "vllm", marker = "extra == 'prefill'", specifier = "==0.34.0" },
 ]
 provides-extras = ["prefill"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "huggingface-hub" },
     { name = "ruff", specifier = "==0.17.6" },
     { name = "transformers", specifier = ">=5.18" },
 ]

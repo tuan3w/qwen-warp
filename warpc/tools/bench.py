@@ -5,9 +5,9 @@
       [--kernels K,...] [--head bf16|int4_refine] [--mtp K] [--host-tables] [--window] [--forge-position] \
       [--prompt-files F... --prompt-len L...] [--gpu-memory-utilization U...] [--language-model-only]
 
-ENGINE is warpc, llama-server, vllm or swift-engine (the hand engine of this repository, 27B checkpoint only); MODEL an
-HF checkpoint directory or a GGUF file. Every engine decodes --tokens tokens greedily, end of sequence ignored: one
-warm-up round, then the median tok/s of --repeats rounds. Only decode is timed.
+ENGINE is warpc, llama-server, vllm or swift-engine (the hand engine of the v0.12.0 checkout $WARPC_LEGACY_DIR, 27B
+checkpoint only); MODEL an HF checkpoint directory or a GGUF file. Every engine decodes --tokens tokens greedily, end
+of sequence ignored: one warm-up round, then the median tok/s of --repeats rounds. Only decode is timed.
 
 Without --prompt-files, the prompt is the same 5 tokens on every engine:
   warpc: wall time of Model.decode(tokens) after the prefill; decode returns once the last token is on the host. Also
@@ -228,7 +228,7 @@ def main():
     ap.add_argument("--backend", choices=BACKENDS, default="cuda", help="warpc backend")
     ap.add_argument("--kernels", help="composite: the warpc kernels admitted, comma-separated (default: all)")
     ap.add_argument("--head", choices=("bf16", "int4_refine"), default="bf16", help="swiftmk / swift-engine head")
-    ap.add_argument("--prompt-files", type=Path, nargs="+", help="text the long prompts are cut from")
+    ap.add_argument("--prompt-files", type=Path, nargs="+", help=prompts.PROMPT_FILES_HELP)
     ap.add_argument("--ids-file", type=Path, help="warpc: JSON with 'speed': {length: prompt ids}, instead of files")
     ap.add_argument("--prompt-len", type=int, nargs="+", help="long prompt length(s) in tokens")
     ap.add_argument(

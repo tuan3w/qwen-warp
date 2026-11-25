@@ -1,41 +1,25 @@
 [project]
 name = "qwen-warp"
 version = "0.12.0"
-description = "Single-stream CUDA decode engine + OpenAI server for Swift-1.5-Qwen3.8-27B INT4 on one RTX 3090, with a 4-bit KV cache for 262k-token contexts"
+description = "Workspace root of qwen-warp; the code is warpc, a compiler from model checkpoints to fused CUDA kernels replayed as CUDA graphs"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = "==3.12.*"
-# Versions the engine and server were built and measured with (CUDA 13.0 toolkit, driver >= 580).
-# torch / torchvision / torchaudio come from PyTorch's own cu130 index (see [tool.uv.sources]) so the CUDA runtime matches the nvcc 13.0 the engine is built with.
-dependencies = [
-    "torch==2.14.0",
-    "torchvision==0.29.0",
-    "torchaudio==2.11.0",
-    "vllm==0.34.0",
-    "flash-linear-attention==0.5.2",
-    "transformers==5.18.0",
-    "numpy==2.3.5",
-    "safetensors==0.8.0",
-    "uvloop==0.23.0",
-    "httpx==0.28.1",
-]
-
-[dependency-groups]
-dev = [
-    "openai==3.24.0",       # tests/test_server_smoke.py
-    "huggingface-hub",      # scripts/fetch_model.sh
-]
+# Everything warpc's tools and tests import at run time beyond what warpc requires of itself: the `prefill` extra (fla and vLLM;
+# the v0.12.0 hand engine that `WARPC_LEGACY_DIR` names imports both). Versions are fixed by uv.lock and by warpc's pins.
+# torch / torchvision / torchaudio come from PyTorch's own cu130 index (see [tool.uv.sources]) so the CUDA runtime matches the nvcc 13.0 that warpc's kernels and the hand engine's library are built with.
+dependencies = ["warpc[prefill]"]
 
 [tool.uv]
-package = false             # not a Python package: engine/ and server/ are run in place
+package = false             # not a Python package: the workspace root only
 # vLLM declares setuptools<81; the open advisories (sdist MANIFEST.in bypass, Windows path escape while installing a legacy wheel) are fixed in 83.0.0 / 84.1.0.
-# The server and the tests were run with 84.2.1 (see CHANGELOG).
 override-dependencies = ["setuptools>=84.1.0"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
+warpc = { workspace = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

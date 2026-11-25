@@ -1,6 +1,6 @@
 """MTP speculative decoding: the device bookkeeping of a cycle, the exactness and resume properties on the 27B.
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint> \
+  WARPC_LEGACY_DIR=<v0.12.0> WARPC_SWIFTMK_LIB=<libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint> \
       uv run --package warpc python warpc/tests/test_speculate.py
 
 The accept program and the ring cursors need a CUDA device; the 27B tests also the checkpoint and the hand engine's
@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 import warpc
-from harness import Skip, run
+from harness import Skip, legacy, run
 from warpc import speculate
 from warpc.composite import CompositeBackend
 from warpc.cuda import CudaBackend
@@ -28,7 +28,6 @@ from warpc.swiftmk import lib as smk
 from warpc.swiftmk.executor import LAZY_ROWS, ring_commit
 
 GLUE = ["g_select_row", "g_take", "g_concat"]
-SOURCES = sorted((Path(__file__).resolve().parents[2] / "engine" / "src").glob("*.cu"))
 
 
 def _cuda() -> None:
@@ -195,10 +194,11 @@ def _model(kv: str, ctx_max: int = 4608, *, k: int = 3, host_tables: bool = Fals
 
 
 def _ids(n: int, slice_: int = 0) -> list[int]:
+    corpus = legacy().corpus()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
     import prompts
 
-    return prompts.prompt_ids(_checkpoint(), SOURCES, n, slice_ * prompts.SLICE_STRIDE)
+    return prompts.prompt_ids(_checkpoint(), corpus, n, slice_ * prompts.SLICE_STRIDE)
 
 
 def _greedy(m, ids: list[int], n: int, k: int, cap=None) -> list[int]:

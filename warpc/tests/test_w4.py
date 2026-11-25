@@ -7,7 +7,7 @@ repack, and the kernel's gates at kernel level.
   gate 3: bitwise against the hand kernel smk_w4r_gemv
   speed:  GB/s of both on the 27B shapes, CUDA-graph timed
 
-  WARPC_SWIFTMK_LIB=<engine/build/libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint dir> \\
+  WARPC_SWIFTMK_LIB=<libswiftmk.so> WARPC_TEST_SWIFT27=<27B checkpoint dir> \\
       uv run --package warpc python warpc/tests/test_w4.py
 
 The kernel tests need a CUDA device (gate 3 and the speed test also $WARPC_SWIFTMK_LIB); they skip without. The caps
