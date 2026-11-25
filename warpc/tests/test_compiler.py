@@ -296,7 +296,7 @@ def test_lowering_error_names_the_ops_and_reasons():
     except LoweringError as e:
         msg = str(e)
         assert msg.startswith("cuda: no kernel for") and "linear" in msg and "attention" in msg, msg
-        assert "K=64 is not a multiple of 256" in msg and "hd=32 not in (64, 128, 256)" in msg, msg
+        assert "K=64 is not a multiple of 256" in msg and "hd=32 not in (64, 128, 256, 512)" in msg, msg
     else:
         raise AssertionError("hidden 64 / head dim 32 must not lower")
 
@@ -329,7 +329,7 @@ def test_int4_rot_lowers_at_the_kernel_head_dims_only():
     try:
         lower(g, BACKEND, rows_max=8)
     except LoweringError as e:
-        assert "attention x1: g_attn: hd=96 not in (64, 128, 256)" in str(e), str(e)
+        assert "attention x1: g_attn: hd=96 not in (64, 128, 256, 512)" in str(e), str(e)
     else:
         raise AssertionError("int4_rot has no kernel for head dim 96")
 

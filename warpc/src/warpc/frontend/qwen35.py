@@ -8,13 +8,7 @@ from ..sources import Source
 from . import common
 
 
-def _prefix(source: Source) -> str:
-    """The text model's tensor prefix: "model.language_model." in the vision-language checkpoint, "model." in a
-    Qwen3_5ForCausalLM one."""
-    return "model.language_model." if "model.language_model.embed_tokens.weight" in source else "model."
-
-
-def build(source: Source, *, ctx_max: int, kv: str) -> Graph:
+def build(source: Source, *, ctx_max: int, rows_max: int, kv: str) -> Graph:
     c = source.config
     la = c.linear
     H, FF, hd, rd = c.hidden_size, c.intermediate_size, c.head_dim, c.rotary_dim
@@ -24,7 +18,7 @@ def build(source: Source, *, ctx_max: int, kv: str) -> Graph:
     missing: list[str] = []
     g = Graph(c.family)
     tokens, pos = common.inputs(g)
-    prefix = _prefix(source)
+    prefix = common.text_prefix(source)
 
     def weight(decl: str, tensor: str, shape: tuple[int, ...]) -> str:
         return common.weight(g, source, missing, decl, tensor, shape)

@@ -11,6 +11,7 @@ from .graph import (
     StateDecl,
     TType,
     WeightDecl,
+    reads_of,
     states_of,
     weights_of,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "StateDecl",
     "TType",
     "WeightDecl",
+    "reads_of",
     "states_of",
     "weights_of",
 ]

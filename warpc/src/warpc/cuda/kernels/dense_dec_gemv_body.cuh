@@ -35,6 +35,7 @@ int by_rpw(const GemvP& p, int rpw, cudaStream_t st) {
 template <bool NORM>
 int by_nit(const GemvP& p, int rpw, cudaStream_t st) {
   switch (p.K / 256) {
+    case 1: return by_rpw<1, NORM>(p, rpw, st);
     case 4: return by_rpw<4, NORM>(p, rpw, st);
     case 6: return by_rpw<6, NORM>(p, rpw, st);
     case 8: return by_rpw<8, NORM>(p, rpw, st);

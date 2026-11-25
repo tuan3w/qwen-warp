@@ -35,6 +35,20 @@ def _norm_offset(m, A) -> float:
     return next((A.node(i).attrs.get("offset", 0.0) for i in m.pre if A.node(i).op == "rmsnorm"), 0.0)
 
 
+def _norms_weighted(m, A) -> bool:
+    """Every rmsnorm a match folds in front of its anchor carries a weight (the kernels have no weightless norm)."""
+    return all("weight" in A.node(i).attrs for i in m.pre if A.node(i).op == "rmsnorm")
+
+
+ACT_CODES = {"silu": 0, "gelu_tanh": 1}  # the GEMV kernels' `act`
+
+
+def _act_of(m, A) -> str:
+    """The gate activation of the silu_mul / gelu_mul a pair or row match absorbs."""
+    n = A.node(m.pair if m.pair is not None else m.post[0])
+    return {"silu_mul": "silu", "gelu_mul": "gelu_tanh"}[n.op]
+
+
 def _gemv_consts(mode: int):
     def f(m, A):
         shapes = [_lin_shape(A, i) for i in m.anchors]
@@ -47,6 +61,8 @@ def _gemv_consts(mode: int):
             "mode": mode,
             "dtype": A.graph.types[A.node(m.anchors[0]).ins[0]].dtype,
             "offset": _norm_offset(m, A),
+            "weighted": _norms_weighted(m, A),
+            **({"act": _act_of(m, A)} if mode in (1, 4) else {}),
         }
 
     return f
@@ -80,6 +96,75 @@ def _dual_check(m, A):
     return _norm_prologue_check(m, A)
 
 
+def _row_check(m, A):
+    """The linear is the gate (first input) of the gelu_mul; the other operand is a value computed outside the region
+    that the kernel reads row by row."""
+    gm = A.node(m.post[0])
+    if gm.ins[0] != A.node(m.anchors[0]).outs[0] or gm.ins[1] == gm.ins[0]:
+        return "the linear must be the first input of the gelu_mul, the other operand a value from outside"
+    return _gemv_check(m, A)
+
+
+def _head_check(m, A):
+    """With a softcap the kernel stores only the capped logits: nothing else may read the cast's fp32 values."""
+    if len(m.post) == 3:
+        cast = A.node(m.post[0]).outs[0]
+        if A.consumers(cast) != [m.post[1]] or cast in A.outputs:
+            return "the logits before the softcap have other readers: the kernel writes the capped logits only"
+    return None
+
+
+def _post_norm_check(m, A):
+    """x = add(h, rmsnorm(y)) [then scale by the layer's learned [1] weight]: the kernel stores the final stream, so a
+    scale must be the only reader of the sum."""
+    if len(m.post) == 2:
+        sc, add = A.node(m.post[1]), A.node(m.post[0])
+        if "weight" not in sc.attrs or A.graph.weights[sc.attrs["weight"]].shape != (1,):
+            return "the scale is not by a learned [1] weight"
+        if A.consumers(add.outs[0]) != [m.post[1]] or add.outs[0] in A.outputs:
+            return "the sum has readers besides the scale: the kernel writes only the scaled stream"
+    return None
+
+
+def _ple_nodes(m, A):
+    """(scale in, norm, embed, add, scale out, split) of a PLE match."""
+    pre = [A.node(i) for i in m.pre]
+    first = {n.op: n for n in reversed(pre)}
+    return first["scale"], first["rmsnorm"], first["embed"], A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[1])
+
+
+def _ple_consts(m, A):
+    _, norm, _, _, _, _ = _ple_nodes(m, A)
+    x = A.graph.types[norm.ins[0]]
+    return {
+        "L": x.shape[-2] if len(x.shape) == 3 else 0,
+        "D": x.shape[-1],
+        "rank": len(x.shape),
+        "T": A.rows_max,
+        "dtype": x.dtype,
+        "offset": norm.attrs.get("offset", 0.0),
+        "weighted": "weight" in norm.attrs,
+    }
+
+
+def _ple_check(m, A):
+    """The per-layer-embedding prelude: add(norm(reshape(scale(ctx))) reshaped back, embed(tokens)), scaled and split
+    into one [T, D] slice per layer; both scales are constant factors."""
+    g = A.graph
+    sin, norm, emb, add, sout, split = _ple_nodes(m, A)
+    L, D = m.consts["L"], m.consts["D"]
+    if "factor" not in sin.attrs or "factor" not in sout.attrs:
+        return "the prelude's scales are constant factors"
+    r1, r2 = A.node(A.prod[norm.ins[0]]), A.node(A.prod[add.ins[0] if add.ins[0] != emb.outs[0] else add.ins[1]])
+    if r1.ins != sin.outs or r2.ins != norm.outs or {*add.ins} != {r2.outs[0], emb.outs[0]}:
+        return "not scale -> reshape -> norm -> reshape -> add with the embedding"
+    if g.types[r2.outs[0]].shape[-1] != L * D or g.weights[emb.attrs["weight"]].shape[1] != L * D:
+        return "the embedding row is not L x D wide"
+    if emb.ins != ["tokens"] or list(split.attrs["sizes"]) != [D] * L:
+        return "the embedding is not of the step's tokens, or the split is not L slices of D"
+    return None
+
+
 def _norm_consts(m, A):
     n = A.node(m.anchors[0])
     x = A.graph.types[n.ins[0]]
@@ -90,7 +175,18 @@ def _norm_consts(m, A):
         "rank": len(x.shape),
         "dtype": x.dtype,
         "offset": n.attrs.get("offset", 0.0),
+        "weighted": "weight" in n.attrs,
     }
+
+
+def _attn_norms(m, A) -> tuple[list[int], list[int]]:
+    """The rmsnorm nodes a match folds in: (those on the q / k the rope rotates, those on the attention's v)."""
+    att = A.node(m.anchors[0])
+    rp = A.prod.get(att.ins[0])
+    rotated = set(A.node(rp).ins[:-1]) if rp is not None and A.node(rp).op == "rope" else set()
+    v = att.ins[2] if att.op == "attention" else None
+    norms = [i for i in m.pre if A.node(i).op == "rmsnorm"]
+    return [i for i in norms if A.node(i).outs[0] in rotated], [i for i in norms if A.node(i).outs[0] == v]
 
 
 def _attn_consts(m, A):
@@ -101,7 +197,9 @@ def _attn_consts(m, A):
     hq = g.types[att.ins[0]].shape[1]
     rp = A.prod.get(att.ins[0])
     rd = A.node(rp).attrs["rotary_dim"] if rp is not None and A.node(rp).op == "rope" else 0
-    nc = schedule.attn_chunks(ctx)
+    window = att.attrs.get("window")
+    nc = schedule.attn_chunks(ctx, window)
+    qk, vn = _attn_norms(m, A)
     return {
         "hd": hd,
         "Hq": hq,
@@ -113,8 +211,12 @@ def _attn_consts(m, A):
         "cache": st.cache,
         "dtype": g.types[att.ins[0]].dtype,
         "nc": nc,
-        "nsplit": schedule.attn_splits(ctx, nc),
-        "offset": _norm_offset(m, A),
+        "nsplit": schedule.attn_splits(ctx, nc, window),
+        # the q / k norms' (the v norm has no weight and no offset)
+        "offset": next((A.node(i).attrs.get("offset", 0.0) for i in qk), 0.0),
+        "weighted": all("weight" in A.node(i).attrs for i in qk),
+        "window": window,
+        "v_norm": bool(vn),
     }
 
 
@@ -134,21 +236,27 @@ def _attn_info(c: dict) -> Verdict:
 def _attn_check(m, A):
     g = A.graph
     att = A.node(m.anchors[0])
-    q, k = att.ins[0], att.ins[1]
+    read = att.op == "attention_read"
+    q = att.ins[0]
     rp = A.prod.get(q)
-    if rp is None or A.prod.get(k) != rp or A.node(rp).outs != [q, k]:
+    if rp is None or A.node(rp).op != "rope" or A.node(rp).outs != ([q] if read else [q, att.ins[1]]):
+        return "q must come from a rope node" if read else "q and k must come from one rope node"
+    if not read and A.prod.get(att.ins[1]) != rp:
         return "q and k must come from one rope node"
-    norms = [A.node(i) for i in m.pre if A.node(i).op == "rmsnorm"]
-    if len(norms) not in (0, 2):
+    qk, vn = _attn_norms(m, A)
+    norms = [A.node(i) for i in qk]
+    if len(norms) not in (0, len(A.node(rp).ins) - 1):
         return "qk-norm must apply to both q and k or neither"
-    if norms and norms[0].attrs["eps"] != norms[1].attrs["eps"]:
-        return "q and k norms differ in eps"
-    if norms and norms[0].attrs.get("offset", 0.0) != norms[1].attrs.get("offset", 0.0):
+    if len({n.attrs["eps"] for n in (*norms, *(A.node(i) for i in vn))}) > 1:
+        return "the q / k / v norms differ in eps"
+    if len({n.attrs.get("offset", 0.0) for n in norms}) > 1:
         return "q and k norms differ in offset"
+    if any("weight" in A.node(i).attrs for i in vn):
+        return "the v norm carries a weight (the kernel's is weightless)"
 
     # the launcher reads the GEMV outputs through the reshapes: q and k reach the rope as (qk-norm of)
-    # reshape(projection) and v as reshape(projection); a norm anywhere else (full width before the reshape, or on v)
-    # has no place in the kernel
+    # reshape(projection) and v as (a weightless norm of) reshape(projection); a norm anywhere else (full width before
+    # the reshape) has no place in the kernel
     def reshaped(v_):
         pn = A.prod.get(v_)
         ok = (
@@ -159,24 +267,27 @@ def _attn_check(m, A):
         )
         return pn if ok else None
 
-    direct = []  # the norms that sit between a reshape and the rope
-    for v_ in A.node(rp).ins[:2]:
+    direct = []  # the norms that sit between a reshape and the rope (or the attention's v)
+    sources = [*A.node(rp).ins[:-1], *([] if read else [att.ins[2]])]
+    for v_ in sources:
         pn = A.prod.get(v_)
         if pn in m.covers and A.node(pn).op == "rmsnorm":
             direct.append(pn)
             v_ = A.node(pn).ins[0]
         if reshaped(v_) is None:
-            return (
-                "q and k must be (a qk-norm of) a reshape of a projection output: a norm elsewhere is not the kernel's"
-            )
-    if reshaped(att.ins[2]) is None:
-        return "v must be a reshape of a projection output"
+            return "q, k and v must be (a norm of) a reshape of a projection output: a norm elsewhere is no kernel's"
     if sorted(direct) != sorted(i for i in m.pre if A.node(i).op == "rmsnorm"):
-        return "a norm in front of the attention does not sit between the q / k reshape and the rope"
-    cache = g.states[att.attrs["state"]].cache
-    if cache not in FORMATS:
-        return f"KV cache format {cache} has no kernel here"
-    return schedule.kv_kernel_reason(FORMATS[cache], m.consts["hd"])
+        return "a norm in front of the attention does not sit between the reshape and the rope / attention"
+    st = g.states[att.attrs["state"]]
+    if st.cache not in FORMATS:
+        return f"KV cache format {st.cache} has no kernel here"
+    if vn and FORMATS[st.cache].quantized:
+        return f"KV format {st.cache} has no weightless v-norm kernel"
+    window, ctx = m.consts["window"], m.consts["ctx"]
+    ctx_max = max(s.shape[1] for s in g.states.values() if s.kind == "kv")
+    if window is not None and ctx < ctx_max and ctx < window + A.rows_max - 1:
+        return f"a ring of {ctx} rows cannot hold a window of {window} keys and a step of {A.rows_max} rows"
+    return schedule.kv_kernel_reason(FORMATS[st.cache], m.consts["hd"], window)
 
 
 def _unfused_ctas(n, A) -> int:
@@ -184,9 +295,9 @@ def _unfused_ctas(n, A) -> int:
     if n.op == "linear":
         w = A.graph.weights[n.attrs["weight"]]
         return schedule.gemv_ctas(w.shape[0], w.shape[1], 0)
-    if n.op == "attention":
+    if n.op in ("attention", "attention_read"):
         _, ctx, hkv, _ = A.graph.states[n.attrs["state"]].shape
-        return hkv * min(schedule.ATTN_MAX_SPLITS, max(1, schedule.attn_splits(ctx, 1)))
+        return hkv * min(schedule.ATTN_MAX_SPLITS, max(1, schedule.attn_splits(ctx, 1, n.attrs.get("window"))))
     if n.op in ("rmsnorm", "embed"):
         return 1  # one CTA per row, priced at one decode row
     # ops this backend only runs fused: priced as an elementwise kernel of 256 threads x 8 bf16 per CTA over the
@@ -217,9 +328,12 @@ def _emit_embed(m, A):
         ins={"tok": "@tokens"},
         outs={"x": n.outs[0]},
         weights={"table": w},
-        attrs={"H": A.graph.weights[w].shape[1]},
+        attrs={
+            "H": A.graph.weights[w].shape[1],
+            **({"scale": n.attrs["scale"]} if n.attrs.get("scale", 1.0) != 1.0 else {}),
+        },
         packs=[Pack(w, "dense", [w])],
-        numerics="row gather",
+        numerics="row gather, scaled by bf16(scale) when the node carries one",
     )
 
 
@@ -250,6 +364,52 @@ def _emit_rmsnorm(m, A):
         attrs=attrs,
         inplace=("h_out", "h"),
         numerics="h = bf16(h + y) in place, then fp32 rmsnorm with one rounding",
+    )
+
+
+def _emit_rmsnorm_post(m, A):
+    rn = A.node(m.anchors[0])
+    w = rn.attrs["weight"]
+    weights, packs = {"w": w}, [Pack(w, "dense", [w])]
+    numerics = "h = bf16(h + bf16(fp32 rmsnorm)) in place"
+    if len(m.post) == 2:
+        s = A.node(m.post[1]).attrs["weight"]
+        weights["s"] = s
+        packs.append(Pack(s, "dense", [s]))
+        numerics += ", then h = bf16(h * the layer scalar)"
+    return Region(
+        "g_rmsnorm_post",
+        set(m.covers),
+        ins={"x": rn.ins[0], "h": m.h},
+        outs={"h_out": A.node(m.post[-1]).outs[0]},
+        weights=weights,
+        packs=packs,
+        attrs={"H": A.graph.types[rn.ins[0]].shape[-1], "eps": rn.attrs["eps"]},
+        inplace=("h_out", "h"),
+        numerics=numerics,
+    )
+
+
+def _emit_ple(m, A):
+    sin, norm, emb, _, sout, split = _ple_nodes(m, A)
+    w, table = norm.attrs["weight"], emb.attrs["weight"]
+    return Region(
+        "g_ple",
+        set(m.covers),
+        ins={"ctx": sin.ins[0], "tok": "@tokens"},
+        outs={f"p{j}": v for j, v in enumerate(split.outs)},
+        weights={"w": w, "table": table},
+        packs=[Pack(w, "dense", [w]), Pack(table, "dense", [table])],
+        attrs={
+            "L": m.consts["L"],
+            "D": m.consts["D"],
+            "eps": norm.attrs["eps"],
+            "ctx_scale": sin.attrs["factor"],
+            "out_scale": sout.attrs["factor"],
+            "scale": emb.attrs.get("scale", 1.0),
+        },
+        numerics="fp32 rmsnorm over each D-wide slice (thread partials of 8 in order, butterfly, warp sums in order);"
+        " every op boundary rounded to bf16 as the interpreter does",
     )
 
 
@@ -285,8 +445,12 @@ def _emit_dual(kernel: str, kind: str, numerics: str):
             outs={"out": A.node(m.pair).outs[0]},
             weights={"w": wg, "w2": wu},
             packs=[Pack(wg, kind, [wg]), Pack(wu, kind, [wu])],
-            attrs={"N": A.graph.weights[wg].shape[0], "K": A.graph.weights[wg].shape[1]},
-            numerics=numerics + "; silu emulated at bf16 between the two roundings",
+            attrs={
+                "N": A.graph.weights[wg].shape[0],
+                "K": A.graph.weights[wg].shape[1],
+                **({"act": ACT_CODES[_act_of(m, A)]} if _act_of(m, A) != "silu" else {}),
+            },
+            numerics=numerics + f"; {_act_of(m, A)} emulated at bf16 between the two roundings",
         )
         return _with_norm(m, A, r)
 
@@ -312,39 +476,70 @@ def _emit_resadd(kernel: str, kind: str, numerics: str):
     return emit
 
 
+def _emit_row(kernel: str, kind: str, numerics: str):
+    def emit(m, A):
+        lin, gm = A.node(m.anchors[0]), A.node(m.post[0])
+        w = A.graph.weights[lin.attrs["weight"]]
+        return Region(
+            kernel,
+            set(m.covers),
+            ins={"x": lin.ins[0], "row": gm.ins[1]},
+            outs={"out": gm.outs[0]},
+            weights={"w": w.name},
+            packs=[Pack(w.name, kind, [w.name])],
+            attrs={"N": w.shape[0], "K": w.shape[1], "act": ACT_CODES[_act_of(m, A)]},
+            numerics=numerics + f"; {_act_of(m, A)} emulated at bf16, then the product with the row operand",
+        )
+
+    return emit
+
+
 def _emit_head(m, A):
-    ln, cast, amax = A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[1])
+    ln, cast, amax = A.node(m.anchors[0]), A.node(m.post[0]), A.node(m.post[-1])
+    cap = A.node(m.post[1]) if len(m.post) == 3 else None
     w = A.graph.weights[ln.attrs["weight"]]
     return Region(
         "g_head",
         set(m.covers),
         ins={"x": ln.ins[0]},
-        outs={"logits": cast.outs[0], "ids": amax.outs[0]},
+        outs={"logits": (cap or cast).outs[0], "ids": amax.outs[0]},
         weights={"w": w.name},
         packs=[Pack(w.name, "dense", [w.name])],
-        attrs={"N": w.shape[0], "K": w.shape[1]},
-        numerics=HEAD_NUMERICS,
+        attrs={"N": w.shape[0], "K": w.shape[1], **({"cap": cap.attrs["cap"]} if cap else {})},
+        numerics=HEAD_NUMERICS + ("; softcap in fp32 on the accumulator" if cap else ""),
     )
 
 
 def _emit_attn(m, A):
     g = A.graph
     n = A.node(m.anchors[0])
-    q, _k, v, _pos = n.ins
-    rpn = A.node(A.prod[q])
+    read = n.op == "attention_read"
+    rpn = A.node(A.prod[n.ins[0]])
     norms, srcs = [], []
-    for v_ in rpn.ins[:2]:
+    for v_ in rpn.ins[:-1]:
         rn = A.prod.get(v_)
         if rn in m.covers and A.node(rn).op == "rmsnorm":
             norms.append(A.node(rn))
             v_ = A.node(rn).ins[0]
         srcs.append(A.node(A.prod[v_]).ins[0])  # the reshape's input: the GEMV output the kernel reads in place
+    ins, vnorm = {"q": srcs[0]}, None
+    if not read:
+        v_ = n.ins[2]
+        if A.prod.get(v_) in m.covers and A.node(A.prod[v_]).op == "rmsnorm":
+            vnorm = A.node(A.prod[v_])
+            v_ = vnorm.ins[0]
+        ins = {**ins, "k": srcs[1], "v": A.node(A.prod[v_]).ins[0]}
     st = g.states[n.attrs["state"]]
     fmt = FORMATS[st.cache]
-    weights = {"q_norm": norms[0].attrs["weight"], "k_norm": norms[1].attrs["weight"]} if norms else {}
-    numerics = (
-        "prep (qk norm, rope, KV write) + split-K flash decode + reduce; fp32 softmax, one bf16 rounding of the output"
-    )
+    weights = {"q_norm": norms[0].attrs["weight"], "k_norm": norms[1].attrs["weight"]} if norms and not read else {}
+    if norms and read:
+        weights = {"q_norm": norms[0].attrs["weight"]}
+    prep = "q prep (norm, rope) + " if read else "prep (qk norm, rope, KV write) + "
+    numerics = prep + "split-K flash decode + reduce; fp32 softmax, one bf16 rounding of the output"
+    if vnorm is not None:
+        numerics += "; weightless v norm in the prep"
+    if n.attrs.get("window") is not None:
+        numerics += f"; window {n.attrs['window']}: chunks below it are skipped, ring slot = position mod rows"
     if isinstance(fmt, RotatedInt4Format):
         numerics += (
             f"; KV cache {st.cache}: the hand engine's rotated int4 (WHT, 16-level companded grid, 8-bit log2 scale per"
@@ -359,10 +554,11 @@ def _emit_attn(m, A):
         )
         if fmt.exact_rows:
             numerics += f", first {fmt.sink} and newest {fmt.window} positions exact (fp16)"
+    eps = next((x.attrs["eps"] for x in (*norms, *([vnorm] if vnorm is not None else []))), None)
     return Region(
-        "g_attn",
+        "g_attn_read" if read else "g_attn",
         set(m.covers),
-        ins={"q": srcs[0], "k": srcs[1], "v": A.node(A.prod[v]).ins[0]},
+        ins=ins,
         outs={"y": n.outs[0]},
         weights=weights,
         states={"kv": n.attrs["state"]},
@@ -375,9 +571,11 @@ def _emit_attn(m, A):
             "ctx": m.consts["ctx"],
             "scale": n.attrs["scale"],
             "qk_norm": bool(norms),
-            **({"eps": norms[0].attrs["eps"]} if norms else {}),
+            **({"eps": eps} if eps is not None else {}),
             "cache": st.cache,
             "nc": m.consts["nc"],
+            **({"window": n.attrs["window"]} if n.attrs.get("window") is not None else {}),
+            **({"v_norm": True} if vnorm is not None else {}),
         },
         packs=[Pack(w, "dense", [w]) for w in weights.values()],
         numerics=numerics,
@@ -390,25 +588,62 @@ _RESADD = Absorb("add", min=1, max=1, exposes=True, inplace=True)
 _ROWS = schedule.STEP_ROWS
 # K: k_gemv reads 8 bf16 per lane and 32 lanes per iteration; k_q4_gemv one Q4_0 block per lane. offset: the norms
 # compute x-hat * w (a folded prologue norm included), not the zero-centred x-hat * (1 + w)
-_GEMV_LIMITS = {"K_multiple": 256, "T_max": _ROWS, "dtype_in": ("bf16",), "offset_in": (0.0,)}
+_GEMV_LIMITS = {
+    "K_multiple": 256,
+    "T_max": _ROWS,
+    "dtype_in": ("bf16",),
+    "offset_in": (0.0,),
+    "weighted_in": (True,),
+}
 _Q4GEMV_LIMITS = {"K_multiple": Q4_0_BLOCK_ELEMS, "T_max": _ROWS, "dtype_in": ("bf16",)}
-_NORM_LIMITS = {"H_multiple": 8, "T_max": _ROWS, "rank_in": (2,), "dtype_in": ("bf16",), "offset_in": (0.0,)}
+_NORM_LIMITS = {
+    "H_multiple": 8,
+    "T_max": _ROWS,
+    "rank_in": (2,),
+    "dtype_in": ("bf16",),
+    "offset_in": (0.0,),
+    "weighted_in": (True,),
+}
+# kernels/gemma_rows.cu PLE_MAX_LAYERS: the layer slices k_ple writes through a by-value pointer array
+PLE_MAX_LAYERS = 64
 
+# hd 512, a window or a ring only with a bf16 cache (schedule.kv_kernel_reason); offset: the q / k norms compute x-hat*w
+_ATTN_LIMITS = {
+    "hd_in": schedule.ATTN_HEAD_DIMS,
+    "G_max": 8,
+    "T_max": _ROWS,
+    "dtype_in": ("bf16",),
+    "offset_in": (0.0,),
+    "weighted_in": (True,),
+}
+
+# attention `launches`: prep + split + merge, as a prompt step (T > 1) runs them. A decode row (T = 1) of head dim
+# 256 / 512 is ONE launch (k_attn_decode1: prep, split and a last-block merge; two when the state has more than 32
+# chunks of 32 keys, i.e. past 1024 positions).
 # order = tie-break of the cost model: the kernels with the most absorbed work first
 CAPS = [
     Cap(
         "g_attn",
         "attention",
-        pre=(Absorb("reshape", min=3, max=3), Absorb("rmsnorm", min=0, max=2), Absorb("rope", min=1, max=1)),
-        limits={
-            "hd_in": schedule.ATTN_HEAD_DIMS,
-            "G_max": 8,
-            "T_max": _ROWS,
-            "dtype_in": ("bf16",),
-            "offset_in": (0.0,),
-        },
+        # q, k, v reshapes; q / k norms (weighted) and v norm (weightless); rope on q and k
+        pre=(Absorb("reshape", min=3, max=3), Absorb("rmsnorm", min=0, max=3), Absorb("rope", min=1, max=1)),
+        limits=_ATTN_LIMITS,
         rounds={"rmsnorm": ("out",), "rope": ("out",), "attention": ("out",)},
         tolerance=("rope.trig", "rope.prod", "attention.p"),
+        launches=3,
+        constants=_attn_consts,
+        info=_attn_info,
+        check=_attn_check,
+        emit=_emit_attn,
+    ),
+    Cap(
+        "g_attn_read",
+        "attention_read",
+        # the q reshape, q norm (weighted) and rope; no KV write: the state is an earlier task's
+        pre=(Absorb("reshape", min=1, max=1), Absorb("rmsnorm", min=0, max=1), Absorb("rope", min=1, max=1)),
+        limits=_ATTN_LIMITS,
+        rounds={"rmsnorm": ("out",), "rope": ("out",), "attention_read": ("out",)},
+        tolerance=("rope.trig", "rope.prod", "attention_read.p"),
         launches=3,
         constants=_attn_consts,
         info=_attn_info,
@@ -430,14 +665,31 @@ CAPS = [
         "g_gemv_dual",
         "linear",
         anchor_schemes=("dense",),
-        pair=("silu_mul",),
+        pair=("silu_mul", "gelu_mul"),
         pre=(_NORM_PRO,),
-        limits=_GEMV_LIMITS,
-        rounds={"linear": ("out",), "rmsnorm": ("out",), "silu_mul": ("silu", "out")},
+        limits={**_GEMV_LIMITS, "act_in": tuple(ACT_CODES)},
+        rounds={
+            "linear": ("out",),
+            "rmsnorm": ("out",),
+            "silu_mul": ("silu", "out"),
+            "gelu_mul": ("gelu", "out"),
+        },
         constants=_gemv_consts(1),
         info=_gemv_info,
         check=_dual_check,
         emit=_emit_dual("g_gemv_dual", "dense", NUM_GEMV),
+    ),
+    Cap(
+        "g_gemv_row",
+        "linear",
+        anchor_schemes=("dense",),
+        post=(Absorb("gelu_mul", min=1, max=1),),
+        limits={**_GEMV_LIMITS, "act_in": ("gelu_tanh",)},
+        rounds={"linear": ("out",), "gelu_mul": ("gelu", "out")},
+        constants=_gemv_consts(4),
+        info=_gemv_info,
+        check=_row_check,
+        emit=_emit_row("g_gemv_row", "dense", NUM_GEMV),
     ),
     Cap(
         "g_head",
@@ -445,6 +697,7 @@ CAPS = [
         anchor_schemes=("dense",),
         post=(
             Absorb("cast", min=1, max=1, exposes=True, attrs={"dtype": "f32"}),
+            Absorb("softcap", min=0, max=1, exposes=True),
             Absorb("argmax", min=1, max=1, exposes=True, reduction_ok=True),
         ),
         limits=_GEMV_LIMITS,
@@ -454,6 +707,7 @@ CAPS = [
         launches=3,
         constants=_gemv_consts(2),
         info=_gemv_info,
+        check=_head_check,
         emit=_emit_head,
     ),
     Cap(
@@ -505,6 +759,17 @@ CAPS = [
         emit=_emit_segments("g_gemv", "dense_cat", "dense", NUM_GEMV),
     ),
     Cap(
+        "g_rmsnorm_post",
+        "rmsnorm",
+        # x = add(h, rmsnorm(y)), then the layer's learned scalar: h is updated in place
+        post=(_RESADD, Absorb("scale", min=0, max=1, exposes=True)),
+        limits={**_NORM_LIMITS, "H_max": 8192},
+        rounds={"rmsnorm": ("out",), "add": ("out",), "scale": ("out",)},
+        constants=_norm_consts,
+        check=_post_norm_check,
+        emit=_emit_rmsnorm_post,
+    ),
+    Cap(
         "g_rmsnorm_add",
         "rmsnorm",
         pre=(_RESADD,),
@@ -521,8 +786,43 @@ CAPS = [
         constants=_norm_consts,
         emit=_emit_rmsnorm,
     ),
-    Cap("g_embed", "embed", rounds={"embed": ("out",)}, emit=_emit_embed),
+    Cap(
+        "g_embed",
+        "embed",
+        limits={"H_multiple": 8},
+        rounds={"embed": ("out",)},
+        constants=lambda m, A: {"H": A.graph.weights[A.node(m.anchors[0]).attrs["weight"]].shape[1]},
+        emit=_emit_embed,
+    ),
+    Cap(
+        "g_ple",
+        "add",
+        # the per-layer-embedding prelude: the projection's scale, its reshape / norm / reshape, the scaled token
+        # embedding, their sum, the sum's scale and the split into one slice per layer
+        pre=(
+            Absorb("scale", min=1, max=1),
+            Absorb("reshape", min=2, max=2),
+            Absorb("rmsnorm", min=1, max=1),
+            Absorb("embed", min=1, max=1),
+        ),
+        post=(Absorb("scale", min=1, max=1), Absorb("split", min=1, max=1, exposes=True)),
+        limits={
+            "D_multiple": 256,
+            "D_max": 1024,
+            "L_max": PLE_MAX_LAYERS,
+            "rank_in": (3,),
+            "T_max": _ROWS,
+            "dtype_in": ("bf16",),
+            "offset_in": (0.0,),
+            "weighted_in": (True,),
+        },
+        rounds={"scale": ("out",), "rmsnorm": ("out",), "embed": ("out",), "add": ("out",)},
+        operand_cap=PLE_MAX_LAYERS + 4,  # the slices, the projection and the tokens, the norm weight and the table
+        constants=_ple_consts,
+        check=_ple_check,
+        emit=_emit_ple,
+    ),
 ]
 
 # an unfused attention is still prep + split + merge; a reshape is a view
-TABLE = CapsTable(CAPS, RTX3090, _unfused_ctas, {"attention": 3, "reshape": 0})
+TABLE = CapsTable(CAPS, RTX3090, _unfused_ctas, {"attention": 3, "attention_read": 3, "reshape": 0, "split": 0})

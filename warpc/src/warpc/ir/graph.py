@@ -64,9 +64,11 @@ class WeightDecl:
 
 @dataclass(frozen=True)
 class StateDecl:
-    """kv: positional cache [2 (K, V), ctx, Hkv, hd] in format `cache` (a name in `warpc.kvcache.FORMATS`). conv: the
-    last W-1 inputs of a depthwise causal conv, [C, W-1], oldest first. recurrent: one matrix per head, [H, dk, dv].
-    Element type: STATE_DTYPE (conv, recurrent) or the cache format (kv)."""
+    """kv: a cache [2 (K, V), R, Hkv, hd] in format `cache` (a name in `warpc.kvcache.FORMATS`): positional when R
+    holds every position, else a ring (position p lives in slot p mod R; a window-w attention needs R >= w + rows - 1
+    for a step of `rows` rows, and the frontend sizes R = min(ctx_max, w + rows_max - 1)). conv: the last W-1 inputs
+    of a depthwise causal conv, [C, W-1], oldest first. recurrent: one matrix per head, [H, dk, dv]. Element type:
+    STATE_DTYPE (conv, recurrent) or the cache format (kv)."""
 
     name: str
     kind: str
@@ -88,15 +90,17 @@ class Node:
 
 @dataclass(frozen=True)
 class OpDef:
-    """An op: `infer(graph, attrs, input types) -> output types`, raising ValueError on ill-typed use. `weights` and
-    `states` list the attrs that name a graph weight / state (an absent optional attr names none); `state_kind` is
-    the kind every named state must have."""
+    """An op: `infer(graph, attrs, input types) -> output types`, raising ValueError on ill-typed use. `weights` list
+    the attrs that name a graph weight (an absent optional attr names none); `states` the attrs that name a state the
+    op writes (an op that writes a cache also reads it); `reads` the attrs that name a state it only reads, one an
+    earlier node of the graph wrote; `state_kind` is the kind every named state must have."""
 
     name: str
     infer: Callable[[Graph, dict, list[TType]], list[TType]]
     weights: tuple[str, ...] = ()
     states: tuple[str, ...] = ()
     state_kind: str = ""
+    reads: tuple[str, ...] = ()
 
 
 OPS: dict[str, OpDef] = {}
@@ -108,8 +112,13 @@ def weights_of(n: Node) -> list[str]:
 
 
 def states_of(n: Node) -> list[str]:
-    """The graph states node `n` reads and writes."""
+    """The graph states node `n` writes (and reads)."""
     return [n.attrs[k] for k in OPS[n.op].states if k in n.attrs]
+
+
+def reads_of(n: Node) -> list[str]:
+    """The graph states node `n` only reads."""
+    return [n.attrs[k] for k in OPS[n.op].reads if k in n.attrs]
 
 
 class Graph:
@@ -176,7 +185,7 @@ class Graph:
         for w in weights_of(n):
             if w not in self.weights:
                 raise ValueError(f"{n.op}: unknown weight {w}")
-        for s in states_of(n):
+        for s in (*states_of(n), *reads_of(n)):
             if s not in self.states:
                 raise ValueError(f"{n.op}: unknown state {s}")
             if self.states[s].kind != d.state_kind:
@@ -190,16 +199,21 @@ class Graph:
 
     def verify(self) -> None:
         """Every input defined before use, every named weight and state declared (states of the op's kind), every
-        stored type equal to a fresh inference, every output defined."""
-        seen = set(self.inputs)
+        state an op only reads written by an earlier node, every stored type equal to a fresh inference, every output
+        defined."""
+        seen, written = set(self.inputs), set()
         for n in self.nodes:
             for v in n.ins:
                 if v not in seen:
                     raise ValueError(f"{n.op}: {v} used before definition")
             self._check_operands(n)
+            for s in reads_of(n):
+                if s not in written:
+                    raise ValueError(f"{n.op}: state {s} is read before any node of the graph writes it")
             if [self.types[o] for o in n.outs] != OPS[n.op].infer(self, n.attrs, [self.types[v] for v in n.ins]):
                 raise ValueError(f"{n.op}: stored output types differ from inference")
             seen.update(n.outs)
+            written.update(states_of(n))
         for v in self.outputs.values():
             if v not in seen:
                 raise ValueError(f"output {v} never defined")

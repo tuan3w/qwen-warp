@@ -119,13 +119,15 @@ class Runtime:
     def __init__(self, graph: Graph, plan: Plan, source: Source, backend: Backend):
         if not torch.cuda.is_available():
             raise RuntimeError("the runtime needs a CUDA device")
+        # a ring (a sliding-window state) holds fewer rows than there are positions: the positions the graph can run
+        # are those of its largest KV state
         contexts = {s.shape[1] for s in graph.states.values() if s.kind == "kv"}
-        if len(contexts) != 1:
-            raise ValueError(f"the graph's KV states must hold one number of positions, not {sorted(contexts)}")
+        if not contexts:
+            raise ValueError("the graph has no KV state")
         if "ids" not in graph.outputs or "logits" not in graph.outputs:
             raise ValueError("the graph must output 'logits' and 'ids'")
         self._graph, self._plan = graph, plan
-        self._ctx_max, self._rows_max = contexts.pop(), plan.rows_max
+        self._ctx_max, self._rows_max = max(contexts), plan.rows_max
         self._executor = backend.executor(graph, plan, source)
         self._packs = {p.name: self._executor.pack(p) for p in plan.packs.values()}
         rows = plan.rows_max

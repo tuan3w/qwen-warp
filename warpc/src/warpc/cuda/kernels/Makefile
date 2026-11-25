@@ -22,18 +22,22 @@ HDR := $(wildcard *.cuh)
 SRC := $(filter-out %_inst.cu,$(wildcard *.cu))
 OBJS := $(patsubst %.cu,$(OBJ)/%.o,$(SRC))
 
-# k_gemv and k_q4_gemv: one object per (T set, mode), rows per warp 1, 2, 4 in each
+# k_gemv, k_ks and k_q4_gemv: one object per (T set, mode), rows per warp 1, 2, 4 in each (k_ks: per T set)
 GEMV_SETS := T1 T2 T3_5 T6_8
-GEMV_MODES := 0 1 2 3
+GEMV_MODES := 0 1 2 3 4
 GEMV_OBJS := $(foreach m,$(GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_gemv_inst_$(s)_m$(m).o))
+KS_OBJS := $(foreach s,$(GEMV_SETS),$(OBJ)/dense_ks_gemv_inst_$(s).o)
 Q4GEMV_MODES := 0 1 3
 Q4GEMV_OBJS := $(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/dense_q4_gemv_inst_$(s)_m$(m).o))
 
 # attention: one object per (head dim, part); parts 1 bf16 split + reduce, 2 chunked bf16, 4 quantised prep + merge,
-# 8 / 16 quantised split with 8-bit / 4-bit V, 32 int4_rot prep + split
+# 8 / 16 quantised split with 8-bit / 4-bit V, 32 int4_rot prep + split, 64 the one-row decode of head dims 256 / 512
+# (part 64 only there). Head dim 512 (Gemma's global layers) has the bf16 parts only
 ATTN_HDS := 64 128 256
 ATTN_PARTS := 1 2 4 8 16 32
 ATTN_OBJS := $(foreach h,$(ATTN_HDS),$(foreach p,$(ATTN_PARTS),$(OBJ)/dense_attn_inst_hd$(h)_p$(p).o))
+ATTN_OBJS += $(foreach h,256 512,$(OBJ)/dense_attn_inst_hd$(h)_p64.o)
+ATTN_OBJS += $(foreach p,1 2,$(OBJ)/dense_attn_inst_hd512_p$(p).o)
 
 CC_CACHED = sh ./nvcc_cached.sh "$(CACHE)" "$(NVCC)" $@ $< $(NVFLAGS) $(DEFS)
 
@@ -47,6 +51,10 @@ $(GEMV_OBJS): $(OBJ)/%.o: dense_gemv_inst.cu $(HDR)
 $(foreach m,$(GEMV_MODES),$(foreach s,$(GEMV_SETS),\
   $(eval $(OBJ)/dense_gemv_inst_$(s)_m$(m).o: DEFS = -DGEMV_SET=$(s) -DGEMV_MODE=$(m))))
 
+$(KS_OBJS): $(OBJ)/%.o: dense_ks_gemv_inst.cu $(HDR)
+	@$(CC_CACHED)
+$(foreach s,$(GEMV_SETS),$(eval $(OBJ)/dense_ks_gemv_inst_$(s).o: DEFS = -DGEMV_SET=$(s)))
+
 $(Q4GEMV_OBJS): $(OBJ)/%.o: dense_q4_gemv_inst.cu $(HDR)
 	@$(CC_CACHED)
 $(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),\
@@ -54,11 +62,11 @@ $(foreach m,$(Q4GEMV_MODES),$(foreach s,$(GEMV_SETS),\
 
 $(ATTN_OBJS): $(OBJ)/%.o: dense_attn_inst.cu $(HDR)
 	@$(CC_CACHED)
-$(foreach h,$(ATTN_HDS),$(foreach p,$(ATTN_PARTS),\
+$(foreach h,$(ATTN_HDS) 512,$(foreach p,$(ATTN_PARTS) 64,\
   $(eval $(OBJ)/dense_attn_inst_hd$(h)_p$(p).o: DEFS = -DATTN_HD=$(h) -DATTN_PARTS=$(p))))
 
 # link into a temporary name and rename: a loader never sees a half-written library
-$(OUT): $(OBJS) $(GEMV_OBJS) $(Q4GEMV_OBJS) $(ATTN_OBJS)
+$(OUT): $(OBJS) $(GEMV_OBJS) $(KS_OBJS) $(Q4GEMV_OBJS) $(ATTN_OBJS)
 	@mkdir -p $(BUILD)
 	@$(NVCC) -gencode arch=compute_$(SM),code=sm_$(SM) -shared -o $@.tmp.$$$$ $^ && mv -f $@.tmp.$$$$ $@
 
