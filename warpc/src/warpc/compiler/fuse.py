@@ -13,7 +13,7 @@ import math
 from collections import Counter, deque
 from dataclasses import dataclass, field
 
-from ..ir import Graph, Node
+from ..ir import Graph, Node, states_of, weights_of
 from .caps import REDUCTION_OPS, Absorb, Cap, CapsTable
 from .plan import Pack
 
@@ -88,8 +88,7 @@ class Analysis:
         return self.elements(v) * _BYTES[self.graph.types[v].dtype]
 
     def weight_bytes(self, n: Node) -> int:
-        w = self.graph.weights.get(n.attrs.get("weight", ""))
-        return w.nbytes if w is not None and len(w.shape) == 2 else 0
+        return sum(w.nbytes for w in (self.graph.weights[k] for k in weights_of(n)) if len(w.shape) == 2)
 
 
 @dataclass
@@ -232,25 +231,18 @@ def _external(A: Analysis, covers) -> tuple[list[str], list[str]]:
 def _operands(A: Analysis, covers, ext_in, ext_out) -> int:
     ws, st = set(), set()
     for i in covers:
-        n = A.node(i)
-        if "weight" in n.attrs:
-            ws.add(n.attrs["weight"])
-        if "state" in n.attrs:
-            st.add(n.attrs["state"])
+        ws.update(weights_of(A.node(i)))
+        st.update(states_of(A.node(i)))
     return len(ext_in) + len(ext_out) + len(ws) + len(st)
 
 
 def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | None, include: set[str]) -> Match:
-    """One match for a seed and a choice of optional prologue ops; `why_not` is set when a legality tier rejects it."""
+    """One match for a seed and a choice of optional prologue ops; `why_not` is set when a legality tier rejects it.
+    The epilogue chain is matched first, so the prologue also absorbs producers of the epilogue's other operands (a
+    gate's reshape in front of the op that applies it)."""
     g = A.graph
     covers = set(anchors) | ({pair} if pair is not None else set())
     m = Match(cap, rank, anchors, pair)
-    m.pre = _pre_closure(cap, A, covers, include)
-    cnt = Counter(A.node(i).op for i in m.pre)
-    for a in cap.pre:
-        if cnt[a.op] < a.min:
-            m.why_not = f"needs {a.min} {a.op} upstream, found {cnt[a.op]}"
-            return m
     res = None
     if pair is not None:
         res = A.node(pair).outs[0]
@@ -265,6 +257,12 @@ def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | Non
             m.why_not = why
             return m
         covers |= set(m.post)
+    m.pre = _pre_closure(cap, A, covers, include)
+    cnt = Counter(A.node(i).op for i in m.pre)
+    for a in cap.pre:
+        if cnt[a.op] < a.min:
+            m.why_not = f"needs {a.min} {a.op} upstream, found {cnt[a.op]}"
+            return m
     m.covers = frozenset(covers)
     # structural tier: values leaving the region must be ones the kernel writes
     exposed = set()

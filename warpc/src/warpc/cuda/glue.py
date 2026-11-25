@@ -34,7 +34,6 @@ SIGNATURES: dict[str, tuple[list, type]] = {
     "warpc_attn_ws_bytes": ([_INT, _INT, _INT, _INT, _INT], _SIZE),
     "warpc_argmax": ([_PTR, _INT, _INT, _PTR, _PTR, _PTR], _INT),
     "warpc_argmax_ws_bytes": ([], _SIZE),
-    "warpc_advance": ([_PTR, _PTR, _PTR, _INT, _INT, _PTR], _INT),
     "warpc_prefetch": ([_PTR, _SIZE, _INT, _INT, _PTR], _INT),
     "warpc_error_string": ([_INT], C.c_char_p),
 }

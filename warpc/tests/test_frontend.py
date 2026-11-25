@@ -1,9 +1,14 @@
 """Frontend + reference interpreter vs transformers on tiny random models of every family, and the config guard.
 
 uv run --package warpc python warpc/tests/test_frontend.py
+
+WARPC_TEST_SWIFT27 (the Qwen3.5 27B W4G128 checkpoint directory) enables the real-checkpoint graph check (headers only).
 """
 
+import contextlib
+import inspect
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -20,7 +25,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.utils import logging as transformers_logging
 
 import warpc.sources
-from harness import run
+from harness import Skip, run
 from warpc import frontend
 from warpc.errors import UnsupportedModel
 from warpc.reference import Interpreter
@@ -293,7 +298,7 @@ def test_unsupported_settings_are_named():
         "attention_bias=True": {"attention_bias": True},
         "mlp_bias=True": {"mlp_bias": True},
         "hidden_act='gelu'": {"hidden_act": "gelu"},
-        "model_type 'qwen2' (supported: llama, mistral, qwen3)": {"model_type": "qwen2"},
+        "model_type 'qwen2' (supported: llama, mistral, qwen3, qwen3_5": {"model_type": "qwen2"},
     }
     mistral_style = {k: v for k, v in QWEN3_0_6B.items() if k != "use_sliding_window"}
     for needle, hf in [(n, {**QWEN3_0_6B, **p}) for n, p in cases.items()] + [
@@ -312,6 +317,308 @@ def test_unsupported_settings_are_named():
         assert "attention_bias=True; hidden_act='gelu'" in str(e), str(e)
     else:
         raise AssertionError("two unsupported settings accepted")
+
+
+QWEN35 = {
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 96,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+    "full_attention_interval": 4,
+    "rms_norm_eps": 1e-6,
+    "max_position_embeddings": 256,
+    "tie_word_embeddings": False,
+    "rope_parameters": {
+        "rope_type": "default",
+        "rope_theta": 10000.0,
+        "partial_rotary_factor": 0.25,
+        "mrope_interleaved": True,
+        "mrope_section": [1, 1, 2],
+    },
+}
+
+
+def tiny_qwen35(**overrides):
+    """A tiny random Qwen3_5ForCausalLM (3 Gated DeltaNet layers, then 1 gated full-attention layer), fp32 with
+    bf16-representable weights."""
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    torch.manual_seed(0)
+    model = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**{**QWEN35, **overrides})).float()
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            scale = 0.3 if "norm" in n or n.endswith(("A_log", "dt_bias")) else p.shape[-1] ** -0.5
+            p.copy_((torch.randn_like(p) * scale).bfloat16().float())
+    return model.eval()
+
+
+@contextlib.contextmanager
+def hf_torch_paths(*, chunk_is_recurrent: bool):
+    """transformers' own torch functions for the conv and the DeltaNet rule, not the fla / causal_conv1d kernels its hub
+    wrappers pick when those packages are installed (GPU only, other numerics); with `chunk_is_recurrent`, the chunked
+    prefill algorithm (about 3e-4 per layer from the recurrent rule in fp32) is the recurrent rule too."""
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
+
+    names = (
+        "torch_chunk_gated_delta_rule",
+        "torch_recurrent_gated_delta_rule",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
+    )
+    saved = {n: getattr(hf, n) for n in names}
+    plain = {n: inspect.unwrap(f) for n, f in saved.items()}
+    if chunk_is_recurrent:
+        plain["torch_chunk_gated_delta_rule"] = plain["torch_recurrent_gated_delta_rule"]
+    for n, f in plain.items():
+        setattr(hf, n, f)
+    try:
+        yield
+    finally:
+        for n, f in saved.items():
+            setattr(hf, n, f)
+
+
+def hf_stepwise(model, ids: torch.Tensor) -> torch.Tensor:
+    """transformers one row at a time through its cache, every row on the recurrent rule the gated_delta_rule op
+    defines."""
+    from transformers.cache_utils import DynamicCache
+
+    cache, outs = DynamicCache(config=model.config), []
+    with hf_torch_paths(chunk_is_recurrent=True), torch.no_grad():
+        for t in range(ids.shape[0]):
+            outs.append(model(ids[None, t : t + 1], past_key_values=cache, use_cache=True).logits[0])
+    return torch.cat(outs)
+
+
+def check_qwen35(source, expected: torch.Tensor, ids: torch.Tensor) -> Interpreter:
+    """The reference against transformers' rows, and windows of any size through the conv, recurrent and KV states
+    against the full pass."""
+    n = ids.shape[0]
+    it = Interpreter(frontend.build(source, ctx_max=64), source, dtype=torch.float32)
+    full = it.run({"tokens": ids.int(), "pos": torch.arange(n, dtype=torch.int32)})["logits"]
+    err = (full - expected).abs().max().item()
+    assert torch.allclose(full, expected, atol=2e-4, rtol=2e-4), err
+    it.reset()
+    parts, at = [], 0
+    for w in (11, 1, 1, 4, 1, n - 18):  # a prompt, decode rows, an 8-row-sized window, a tail
+        parts.append(
+            it.run({"tokens": ids[at : at + w].int(), "pos": torch.arange(at, at + w, dtype=torch.int32)})["logits"]
+        )
+        at += w
+    assert torch.allclose(torch.cat(parts), full, atol=1e-4, rtol=1e-4), (torch.cat(parts) - full).abs().max()
+    return it
+
+
+def test_qwen35_matches_transformers():
+    model = tiny_qwen35()
+    ids = torch.randint(0, QWEN35["vocab_size"], (30,), generator=torch.Generator().manual_seed(3))
+    expected = hf_stepwise(model, ids)
+    with hf_torch_paths(chunk_is_recurrent=False), torch.no_grad():  # transformers' chunked prefill: a loose bound
+        assert torch.allclose(model(ids[None]).logits[0], expected, atol=5e-2, rtol=5e-2)
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        source = warpc.sources.open(tmp)
+        c = source.config
+        assert (c.family, c.rotary_dim, c.norm_offset, c.quantization) == ("qwen3_5", 8, 1.0, None)
+        assert c.layer_types == ("linear_attention",) * 3 + ("attention",)
+        check_qwen35(source, expected, ids)
+
+
+def test_qwen35_vision_language_prefix():
+    """The vision-language checkpoint nests the text config under text_config and the text tensors under
+    model.language_model.; the graph reads the same weights."""
+    model = tiny_qwen35()
+    ids = torch.randint(0, QWEN35["vocab_size"], (24,), generator=torch.Generator().manual_seed(4))
+    expected = hf_stepwise(model, ids)
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        from safetensors.torch import load_file, save_file
+
+        path = Path(tmp) / "model.safetensors"
+        tensors = load_file(path)
+        renamed = {k.replace("model.", "model.language_model.", 1): v for k, v in tensors.items()}
+        renamed["mtp.fc.weight"] = torch.zeros(4, 4)  # carried by the real checkpoint, read by nobody
+        save_file(renamed, path)
+        text = json.loads((Path(tmp) / "config.json").read_text())
+        hf = {"model_type": "qwen3_5", "tie_word_embeddings": False, "text_config": text, "vision_config": {}}
+        (Path(tmp) / "config.json").write_text(json.dumps(hf))
+        source = warpc.sources.open(tmp)
+        graph = frontend.build(source, ctx_max=64)
+        assert graph.weights["embed"].source == "model.language_model.embed_tokens.weight"
+        assert graph.weights["lm_head"].source == "lm_head.weight"
+        check_qwen35(source, expected, ids)
+
+
+def pack_w4(codes: torch.Tensor) -> torch.Tensor:
+    """Nibbles [N, K] in 0..15 -> int32 [N, K / 8], column 8j + e in nibble e of word j."""
+    words = (codes.reshape(codes.shape[0], -1, 8).long() << torch.arange(0, 32, 4)).sum(-1)
+    return torch.from_numpy(words.numpy().astype("uint32").view("int32"))
+
+
+def test_qwen35_w4g128_checkpoint():
+    """A compressed-tensors W4G128 checkpoint: the packed linears become w4g128 weights (in_proj_a / b stay dense, as in
+    the real checkpoint's ignore list), and the reference equals transformers running the dequantised fp32 matrices."""
+    # every linear's K a multiple of the 128-column group: hidden 128, FF 256, 4 value heads of 32
+    model = tiny_qwen35(hidden_size=128, intermediate_size=256, linear_value_head_dim=32)
+    g = torch.Generator().manual_seed(5)
+    packed = {}
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() != 2 or "embed" in name or "lm_head" in name or "in_proj_a" in name or "in_proj_b" in name:
+                continue
+            n, k = p.shape
+            codes = torch.randint(0, 16, (n, k), generator=g)
+            scale = (torch.rand(n, k // 128, generator=g) * 0.02 + 0.002).bfloat16()
+            p.copy_((codes - 8).float() * scale.float().repeat_interleave(128, 1))
+            packed[name] = (pack_w4(codes), scale)
+    ids = torch.randint(0, QWEN35["vocab_size"], (24,), generator=torch.Generator().manual_seed(6))
+    expected = hf_stepwise(model, ids)
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        from safetensors.torch import load_file, save_file
+
+        path = Path(tmp) / "model.safetensors"
+        tensors = load_file(path)
+        for name, (words, scale) in packed.items():
+            base = name[: -len("weight")]
+            del tensors[name]
+            tensors[base + "weight_packed"], tensors[base + "weight_scale"] = words, scale
+            tensors[base + "weight_shape"] = torch.tensor([words.shape[0], words.shape[1] * 8])
+        save_file(tensors, path)
+        cfg = json.loads((Path(tmp) / "config.json").read_text())
+        cfg["quantization_config"] = W4G128_CONFIG
+        (Path(tmp) / "config.json").write_text(json.dumps(cfg))
+        source = warpc.sources.open(tmp)
+        assert source.config.quantization == "w4g128"
+        graph = frontend.build(source, ctx_max=64)
+        schemes = {w.name: w.scheme for w in graph.weights.values()}
+        assert schemes["L0.qkv"] == schemes["L3.q"] == schemes["L3.down"] == "w4g128", schemes
+        assert schemes["L0.a"] == schemes["L0.b"] == schemes["lm_head"] == schemes["L0.conv_w"] == "dense", schemes
+        check_qwen35(source, expected, ids)
+
+
+W4G128_CONFIG = {
+    "quant_method": "compressed-tensors",
+    "format": "pack-quantized",
+    "config_groups": {
+        "group_0": {
+            "format": "pack-quantized",
+            "targets": ["Linear"],
+            "input_activations": None,
+            "output_activations": None,
+            "weights": {
+                "num_bits": 4,
+                "type": "int",
+                "strategy": "group",
+                "group_size": 128,
+                "symmetric": True,
+                "dynamic": False,
+                "actorder": "static",
+            },
+        }
+    },
+    "ignore": ["lm_head"],
+}
+
+
+def test_qwen35_fp8_kv_reads_the_checkpoint_scales():
+    """kv="fp8": the attention layers read the checkpoint's per-layer k_scale / v_scale as weights; the e4m3 cache stays
+    close to the exact one, and a wrong scale moves it."""
+    model = tiny_qwen35()
+    ids = torch.randint(0, QWEN35["vocab_size"], (20,), generator=torch.Generator().manual_seed(7))
+    inputs = {"tokens": ids.int(), "pos": torch.arange(20, dtype=torch.int32)}
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        from safetensors.torch import load_file, save_file
+
+        path = Path(tmp) / "model.safetensors"
+        tensors = load_file(path)
+        source = warpc.sources.open(tmp)
+        exact = Interpreter(frontend.build(source, ctx_max=32), source, dtype=torch.float32).run(inputs)["logits"]
+        errs = []
+        for s in (0.01, 1.0):  # |k|, |v| here are about 1 to 3: 0.01 puts them near e4m3's top, 1.0 far below
+            scales = {f"model.layers.3.self_attn.{n}": torch.tensor([s]).bfloat16() for n in ("k_scale", "v_scale")}
+            save_file({**tensors, **scales}, path)
+            source = warpc.sources.open(tmp)
+            graph = frontend.build(source, ctx_max=32, kv="fp8")
+            att = next(n for n in graph.nodes if n.op == "attention")
+            assert graph.weights[att.attrs["k_scale"]].source == "model.layers.3.self_attn.k_scale"
+            logits = Interpreter(graph, source, dtype=torch.float32).run(inputs)["logits"]
+            errs.append((logits - exact).abs().max().item())
+        assert 0 < errs[0] < 0.2 and errs[0] != errs[1], errs
+
+
+def test_qwen35_graph_shape():
+    model = tiny_qwen35()
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        source = warpc.sources.open(tmp)
+        graph = frontend.build(source, ctx_max=64)
+    kinds = {s.name: (s.kind, s.shape) for s in graph.states.values()}
+    assert kinds == {
+        "L0.conv": ("conv", (128, 3)),
+        "L0.rec": ("recurrent", (4, 16, 16)),
+        "L1.conv": ("conv", (128, 3)),
+        "L1.rec": ("recurrent", (4, 16, 16)),
+        "L2.conv": ("conv", (128, 3)),
+        "L2.rec": ("recurrent", (4, 16, 16)),
+        "L3.kv": ("kv", (2, 64, 2, 32)),
+    }, kinds
+    ops = [n.op for n in graph.nodes]
+    for op, count in (("gated_delta_rule", 3), ("causal_conv1d", 3), ("silu", 3), ("gated_rmsnorm", 3)):
+        assert ops.count(op) == count, (op, ops.count(op))
+    assert ops.count("split") == 4 and ops.count("sigmoid_mul") == 1 and ops.count("attention") == 1
+    assert {n.attrs.get("offset") for n in graph.nodes if n.op == "rmsnorm"} == {1.0}
+    assert graph.weights["L0.conv_w"].shape == (128, 4)  # [C, 1, W] on disk
+    rope = next(n for n in graph.nodes if n.op == "rope")
+    assert rope.attrs["rotary_dim"] == 8 and len(rope.attrs["inv_freq"]) == 4
+    for bad in ({"attn_output_gate": False}, {"layer_types": ["linear_attention"] * 3 + ["sliding_attention"]}):
+        hf = {**QWEN35, "model_type": "qwen3_5_text", **bad}
+        try:
+            ModelConfig.from_hf(hf)
+        except UnsupportedModel as e:
+            assert next(iter(bad)) in str(e), str(e)
+        else:
+            raise AssertionError(f"{bad} accepted")
+
+
+def test_real_qwen35_checkpoint():
+    """The 27B checkpoint: every weight the graph declares exists with the declared shape (safetensors headers: the
+    packed form's weight_shape, the [C, 1, W] conv), and the schemes are the checkpoint's (400 W4G128 linears)."""
+    path = os.environ.get("WARPC_TEST_SWIFT27")
+    if not path:
+        raise Skip("WARPC_TEST_SWIFT27 unset")
+    from safetensors import safe_open
+
+    source = warpc.sources.open(path)
+    graph = frontend.build(source, ctx_max=4096, kv="fp8")
+    files = json.loads((Path(path) / "model.safetensors.index.json").read_text())["weight_map"]
+
+    def shape_of(w) -> tuple[int, ...]:
+        """The on-disk shape: the packed form's weight_shape values, else the header's ([C, 1, W] conv as [C, W])."""
+        name = w.source[: -len("weight")] + "weight_shape" if w.scheme == "w4g128" else w.source
+        with safe_open(str(Path(path) / files[name]), framework="pt") as h:
+            if w.scheme == "w4g128":
+                return tuple(h.get_tensor(name).tolist())
+            shape = tuple(h.get_slice(name).get_shape())
+        return (shape[0], shape[2]) if w.name.endswith("conv_w") else shape
+
+    for w in graph.weights.values():
+        assert shape_of(w) == w.shape, (w.name, w.source, shape_of(w), w.shape)
+    schemes = {s: sum(1 for w in graph.weights.values() if w.scheme == s) for s in ("w4g128", "dense")}
+    c = source.config
+    print(f"  {len(graph.nodes)} nodes, {len(graph.weights)} weights {schemes}, {len(graph.states)} states")
+    assert schemes["w4g128"] == 400 and c.layer_types.count("attention") == 16, schemes
 
 
 if __name__ == "__main__":

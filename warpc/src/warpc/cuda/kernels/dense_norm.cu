@@ -108,12 +108,6 @@ __global__ void k_argmax_final(const float* pv, const int* pi, int nb, int* out)
   }
 }
 
-// Step bookkeeping on the device, so one captured graph serves every position: pos += T, and with feedback the argmax of the last row becomes the next input token.
-__global__ void k_advance(int* pos, int* tok, const int* ids, int T, int feedback) {
-  pos[0] += T;
-  if (feedback) tok[0] = ids[T - 1];
-}
-
 extern "C" {
 
 int warpc_embed(const void* table, const int* tok, void* out, int T, int H, cudaStream_t st) {
@@ -137,11 +131,6 @@ int warpc_argmax(const float* logits, int T, int N, int* out_tok, void* ws, cuda
   int* pi = reinterpret_cast<int*>(pv + STEP_ROWS * ARGMAX_BLOCKS);
   k_argmax_part<<<dim3(ARGMAX_BLOCKS, T), 256, 0, st>>>(logits, N, pv, pi);
   k_argmax_final<<<T, ARGMAX_BLOCKS, 0, st>>>(pv, pi, ARGMAX_BLOCKS, out_tok);
-  return cudaGetLastError();
-}
-
-int warpc_advance(int* pos, int* tok, const int* ids, int T, int feedback, cudaStream_t st) {
-  k_advance<<<1, 1, 0, st>>>(pos, tok, ids, T, feedback);
   return cudaGetLastError();
 }
 

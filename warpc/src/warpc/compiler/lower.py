@@ -4,7 +4,7 @@ assignment (with in-place residual updates) follow from the dataflow alone."""
 from __future__ import annotations
 
 import heapq
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ..errors import LoweringError
 from ..ir import Graph
@@ -12,10 +12,20 @@ from .caps import CapsTable
 from .fuse import Region, fuse
 from .plan import Buffer, Plan, Task
 
+if TYPE_CHECKING:
+    from ..runtime import Executor
+    from ..sources import Source
+
 
 class Backend(Protocol):
+    """A backend: its capability table (what lowering may claim) and its runtime half."""
+
     name: str
     caps: CapsTable
+
+    def executor(self, graph: Graph, plan: Plan, source: Source) -> Executor:
+        """The executor that packs, sizes states and launches the tasks of `plan` (lowered from `graph`)."""
+        ...
 
 
 def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
@@ -40,10 +50,14 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
         plan.constants[name] = values
         return name
 
+    names: dict[str, tuple] = {}
     for ri in order:
         r = regions[ri]
         for p in r.packs:
-            plan.packs.setdefault(p.name, p)
+            key = (p.kind, tuple(p.parts))
+            if names.setdefault(p.name, key) != key:
+                raise LoweringError(f"pack {p.name} is built as {names[p.name]} and as {key}")
+            plan.packs.setdefault(key, p)
         plan.tasks.append(
             Task(
                 kernel=r.kernel,

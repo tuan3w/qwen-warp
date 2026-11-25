@@ -15,7 +15,7 @@
 //                         for bit; dense_dec_gemv_body.cuh + dense_dec_gemv_m<mode>.cu: its launchers, one per mode
 //   dense_q4_gemv.cuh     k_q4_gemv: k_gemv over GGUF Q4_0 weights dequantised in registers (dense_q4_gemv.cu: entry
 //                         point, dense_q4_gemv_inst.cu: instantiations)
-//   dense_norm.cu         embed, rmsnorm, argmax, the step bookkeeping (advance), the CUDA error string
+//   dense_norm.cu         embed, rmsnorm, argmax, the CUDA error string
 //   dense_attn_common.cuh constants, QKV, the shared WHT and merge kernel (k_attn_reduce2), the attention launchers run_*
 //   dense_attn.cuh        bf16 attention kernel templates (split, reduce, chunked split_x, and k_attn_fused = prep +
 //                         split of one row)

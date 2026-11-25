@@ -30,9 +30,12 @@ REF_POINTS: dict[str, tuple[str, ...]] = {
     "silu_mul": ("silu", "out"),  # silu(gate) is a bf16 tensor before the product with up
     "rope": ("trig", "prod", "out"),  # cos / sin cast to bf16, x*cos and rot(x)*sin are bf16 tensors, then their sum
     "attention": ("p", "out"),  # the softmax probabilities are rounded to bf16 before P V
+    "sigmoid_mul": ("sigmoid", "out"),  # sigmoid(gate) is a bf16 tensor before the product
+    "gated_delta_rule": ("beta", "out"),  # sigmoid(b) is rounded before the fp32 recurrence
+    "gated_rmsnorm": ("norm", "scale", "out"),  # bf16(x-hat), bf16(x-hat * w), then the fp32 gate product
 }
-VIEW_OPS = frozenset({"reshape"})
-REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention"})
+VIEW_OPS = frozenset({"reshape", "split"})
+REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention", "gated_rmsnorm"})
 _LIMIT_SUFFIXES = ("_multiple", "_in", "_max", "_min")
 
 
