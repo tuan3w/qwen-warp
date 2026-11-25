@@ -32,6 +32,7 @@ make room for a 262,144-token context.
 | `server/` | `serve.py` (entry point), the vLLM engine-core client, the engine driver, the tool-schema hook (`tool_schema.py`), a small vLLM plugin |
 | `tests/` | the tests `make test` runs, most of them need the checkpoint and the GPU, a few neither ([what they check](GETTING_STARTED.md#4-verify-it-works)) |
 | `scripts/` | `fetch_model.sh` (weights download), `check_repo.sh` (checks that need no GPU, run by CI) |
+| `warpc/` | an experimental compiler, separate from the engine: dense decoder-only models (Llama, Mistral, Qwen3) from safetensors or GGUF to fused CUDA kernels replayed as CUDA graphs ([warpc/README.md](../warpc/README.md)) |
 | `docs/` | this documentation |
 | `Dockerfile`, `docker-compose.yml`, `docker/`, `.env.example` | the container image, its compose file, its entrypoint and its settings |
 | `Makefile`, `pyproject.toml`, `uv.lock` | `make setup` and `make test`; the pinned Python environment |

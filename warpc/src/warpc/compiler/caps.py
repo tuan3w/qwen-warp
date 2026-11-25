@@ -1,0 +1,171 @@
+"""Kernel capability records: what a backend kernel absorbs next to its heavy op, as data the fusion pass reads.
+
+A `Cap` is one kernel:
+
+  anchor     the graph op the kernel is built around ("linear", "rmsnorm", "attention", "embed")
+  emit       (Match, Analysis) -> Region: binds a legal match to the kernel's launch roles
+  segments   how many anchors on one shared input a single launch serves (the q|k|v GEMV: 3); the outputs stay separate
+  pair       ops that merge two same-input anchors into one output (silu_mul on a gate|up pair: the dual GEMV)
+  pre        `Absorb` records of producers folded into the kernel's input side (rmsnorm prologue, the residual add in
+             front of a norm, the reshape / qk-norm / rope in front of attention)
+  post       `Absorb` records of a chain of consumers folded into the output side (residual add in place, cast + argmax
+             of the head)
+  limits     static kernel limits, evaluated on the constants of a match (K multiple, head dims, rows)
+  rounds     per absorbed op, which rounding points of the reference interpreter the kernel reproduces (see REF_POINTS)
+  tolerance  the gaps (op.point) a kernel is known to leave open, so a plan containing it is reference-tolerance, not
+             bit-exact
+
+The legality tiers live in the pass (structural, memory) and in `Cap.check` / `Cap.info` (semantic).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+# The reference interpreter computes in the activation dtype (bf16) except where an op says fp32 inside, so a bf16
+# value is rounded at every op boundary. REF_POINTS[op] names every place the interpreter rounds while computing `op`
+# with a bf16 output, "out" being the boundary itself; ops not listed round once, at the boundary; views round nothing.
+REF_POINTS: dict[str, tuple[str, ...]] = {
+    "silu_mul": ("silu", "out"),  # silu(gate) is a bf16 tensor before the product with up
+    "rope": ("trig", "prod", "out"),  # cos / sin cast to bf16, x*cos and rot(x)*sin are bf16 tensors, then their sum
+    "attention": ("p", "out"),  # the softmax probabilities are rounded to bf16 before P V
+}
+VIEW_OPS = frozenset({"reshape"})
+REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention"})
+_LIMIT_SUFFIXES = ("_multiple", "_in", "_max", "_min")
+
+
+def ref_points(op: str, out_dtype: str) -> tuple[str, ...]:
+    """Rounding points of one interpreter node: none for views and non-bf16 outputs, else REF_POINTS or ("out",)."""
+    if op in VIEW_OPS or out_dtype != "bf16":
+        return ()
+    return REF_POINTS.get(op, ("out",))
+
+
+@dataclass(frozen=True)
+class Target:
+    """Cost-model constants of the machine a table's kernels run on."""
+
+    launch_us: float  # fixed cost of one launch inside a CUDA graph
+    dram_bandwidth: float  # bytes / s
+    sms: int  # streaming multiprocessors (the CTA-utilisation term)
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The semantic tier's answer on one match: why the kernel cannot run it (empty: it can), and the CTAs its launch
+    uses when the cost model should not guess them."""
+
+    reasons: list[str] = field(default_factory=list)
+    ctas: int | None = None
+
+
+@dataclass(frozen=True)
+class Absorb:
+    """One op a kernel folds in; `pre` / `post` of the holding `Cap` says on which side.
+
+    min / max       how many nodes of this op a match absorbs (attention: 3 reshapes, 0 or 2 qk-norms, 1 rope)
+    exposes         the node's output is ALSO written to memory (the residual stream after the add, the logits before
+                    the argmax)
+    inplace         the node updates one of its operands in place (residual add): the memory tier proves nobody reads
+                    it afterwards
+    reduction_ok    the op is a reduction the kernel really implements (reductions in an epilogue are illegal by
+                    default)
+    attrs           attribute values the node must carry (cast: {"dtype": "f32"})
+    """
+
+    op: str
+    min: int = 0
+    max: int = 1
+    exposes: bool = False
+    inplace: bool = False
+    reduction_ok: bool = False
+    attrs: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Cap:
+    kernel: str
+    anchor: str
+    emit: Callable  # (Match, Analysis) -> Region
+    anchor_schemes: tuple[str, ...] = ()  # weight schemes a linear anchor may read: empty = any
+    segments: int = 1
+    pair: tuple[str, ...] = ()
+    pre: tuple[Absorb, ...] = ()
+    post: tuple[Absorb, ...] = ()
+    limits: dict = field(default_factory=dict)  # see `limits_ok`
+    rounds: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    tolerance: tuple[str, ...] = ()  # acknowledged gaps "op.point"
+    launches: int = 1  # launches one task of this kernel makes
+    constants: Callable | None = None  # (Match, Analysis) -> dict of graph constants the limits and the cost model read
+    info: Callable | None = None  # (constants) -> Verdict; None = limits only
+    check: Callable | None = None  # semantic predicate (Match, Analysis) -> reason string or None
+
+    def __post_init__(self):
+        for key in self.limits:
+            if not key.endswith(_LIMIT_SUFFIXES):
+                raise ValueError(f"{self.kernel}: unknown limit {key}")
+
+    def ops(self) -> set[str]:
+        return {self.anchor, *self.pair, *(a.op for a in self.pre), *(a.op for a in self.post)}
+
+    def evaluate(self, c: dict) -> Verdict:
+        reasons = limits_ok(self.kernel, self.limits, c)
+        if self.info is None:
+            return Verdict(reasons)
+        extra = self.info(c)
+        return Verdict(reasons + extra.reasons, extra.ctas)
+
+    def gaps(self, op: str, out_dtype: str) -> tuple[str, ...]:
+        """Reference rounding points of `op` this kernel does not reproduce when it absorbs the op."""
+        have = set(self.rounds.get(op, ()))
+        return tuple(p for p in ref_points(op, out_dtype) if p not in have)
+
+
+def limits_ok(kernel: str, limits: dict, c: dict) -> list[str]:
+    """Evaluate static limits on constants: `<c>_multiple`, `<c>_in`, `<c>_max`, `<c>_min`. A limit on a constant the
+    match does not define is a table error, not a pass."""
+    bad = []
+    for key, lim in limits.items():
+        suffix = next(s for s in _LIMIT_SUFFIXES if key.endswith(s))
+        name = key[: -len(suffix)]
+        if name not in c:
+            raise ValueError(f"{kernel}: limit {key} reads a constant {name!r} the kernel's constants do not define")
+        v = c[name]
+        if suffix == "_multiple" and v % lim:
+            bad.append(f"{name}={v} is not a multiple of {lim}")
+        elif suffix == "_in" and v not in lim:
+            bad.append(f"{name}={v} not in {tuple(lim)}")
+        elif suffix == "_max" and v > lim:
+            bad.append(f"{name}={v} > {lim}")
+        elif suffix == "_min" and v < lim:
+            bad.append(f"{name}={v} < {lim}")
+    return bad
+
+
+class CapsTable:
+    """The ordered capabilities of one backend (order = cost-model tie-break) and the target its cost model prices.
+
+    unfused_ctas      (node, Analysis) -> CTAs the backend's kernel for that node alone would launch
+    unfused_launches  op -> launches the backend makes for that node alone (default 1; a view is 0)
+    """
+
+    def __init__(
+        self,
+        caps: list[Cap],
+        target: Target,
+        unfused_ctas: Callable,
+        unfused_launches: dict[str, int] | None = None,
+    ):
+        self.caps = list(caps)
+        self.target = target
+        self.by_kernel = {c.kernel: c for c in self.caps}
+        if len(self.by_kernel) != len(self.caps):
+            raise ValueError("duplicate kernel in capability table")
+        self.rank = {c.kernel: i for i, c in enumerate(self.caps)}
+        self.unfused_ctas = unfused_ctas
+        self.unfused_launches = dict(unfused_launches or {})
+
+    def ops(self) -> set[str]:
+        return set().union(*(c.ops() for c in self.caps)) if self.caps else set()
