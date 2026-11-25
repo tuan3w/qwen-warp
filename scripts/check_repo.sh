@@ -8,7 +8,7 @@ python3 -m compileall -q warpc/src warpc/tests warpc/tools && echo "warpc compil
 uv run --package warpc --only-group dev ruff check warpc && uv run --package warpc --only-group dev ruff format --check warpc && echo "warpc ruff ok"
 uv lock --check && echo "uv.lock ok"
 bad=0
-for f in README.md docs/*.md warpc/README.md; do
+for f in README.md AGENTS.md CONTRIBUTING.md SECURITY.md warpc/README.md; do
   dir=$(dirname "$f")
   while read -r link; do
     p="${link%%#*}"; [ -z "$p" ] && continue
