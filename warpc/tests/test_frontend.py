@@ -9,6 +9,7 @@ import contextlib
 import inspect
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -26,9 +27,10 @@ from transformers.utils import logging as transformers_logging
 
 import warpc.sources
 from harness import Skip, run
+from inkling_common import INKLING_OFFICIAL, INKLING_W4G128, InklingShapes, inkling_w4
 from warpc import frontend
 from warpc.errors import UnsupportedModel
-from warpc.reference import Interpreter
+from warpc.reference import _IMPL, Interpreter
 from warpc.sources import ModelConfig
 
 transformers_logging.disable_progress_bar()
@@ -619,6 +621,202 @@ def test_real_qwen35_checkpoint():
     c = source.config
     print(f"  {len(graph.nodes)} nodes, {len(graph.weights)} weights {schemes}, {len(graph.states)} states")
     assert schemes["w4g128"] == 400 and c.layer_types.count("attention") == 16, schemes
+
+
+INKLING_ORACLE = Path(__file__).resolve().parent / "oracle" / "inkling_hf.py"
+INKLING_WINDOWS = (10, 1, 1, 4, 3, 1, 4)
+
+
+def test_inkling_graph_shape():
+    """The real config: 48 visits of 24 layers, every weight and state counted, rings on the sliding visits."""
+    source = InklingShapes(ModelConfig.from_hf(inkling_w4()))
+    graph = frontend.build(source, ctx_max=4096, rows_max=8)
+    states = graph.states
+    assert len(states) == 240 and len(graph.weights) == 718
+    assert sum(1 for k in graph.outputs if k.startswith("h")) == 48
+    # layers 5 and 23 run once, 11 and 17 three times: 8 full visits; the other 40 are rings of window + rows - 1
+    kv = [s.shape[1] for s in states.values() if s.kind == "kv"]
+    assert sorted(set(kv)) == [1031, 4096] and kv.count(4096) == 8 and kv.count(1031) == 40, sorted(set(kv))
+    ops = {}
+    for n in graph.nodes:
+        ops[n.op] = ops.get(n.op, 0) + 1
+    assert {
+        k: ops[k] for k in ("attention", "moe_route", "moe_experts", "message_gate", "dyn_conv1d", "log_scale")
+    } == {
+        "attention": 48,
+        "moe_route": 48,
+        "moe_experts": 48,
+        "message_gate": 96,  # 24 loop visits in passes 2 and 3 x (attn, k, v, mlp)
+        "dyn_conv1d": 16,
+        "log_scale": 16,
+    }, ops
+    # 96 message reads (12 loop layers x 4 queries x 2 passes), one block-residual read per sliding visit but layer 0's
+    # (39) and three per full visit (24), one per visit before the MLP (48), the output read
+    assert ops["attn_res"] == 96 + 39 + 24 + 48 + 1, ops["attn_res"]
+    schemes = {s: sum(1 for w in graph.weights.values() if w.scheme == s) for s in ("w4g128", "f32", "dense")}
+    assert schemes == {"w4g128": 72, "f32": 74, "dense": 572}, schemes
+    assert graph.weights["L6.e_gate"].shape == (128, 1152, 2304) and graph.weights["L6.e_down"].shape == (
+        128,
+        2304,
+        1152,
+    )
+    assert graph.weights["L5.aq"].shape == (3, 2304) and graph.weights["L5.kstatic"].shape == (4, 1024)
+    assert graph.weights["L0.ksconv"].shape == (1024, 4)  # [C, 1, W] on disk
+    assert abs(sum(w.nbytes for w in graph.weights.values()) / 2**30 - 14.74) < 0.01
+    assert graph.types[graph.outputs["logits"]].shape == ("T", 200058)
+    assert graph.types[graph.outputs["ids"]].dtype == "i32"
+    ring = frontend.build(source, ctx_max=512, rows_max=8)  # a window longer than the context is no ring
+    assert {s.shape[1] for s in ring.states.values() if s.kind == "kv"} == {512}
+
+
+def test_inkling_guards():
+    cases = {
+        "n_shared_experts=1": {"n_shared_experts": 1},
+        "q_bias=True": {"q_bias": True},
+        "o_bias=True": {"o_bias": True},
+        "use_value_norm_no_gamma=False": {"use_value_norm_no_gamma": False},
+        "attn_res_normalize_values=False": {"attn_res_normalize_values": False},
+        "use_gate_bias=False": {"use_gate_bias": False},
+        "loop_config.is_varloop": {
+            "loop_config": {**INKLING_OFFICIAL["text_config"]["loop_config"], "is_varloop": True}
+        },
+        "scoring_func='softmax'": {"scoring_func": "softmax"},
+        "missing sconv_kernel_size": {"sconv_kernel_size": None},
+        "missing loop_config": {"loop_config": None},
+    }
+    for message, patch in cases.items():
+        try:
+            ModelConfig.from_hf(inkling_w4(**patch))
+        except UnsupportedModel as e:
+            assert message in str(e), (message, str(e))
+        else:
+            raise AssertionError(f"{patch} accepted")
+    for quantization, message in (
+        (INKLING_OFFICIAL["quantization_config"], "requantise the experts to W4G128"),
+        ({**INKLING_W4G128, "warpc_layout": None}, "warpc_layout"),
+        ({**INKLING_W4G128, "format": "int-quantized"}, "pack-quantized"),
+    ):
+        try:
+            ModelConfig.from_hf({**inkling_w4(), "quantization_config": quantization})
+        except UnsupportedModel as e:
+            assert message in str(e), (message, str(e))
+        else:
+            raise AssertionError(f"{quantization} accepted")
+    c = ModelConfig.from_hf(inkling_w4())
+    ik = c.inkling
+    assert (c.family, c.rope_theta, c.quantization, c.vocab_size, ik.unpadded_vocab) == (
+        "inkling2_loop",
+        None,
+        "w4g128",
+        201024,
+        200058,
+    )
+    assert [i for i, t in enumerate(c.layer_types) if t == "full_attention"] == [5, 11, 17, 23]
+    assert (c.sliding_window, ik.d_rel, ik.conv_kernel, ik.experts, ik.top_k, ik.expert_width, ik.gate_rank) == (
+        1024,
+        16,
+        4,
+        128,
+        8,
+        1152,
+        64,
+    )
+    # the checkpoint without a quantisation config has dense experts
+    dense = {k: v for k, v in INKLING_OFFICIAL.items() if k != "quantization_config"}
+    assert ModelConfig.from_hf(dense).quantization is None
+
+
+def inkling_oracle(variant: str, directory: Path) -> dict:
+    """Run the official model in the reference environment (`WARPC_INKLING_REF_PYTHON`: its python, or its venv)."""
+    value = os.environ.get("WARPC_INKLING_REF_PYTHON")
+    if not value:
+        raise Skip("WARPC_INKLING_REF_PYTHON unset (the isolated environment with the official inkling2_loop)")
+    python = Path(value) / "bin" / "python" if Path(value).is_dir() else Path(value)
+    done = subprocess.run([str(python), str(INKLING_ORACLE), variant, str(directory)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-2000:]
+    return torch.load(directory / "ref.pt")
+
+
+def inkling_windows(it: Interpreter, ids: torch.Tensor, sizes) -> torch.Tensor:
+    it.reset()
+    parts, at = [], 0
+    for w in sizes:
+        window = {"tokens": ids[at : at + w], "pos": torch.arange(at, at + w, dtype=torch.int32)}
+        parts.append(it.run(window)["logits"])
+        at += w
+    return torch.cat(parts)
+
+
+def check_inkling(variant: str):
+    """The interpreter on the tiny model against the official one, fp32: every visit's output within a few times the
+    official model's own sensitivity to 1e-7 noise, the logits, windows through the states (also against the official
+    cache), a state ring that wraps, and six semantic slips that each move the logits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ref = inkling_oracle(variant, Path(tmp))
+        source = warpc.sources.open(Path(tmp) / "ckpt")
+        n = len(ref["ids"])
+        graph = frontend.build(source, ctx_max=32, rows_max=n)
+        assert (source.config.quantization == "w4g128") == (variant == "b")
+        it = Interpreter(graph, source, dtype=torch.float32)
+        ids = ref["ids"].int()
+        full_run = {"tokens": ids, "pos": torch.arange(n, dtype=torch.int32)}
+        outs = it.run(full_run)
+        visits = [k for k in outs if k.startswith("h")]
+        assert len(visits) == len(ref["visits"]) == 16 and len(graph.states) == 5 * 16
+        for v, (want, floor) in enumerate(zip(ref["visits"], ref["floor"], strict=True)):
+            err = ((outs[f"h{v:02d}"] - want).norm() / want.norm()).item()
+            assert err < max(5 * floor, 2e-6), (variant, v, err, floor)
+        full = outs["logits"]
+        assert full.shape == ref["logits"].shape == (n, 120)
+        d = (full - ref["logits"]).abs().max().item()
+        assert torch.allclose(full, ref["logits"], atol=5e-4, rtol=1e-3), d
+        assert (full.argmax(-1) == ref["logits"].argmax(-1)).all()
+        windows = inkling_windows(it, ids, INKLING_WINDOWS)
+        assert torch.allclose(windows, full, atol=1e-4, rtol=1e-4), (windows - full).abs().max()
+        assert torch.allclose(windows, ref["cache_logits"], atol=2e-4, rtol=1e-3), (
+            (windows - ref["cache_logits"]).abs().max()
+        )
+        # steps of at most 8 rows: the sliding states are rings of 6 + 8 - 1 = 13 rows, and 24 positions wrap them
+        ring = frontend.build(source, ctx_max=32, rows_max=8)
+        assert {s.shape[1] for s in ring.states.values() if s.kind == "kv"} == {13, 32}
+        wrapped = inkling_windows(Interpreter(ring, source, dtype=torch.float32), ids, (8, 1, 1, 4, 3, 1, 4, 2))
+        assert torch.allclose(wrapped, full, atol=1e-4, rtol=1e-4), (wrapped - full).abs().max()
+
+        slips = {
+            "no sink mass": (
+                "attention",
+                lambda f: lambda it, a, q, k, v, p, r, s: f(it, a, q, k, v, p, r, s * 0 - 1e9),
+            ),
+            "no window": ("attention", lambda f: lambda it, a, *x: f(it, dict(a, window=None), *x)),
+            "bias off by one": (
+                "attention",
+                lambda f: lambda it, a, q, k, v, p, r, s: f(it, a, q, k, v, p, r.roll(1, -1), s),
+            ),
+            "conv divisor": ("causal_conv1d", lambda f: lambda it, a, x: f(it, dict(a, divisor=a["divisor"] - 0.3), x)),
+            "no log scaling": ("log_scale", lambda f: lambda it, a, x, pos: x),
+            "route scale": ("moe_route", lambda f: lambda it, a, x: (lambda o: (o[0], o[1] * 1.01))(f(it, a, x))),
+        }
+        impl = dict(_IMPL)
+        try:
+            for name, (op, wrap) in slips.items():
+                _IMPL[op] = wrap(impl[op])
+                bad = (
+                    (Interpreter(graph, source, dtype=torch.float32).run(full_run)["logits"] - ref["logits"])
+                    .abs()
+                    .max()
+                )
+                _IMPL[op] = impl[op]
+                assert bad > 0.05, (variant, name, bad)
+        finally:
+            _IMPL.update(impl)
+
+
+def test_inkling_vs_official_dense_experts():
+    check_inkling("a")
+
+
+def test_inkling_vs_official_w4g128_experts():
+    check_inkling("b")
 
 
 if __name__ == "__main__":

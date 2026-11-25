@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 
 from harness import run
+from inkling_common import real_graph
 from warpc import frontend
 from warpc.compiler import Absorb, Cap, CapsTable, Pack, Region, Verdict, lower
 from warpc.compiler.caps import ref_points
@@ -197,7 +198,7 @@ def check_rounding(g: Graph, regions, caps: CapsTable) -> list[Finding]:
             continue
         for i in sorted(r.covers):
             n = g.nodes[i]
-            for p in ref_points(n.op, g.types[n.outs[0]].dtype):
+            for p in ref_points(n.op, g.types[n.outs[0]].dtype, n.attrs):
                 if p in cap.rounds.get(n.op, ()):
                     st = "preserved"
                 elif f"{n.op}.{p}" in cap.tolerance:
@@ -316,7 +317,7 @@ def test_unknown_kv_format_and_lone_cast_are_lowering_errors():
     try:
         lower(g, BACKEND, rows_max=8)
     except LoweringError as e:
-        assert "cast x1: only absorbable as epilogue of g_head" in str(e), str(e)
+        assert "cast x1: only absorbable as" in str(e), str(e)
     else:
         raise AssertionError("a cast alone has no kernel")
 
@@ -538,6 +539,44 @@ def test_limits_reject_unknown_names_and_missing_constants():
         raise AssertionError("a limit on an undefined constant must not pass silently")
 
 
+def test_rounding_points_of_the_inkling_ops():
+    """An f32 output has no boundary rounding and no interior ones, except where the op rounds to bf16 whatever it
+    returns (message_gate); a relative bias adds the attention point "bias"; plain attention keeps its two."""
+    assert ref_points("sigmoid_mul", "f32") == () and ref_points("attn_res", "f32") == ()
+    assert ref_points("message_gate", "f32") == ("input", "hidden")
+    assert ref_points("moe_experts", "bf16") == ("gate", "up", "act", "down", "out")
+    assert ref_points("attention", "bf16") == ("p", "out")
+    assert ref_points("attention", "bf16", {"scale": 0.1}) == ("p", "out")
+    assert ref_points("attention", "bf16", {"rel_proj": "w"}) == ("bias", "p", "out")
+    assert ref_points("reshape", "bf16") == () and ref_points("l2_clip", "bf16") == ("out",)
+
+
+def test_inkling_real_graph_lowers_with_every_rounding_point_accounted_for():
+    """The real Inkling-2-Mini graph (2,168 nodes) is claimed completely by 340 tasks of ten kernels, and the one
+    rounding gap is the attention's P (the kernels keep the probabilities in fp32)."""
+    g = real_graph(rows_max=8)
+    plan = lower(g, BACKEND, rows_max=8)  # a LoweringError lists every node nobody claims
+    assert len(g.nodes) == 2168 and len(plan.tasks) == 340, (len(g.nodes), len(plan.tasks))
+    kernels = Counter(t.kernel for t in plan.tasks)
+    assert kernels == {
+        "g_attn_rel": 48,
+        "g_attn_res": 96,
+        "g_embed": 1,
+        "g_gemv_convres": 8,
+        "g_gemv_convres_add": 40,
+        "g_gemv_multi": 48,
+        "g_head_softcap": 1,
+        "g_moe": 48,
+        "g_msg_gate": 48,
+        "g_rmsnorm": 2,
+    }, kernels
+    fs = check_rounding(g, plan.tasks, TABLE)
+    gaps = Counter(
+        (plan.tasks[f.region].kernel, f.op, f.point) for f in fs if f.status in ("acknowledged", "tolerated")
+    )
+    assert gaps == {("g_attn_rel", "attention", "p"): 48}, gaps
+
+
 def test_rounding_points_of_the_dense_plan():
     g = build(QWEN3_06B)
     plan = lower(g, BACKEND, rows_max=8)
@@ -675,14 +714,14 @@ class TensorSource:
     def __init__(self, tensors: dict, raw: dict):
         self.tensors, self.raw_blocks = tensors, raw
 
-    def get(self, name):
-        return self.tensors[name]
+    def get(self, name, dtype=torch.bfloat16):
+        return self.tensors[name].to(dtype)
 
     def raw(self, name):
         return self.raw_blocks[name]
 
 
-def test_packer_builds_the_four_kinds():
+def test_packer_builds_its_kinds():
     torch.manual_seed(0)
     a, b, e = (torch.randn(s).bfloat16() for s in ((8, 64), (4, 64), (16, 64)))
     qa, qb = (torch.randint(0, 256, (n, 2 * 18), dtype=torch.uint8) for n in (8, 4))
@@ -694,8 +733,10 @@ def test_packer_builds_the_four_kinds():
         "qa": WeightDecl("qa", (8, 64), "q4_0", "qa.weight"),
         "qb": WeightDecl("qb", (4, 64), "q4_0", "qb.weight"),
         "norm": WeightDecl("norm", (64,), "dense", "norm.weight"),
+        "query": WeightDecl("query", (2, 64), "f32", "query"),
     }
-    dense = {"a.weight": a, "b.weight": b, "embed.weight": e, "norm.weight": e[0]}
+    query = torch.randn(2, 64) * 1e-3 + 1  # not bf16-representable
+    dense = {"a.weight": a, "b.weight": b, "embed.weight": e, "norm.weight": e[0], "query": query}
     raw = {"qa.weight": {"blocks": qa}, "qb.weight": {"blocks": qb}}
     pk = Packer(weights, TensorSource(dense, raw), device="cpu")
     assert torch.equal(pk.build(Pack("a|b", "dense_cat", ["a", "b"])), torch.cat([a, b]))
@@ -704,7 +745,17 @@ def test_packer_builds_the_four_kinds():
     assert torch.equal(pk.build(Pack("qa|qb", "q4_0_cat", ["qa", "qb"])), torch.cat([qa, qb]))
     assert torch.equal(pk.build(Pack("qa", "q4_0", ["qa"])), qa)
     assert pk.build(Pack("norm", "dense", ["norm"])).shape == (64,)
-    for bad in (Pack("qa", "dense", ["qa"]), Pack("a", "q4_0", ["a"]), Pack("x", "w4r_cat", ["x"])):
+    assert torch.equal(pk.build(Pack("a.t", "dense_t", ["a"])), a.t())
+    assert pk.build(Pack("a.t", "dense_t", ["a"])).is_contiguous()
+    got = pk.build(Pack("query", "f32", ["query"]))
+    assert got.dtype == torch.float32 and torch.equal(got, query)
+    for bad in (
+        Pack("qa", "dense", ["qa"]),
+        Pack("a", "q4_0", ["a"]),
+        Pack("a", "f32", ["a"]),
+        Pack("norm", "dense_t", ["norm"]),
+        Pack("x", "w4r_cat", ["x"]),
+    ):
         try:
             pk.build(bad)
         except ValueError:

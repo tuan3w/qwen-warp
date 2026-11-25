@@ -98,7 +98,8 @@ class Match:
     anchors: list[int]
     pair: int | None = None
     pre: list[int] = field(default_factory=list)
-    post: list[int] = field(default_factory=list)
+    post: list[int] = field(default_factory=list)  # every epilogue node, chain after chain
+    chains: list[list[int]] = field(default_factory=list)  # the epilogue chain of each result (empty: none matched)
     covers: frozenset = frozenset()
     exposed: frozenset = frozenset()  # values the kernel writes that outside nodes may read
     inplace_node: int | None = None  # the absorbed add that updates `h` in place
@@ -149,10 +150,19 @@ def _seeds(cap: Cap, A: Analysis, rej: dict):
                 if a in eset and b in eset and a != b and A.node(a).ins == A.node(b).ins:
                     yield [a, b], i
         return
-    if cap.segments > 1:  # anchors on one input
+    if cap.segments > 1:
         groups: dict[tuple, list[int]] = {}
-        for i in elig:
-            groups.setdefault(tuple(A.node(i).ins), []).append(i)
+        if cap.segment_inputs > 1:
+            # anchors on different inputs: each maximal run (in node order) of pairwise independent anchors, which
+            # no region of them can close a cycle through (one visit's q, r, k, v, sink and gate projections)
+            run = 0
+            for k, i in enumerate(elig):
+                if k and any((A.anc[i] >> j) & 1 for j in elig[run:k]):
+                    run = k
+                groups.setdefault((run,), []).append(i)
+        else:  # anchors on one input
+            for i in elig:
+                groups.setdefault(tuple(A.node(i).ins), []).append(i)
         for members in groups.values():
             if len(members) <= SUBSET_FANOUT_MAX:
                 for r in range(1, cap.segments + 1):
@@ -244,20 +254,18 @@ def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | Non
     g = A.graph
     covers = set(anchors) | ({pair} if pair is not None else set())
     m = Match(cap, rank, anchors, pair)
-    res = None
-    if pair is not None:
-        res = A.node(pair).outs[0]
-    elif len(anchors) == 1:
-        res = A.node(anchors[0]).outs[0]
-    if cap.post:
-        if res is None:
-            m.why_not = "an epilogue chain needs a single result"
-            return m
-        m.post, why = _post_chain(cap, A, res)
-        if why:
-            m.why_not = why
-            return m
-        covers |= set(m.post)
+    # the epilogue chain of every result: one for a pair or a lone anchor, one per anchor of a segmented launch
+    results = [A.node(pair).outs[0]] if pair is not None else [A.node(i).outs[0] for i in anchors]
+    for res in results:
+        chain = []
+        if cap.post:
+            chain, why = _post_chain(cap, A, res)
+            if why:
+                m.why_not = why
+                return m
+        m.chains.append(chain)
+        m.post += chain
+        covers |= set(chain)
     m.pre = _pre_closure(cap, A, covers, include)
     cnt = Counter(A.node(i).op for i in m.pre)
     for a in cap.pre:
@@ -267,11 +275,8 @@ def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | Non
     m.covers = frozenset(covers)
     # structural tier: values leaving the region must be ones the kernel writes
     exposed = set()
-    last = A.node(m.post[-1] if m.post else (pair if pair is not None else anchors[-1])).outs
-    if not m.post and pair is None:
-        for i in anchors:
-            exposed.update(A.node(i).outs)
-    exposed.update(last)
+    for res, chain in zip(results, m.chains, strict=True):
+        exposed.update(A.node(chain[-1] if chain else A.prod[res]).outs)
     absorbs = {a.op: a for a in (*cap.pre, *cap.post)}
     for i in (*m.pre, *m.post):
         if absorbs[A.node(i).op].exposes:
@@ -315,7 +320,7 @@ def _build(cap: Cap, rank: int, A: Analysis, anchors: list[int], pair: int | Non
     gaps = []
     for i in sorted(covers):
         n = A.node(i)
-        for p in cap.gaps(n.op, g.types[n.outs[0]].dtype):
+        for p in cap.gaps(n.op, g.types[n.outs[0]].dtype, n.attrs):
             gaps.append((n.op, p))
     m.gaps = tuple(dict.fromkeys(gaps))
     return m

@@ -74,3 +74,20 @@ clean:
 	rm -rf $(OBJ) $(OUT)
 
 .PHONY: all clean
+
+# inkling_gemv_inst.cu: k_ig, one object per (T set, mode)
+INK_GEMV_MODES := 0 1
+INK_GEMV_OBJS := $(foreach m,$(INK_GEMV_MODES),$(foreach s,$(GEMV_SETS),$(OBJ)/inkling_gemv_inst_$(s)_m$(m).o))
+$(INK_GEMV_OBJS): $(OBJ)/%.o: inkling_gemv_inst.cu $(HDR)
+	@$(CC_CACHED)
+$(foreach m,$(INK_GEMV_MODES),$(foreach s,$(GEMV_SETS),\
+  $(eval $(OBJ)/inkling_gemv_inst_$(s)_m$(m).o: DEFS = -DIGEMV_SET=$(s) -DIGEMV_MODE=$(m))))
+$(OUT): $(INK_GEMV_OBJS)
+
+# inkling_moe_inst.cu: k_moe, one object per (rows, conv epilogue)
+INK_MOE_OBJS := $(foreach c,0 1,$(foreach t,1 2 3 4 5 6 7 8,$(OBJ)/inkling_moe_inst_t$(t)_c$(c).o))
+$(INK_MOE_OBJS): $(OBJ)/%.o: inkling_moe_inst.cu $(HDR)
+	@$(CC_CACHED)
+$(foreach c,0 1,$(foreach t,1 2 3 4 5 6 7 8,\
+  $(eval $(OBJ)/inkling_moe_inst_t$(t)_c$(c).o: DEFS = -DMOE_T=$(t) -DMOE_CONV=$(c))))
+$(OUT): $(INK_MOE_OBJS)

@@ -11,6 +11,7 @@ known 24 tokens. WARPC_TEST_SWIFT27 (the Qwen3.5 27B W4G128 checkpoint) enables 
 """
 
 import gc
+import json
 import os
 import subprocess
 import tempfile
@@ -304,5 +305,209 @@ def test_qwen35_27b_reference_on_the_gpu():
     assert "Paris" in text, (got, text)
 
 
+INKLING_IDS = json.loads((Path(__file__).resolve().parent / "data" / "inkling_quality_ids.json").read_text())
+
+
+def inkling_env() -> Path:
+    """The W4 checkpoint directory of $WARPC_TEST_INKLING."""
+    path = os.environ.get("WARPC_TEST_INKLING")
+    if not path:
+        raise Skip("WARPC_TEST_INKLING unset")
+    require_gpu()
+    return Path(path)
+
+
+def agreement(ref: list[torch.Tensor], got: list[torch.Tensor]) -> dict:
+    """Over every predicted position of the quality texts (the logits at positions 0..n-2 predict ids 1..n-1): KL(ref |
+    got), top-1 agreement, how many disagreements are near ties of ref (top-2 gap < 0.5), both perplexities."""
+    kl, agree, near, nll_ref, nll_got = [], [], [], [], []
+    for ids, a, b in zip(INKLING_IDS, ref, got, strict=True):
+        a, b = a[:-1].float().cuda(), b[:-1].float().cuda()
+        lp, lq = torch.log_softmax(a, -1), torch.log_softmax(b, -1)
+        kl.append((lp.exp() * (lp - lq)).sum(-1))
+        agree.append(a.argmax(-1) == b.argmax(-1))
+        top2 = a.topk(2, -1).values
+        near.append(top2[:, 0] - top2[:, 1] < 0.5)
+        target = torch.tensor(ids[1:], device="cuda")
+        nll_ref.append(-lp.gather(1, target[:, None])[:, 0])
+        nll_got.append(-lq.gather(1, target[:, None])[:, 0])
+    kl, agree, near = torch.cat(kl), torch.cat(agree), torch.cat(near)
+    return {
+        "positions": kl.numel(),
+        "kl_mean": kl.mean().item(),
+        "kl_max": kl.max().item(),
+        "top1": agree.float().mean().item(),
+        "disagreements": int((~agree).sum()),
+        "disagreements_not_near_tie": int((~agree & ~near).sum()),
+        "ppl_ref": torch.cat(nll_ref).mean().exp().item(),
+        "ppl_got": torch.cat(nll_got).mean().exp().item(),
+    }
+
+
+def inkling_reference_logits(path: Path) -> list[torch.Tensor]:
+    """The reference interpreter (bf16, on the GPU, the real INT4 weights) on the four quality texts: each text's logits
+    [n, 200058] f32 on the host. Needs the card alone (about 14 GB)."""
+    source = sources.open(path)
+    it = Interpreter(frontend.build(source, ctx_max=256, rows_max=160), source, device="cuda", dtype=torch.bfloat16)
+    out = []
+    for ids in INKLING_IDS:
+        it.reset()
+        n = len(ids)
+        out.append(
+            it.run({"tokens": torch.tensor(ids, dtype=torch.int32), "pos": torch.arange(n, dtype=torch.int32)})[
+                "logits"
+            ].cpu()
+        )
+    return out
+
+
+def test_inkling_reference_real():
+    """The reference on the real INT4 weights: the perplexity of the four texts (622 predicted positions) is the model's
+    (the old tree measured 3.710 with its own interpreter), and, when $WARPC_INKLING_QUALITY holds that interpreter's
+    logit dumps (ref-{0..3}.pt), their agreement is printed. Measured against the dumps: KL mean 0.00288, top-1 98.07%,
+    12 disagreements of which 1 not a near tie, perplexity 3.6996. That is a floor of this model, not an error: the old
+    store rounded the dequantised expert weights to bf16 and multiplied in bf16, this one multiplies the fp32
+    dequantisation. With the old rounding emulated the same code gives KL 0.00195, top-1 99.04%, 0 disagreements that
+    are not near ties, and its first visit differs from the dump by 1e-5 (rel. L2), against 3e-3 with fp32 experts: the
+    two fp32 / bf16 expert variants of THIS code differ by KL 0.00286. No bound is asserted on the dumps."""
+    path = inkling_env()
+    import time
+
+    t0 = time.perf_counter()
+    got = inkling_reference_logits(path)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    assert [g.shape for g in got] == [(len(ids), 200058) for ids in INKLING_IDS], [g.shape for g in got]
+    nll = []
+    for ids, g in zip(INKLING_IDS, got, strict=True):
+        lp = torch.log_softmax(g[:-1].float().cuda(), -1)
+        nll.append(-lp.gather(1, torch.tensor(ids[1:], device="cuda")[:, None])[:, 0])
+    ppl = torch.cat(nll).mean().exp().item()
+    print(f"  4 texts in {time.perf_counter() - t0:.0f} s, peak {peak:.1f} GiB, perplexity {ppl:.4f}")
+    assert 3.65 <= ppl <= 3.75, ppl  # the old tree's 3.710 within 1.1%
+    quality = os.environ.get("WARPC_INKLING_QUALITY")
+    if quality:
+        old = [torch.load(Path(quality) / f"ref-{p}.pt")["logits"][: len(ids)] for p, ids in enumerate(INKLING_IDS)]
+        print(f"  against the old interpreter's dumps: {agreement(old, got)}")
+
+
+def dump_inkling_reference(path: Path, out: Path) -> None:
+    torch.save(inkling_reference_logits(path), out)
+
+
+def prefill_logits(model, ids, rows: int) -> torch.Tensor:
+    """The logits after prefilling `ids` in steps of `rows` rows (the plan holds the graphs of 1..rows_max)."""
+    rt = model._runtime
+    saved, rt._rows_max = rt._rows_max, rows
+    try:
+        model.reset()
+        model.prefill(ids)
+    finally:
+        rt._rows_max = saved
+    return model.logits.clone()
+
+
+def test_inkling_tiny():
+    """A tiny Inkling-2 (real widths, 8 layers = 16 visits, a window of 16 that the 36 positions wrap, 16 experts)
+    compiled onto the CUDA table, one row per step along the reference's greedy continuation of a 13-token prompt. A
+    random model of this depth amplifies bf16 rounding (the real one does too: DESIGN 7h) so free-running ids part
+    after a few tokens; the gate is the model's own noise instead: at every generated position the compiled logits are
+    within 3 times the bf16 reference's distance from the fp32 reference (plus 0.01) of the bf16 reference, on average
+    within 1.5 times, and the compiled id is the reference's wherever the reference's top-2 gap is above twice the
+    largest logit difference between the two references. Logits after a 33-token prompt are bit-identical whether the
+    prompt goes in as steps of 8, 4 or 1 rows."""
+    require_gpu()
+    from inkling_common import random_inkling
+
+    source = random_inkling(0)
+    prompt = torch.randint(0, 2000, (13,), generator=torch.Generator().manual_seed(1)).tolist()
+    model = warpc.compile(source, ctx_max=64, rows_max=8)
+    graph = frontend.build(source, ctx_max=64, rows_max=36)
+    bf = Interpreter(graph, source, device="cuda", dtype=torch.bfloat16)
+    fp = Interpreter(graph, source, device="cuda", dtype=torch.float32)
+    want = bf.generate(prompt, 24)
+    ids = prompt + want[:23]
+    window = {"tokens": torch.tensor(ids, dtype=torch.int32), "pos": torch.arange(len(ids), dtype=torch.int32)}
+    ref_b, ref_f = (it.reset() or it.run(window)["logits"].float() for it in (bf, fp))
+    model.reset()
+    rel_c, rel_f, agree, decided = [], [], 0, 0
+    for pos, token in enumerate(ids):
+        model.step(token)
+        if pos < len(prompt) - 1:
+            continue
+        got, b, f = model.logits.float(), ref_b[pos], ref_f[pos]
+        norm = b.norm()
+        rel_c.append(((got - b).norm() / norm).item())
+        rel_f.append(((b - f).norm() / norm).item())
+        assert rel_c[-1] <= 3 * rel_f[-1] + 0.01, (pos, rel_c[-1], rel_f[-1])
+        top = b.topk(2).values
+        if top[0] - top[1] > 2 * (b - f).abs().max():
+            decided += 1
+            agree += int(got.argmax()) == int(b.argmax())
+    mean_c, mean_f = sum(rel_c) / len(rel_c), sum(rel_f) / len(rel_f)
+    print(
+        f"  {model.plan.summary()}\n  rel L2 to the bf16 reference {mean_c:.4f} on average (bf16 against fp32 reference"
+        f" {mean_f:.4f}); {agree} of {decided} decided ids (of {len(rel_c)}) equal"
+    )
+    assert mean_c <= 1.5 * mean_f and agree == decided and decided >= 8, (mean_c, mean_f, agree, decided)
+    ids = prompt + want[:20]
+    windows = {rows: prefill_logits(model, ids, rows) for rows in (8, 4, 1)}
+    assert torch.equal(windows[8], windows[4]) and torch.equal(windows[8], windows[1]), {
+        r: (windows[r] - windows[8]).abs().max().item() for r in windows
+    }
+
+
+def test_inkling_compiled_real():
+    """The compiled Inkling-2-Mini (all 15.8 GB of INT4 weights on the card, 340 tasks per step) against the reference
+    interpreter on the four quality texts (622 predicted positions, one row per step): KL mean at most 0.0033, top-1 at
+    least 98% with every disagreement a near tie of the reference, and the logits after a 41-token prompt
+    bit-identical for steps of 8, 4 and 1 rows. The reference runs in a process of its own first (it needs the card
+    alone).
+
+    0.0033 is 1.25 times the old tree's noise floor of this model (0.00263: its interpreter against itself with the
+    embedding table perturbed by 2^-9); the design's 0.0026 sat below the floor, and one realisation of any two correct
+    bf16 implementations lands anywhere in 0.0019 - 0.0030 (the mean of 622 heavy-tailed positions: one position of
+    the first text has KL 0.19). Measured: KL(reference | compiled) 0.00301, top-1 98.23% (11 disagreements, all near
+    ties; the old compiled model: 98.23%, 11), perplexity 3.6996 -> 3.7078 (old: 3.7102 -> 3.7093)."""
+    path = inkling_env()
+    import sys
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "reference.pt"
+        t0 = time.perf_counter()
+        done = subprocess.run(
+            [sys.executable, __file__, "--inkling-reference", str(path), str(out)], capture_output=True, text=True
+        )
+        assert done.returncode == 0, done.stderr[-2000:]
+        ref = torch.load(out)
+    print(f"  reference in {time.perf_counter() - t0:.0f} s")
+    t0 = time.perf_counter()
+    model = warpc.compile(path, ctx_max=256, rows_max=8)
+    print(f"  compiled in {time.perf_counter() - t0:.0f} s: {model.plan.summary()}")
+    t0 = time.perf_counter()
+    got = []
+    for ids in INKLING_IDS:
+        model.reset()
+        rows = []
+        for t in ids:
+            model.step(t)
+            rows.append(model.logits.clone().cpu())
+        got.append(torch.stack(rows))
+    r = agreement(ref, got)
+    print(f"  {sum(map(len, INKLING_IDS))} steps in {time.perf_counter() - t0:.1f} s: {r}")
+    assert r["positions"] == 622 and r["kl_mean"] <= 0.0033 and r["top1"] >= 0.98, r
+    assert r["disagreements_not_near_tie"] == 0, r
+    windows = {rows: prefill_logits(model, INKLING_IDS[0][:41], rows) for rows in (8, 4, 1)}
+    assert torch.equal(windows[8], windows[4]) and torch.equal(windows[8], windows[1]), {
+        k: (v - windows[8]).abs().max().item() for k, v in windows.items()
+    }
+
+
 if __name__ == "__main__":
-    run(globals())
+    import sys
+
+    if sys.argv[1:2] == ["--inkling-reference"]:
+        dump_inkling_reference(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        run(globals())

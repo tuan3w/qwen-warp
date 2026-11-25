@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 Dim = int | str
 DTYPES = ("bf16", "f32", "i32")
-SCHEMES = ("dense", "q4_0", "w4g128")
+SCHEMES = ("dense", "q4_0", "w4g128", "f32")
 # GGUF Q4_0 block: one fp16 scale and 32 4-bit codes
 Q4_0_BLOCK_ELEMS = 32
 Q4_0_BLOCK_BYTES = 18
@@ -37,7 +37,9 @@ class WeightDecl:
     """A read-only tensor of logical shape `shape`, read from `source` (a full HF tensor name).
 
     scheme "dense": the source tensor in bf16; "q4_0": the source's on-disk GGUF Q4_0 blocks (`Source.raw`);
-    "w4g128": the source's int4 codes packed 8 per int32 word and bf16 scales of 128 columns (`Source.raw`).
+    "w4g128": the source's int4 codes packed 8 per int32 word and bf16 scales of 128 columns (`Source.raw`); "f32": the
+    source's exact fp32 values (`Source.get(name, torch.float32)`), 4 bytes per element on the device. "dense" and
+    "w4g128" may be rank 3, [E, N, K]: E stacked expert matrices.
     """
 
     name: str
@@ -48,8 +50,8 @@ class WeightDecl:
     def __post_init__(self):
         if self.scheme not in SCHEMES:
             raise ValueError(f"weight {self.name}: unknown scheme {self.scheme!r}")
-        if self.scheme == "w4g128" and (len(self.shape) != 2 or self.shape[1] % W4G128_GROUP):
-            raise ValueError(f"weight {self.name}: w4g128 needs a 2-D shape with K a multiple of {W4G128_GROUP}")
+        if self.scheme == "w4g128" and (len(self.shape) < 2 or self.shape[-1] % W4G128_GROUP):
+            raise ValueError(f"weight {self.name}: w4g128 needs a 2-D or 3-D shape with K a multiple of {W4G128_GROUP}")
 
     @property
     def nbytes(self) -> int:
@@ -57,9 +59,9 @@ class WeightDecl:
         if self.scheme == "q4_0":
             return self.shape[0] * self.shape[1] // Q4_0_BLOCK_ELEMS * Q4_0_BLOCK_BYTES
         if self.scheme == "w4g128":
-            n, k = self.shape
-            return n * k // 2 + n * (k // W4G128_GROUP) * 2
-        return 2 * math.prod(self.shape)
+            k = self.shape[-1]
+            return math.prod(self.shape[:-1]) * (k // 2 + k // W4G128_GROUP * 2)
+        return (4 if self.scheme == "f32" else 2) * math.prod(self.shape)
 
 
 @dataclass(frozen=True)

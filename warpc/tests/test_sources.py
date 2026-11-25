@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -525,6 +526,157 @@ def test_w4g128_source_guards():
     with tempfile.TemporaryDirectory() as tmp:
         write_w4g128(Path(tmp), {"f32.weight": torch.tensor([1.0, 0.5, -3.0])})
         assert torch.equal(warpc.sources.open(tmp).get("f32.weight"), torch.tensor([1.0, 0.5, -3.0]).bfloat16())
+
+
+INKLING_OFFICIAL = Path(__file__).resolve().parent / "data" / "inkling2_mini_config.json"
+INKLING_TOOL = Path(__file__).resolve().parent.parent / "tools" / "inkling_w4_config.py"
+
+
+def run_inkling_tool(official: Path, directory: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(INKLING_TOOL), str(official), str(directory), *extra], capture_output=True, text=True
+    )
+
+
+def write_stacked(directory: Path, experts: int = 3, n: int = 128, k: int = 256) -> dict:
+    """A synthetic Inkling-layout checkpoint: one stacked W4G128 expert projection [E, N, K / 8] packed by
+    compressed_tensors per expert (no weight_shape, as in Inkling-2-Mini-W4), an fp32 tensor bf16 cannot represent, a
+    bf16 tensor; its index and the config.json the tool writes."""
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from safetensors.torch import save_file
+
+    g = torch.Generator().manual_seed(0)
+    codes = torch.randint(-8, 8, (experts, n, k), generator=g, dtype=torch.int8)
+    scale = (torch.rand(experts, n, k // 128, generator=g) * 0.1 + 1e-3).bfloat16()
+    name = "model.llm.layers.0.mlp.experts.gate_proj"
+    tensors = {
+        f"{name}.weight_packed": torch.stack([pack_to_int32(c, 4) for c in codes]),
+        f"{name}.weight_scale": scale,
+        "model.llm.attn_res.output_query": torch.tensor([1.0, 1.0 + 2**-10, -0.1]),
+        "model.llm.norm.weight": torch.randn(4, generator=g).bfloat16(),
+    }
+    save_file(tensors, directory / "model.safetensors")
+    index = {"metadata": {}, "weight_map": dict.fromkeys(tensors, "model.safetensors")}
+    (directory / "model.safetensors.index.json").write_text(json.dumps(index))
+    done = run_inkling_tool(INKLING_OFFICIAL, directory)
+    assert done.returncode == 0, done.stderr
+    return {"codes": codes, "scale": scale, "name": f"{name}.weight"}
+
+
+def test_stacked_w4g128_source():
+    """A rank-3 W4G128 tensor is E matrices: raw and dequantize equal the per-expert rank-2 results and the codes times
+    the scales; get(name, float32) is exact on fp32 tensors and widens bf16; get() still refuses values bf16 rounds."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            want = write_stacked(Path(tmp))
+            source = warpc.sources.open(tmp)
+            raw = source.raw(want["name"])
+            assert source.quant(want["name"]) == "W4G128" and source.config.quantization == "w4g128"
+            assert raw["packed"].shape == (3, 128, 32) and torch.equal(raw["scale"], want["scale"])
+            ours = w4g128.dequantize(raw["packed"], raw["scale"])
+            per_expert = torch.stack([w4g128.dequantize(raw["packed"][e], raw["scale"][e]) for e in range(3)])
+            assert torch.equal(ours, per_expert)
+            assert torch.equal(ours, want["codes"].float() * want["scale"].float().repeat_interleave(128, -1))
+            query = "model.llm.attn_res.output_query"
+            assert torch.equal(source.get(query, torch.float32), torch.tensor([1.0, 1.0 + 2**-10, -0.1]))
+            try:
+                source.get(query)
+            except UnsupportedModel as e:
+                assert "bf16 does not represent" in str(e), str(e)
+            else:
+                raise AssertionError("an fp32 tensor bf16 rounds was handed out as bf16")
+            norm = source.get("model.llm.norm.weight")
+            assert norm.dtype == torch.bfloat16
+            assert torch.equal(source.get("model.llm.norm.weight", torch.float32), norm.float())
+    except ImportError as e:
+        raise Skip(f"compressed_tensors not installed: {e}") from e
+    # a stacked tensor needs the config's warpc_layout marker (a Qwen3.5 config does not carry it)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            write_w4g128(Path(tmp), {"stack.weight_packed": torch.zeros(2, 4, 32, dtype=torch.int32),
+                                     "stack.weight_scale": torch.ones(2, 4, 2).bfloat16()})  # fmt: skip
+        except ImportError as e:
+            raise Skip(f"compressed_tensors not installed: {e}") from e
+        try:
+            warpc.sources.open(tmp).raw("stack.weight")
+        except UnsupportedModel as e:
+            assert "warpc_layout" in str(e), str(e)
+        else:
+            raise AssertionError("a stacked tensor was read without the layout marker")
+
+
+def test_inkling_w4_config_tool():
+    """The config writer copies the official config except quantization_config, which the config guard accepts; it
+    refuses a directory without an index, a packed tensor outside the experts and a config of another model."""
+    official = json.loads(INKLING_OFFICIAL.read_text())
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.llm.layers.0.mlp.experts.up_proj.weight_packed": "x"}})
+        )
+        done = run_inkling_tool(INKLING_OFFICIAL, d, "--out", str(d / "out"))
+        assert done.returncode == 0 and not (d / "config.json").exists(), done.stderr
+        written = json.loads((d / "out" / "config.json").read_text())
+        assert {k: v for k, v in written.items() if k != "quantization_config"} == {
+            k: v for k, v in official.items() if k != "quantization_config"
+        }
+        c = ModelConfig.from_hf(written)
+        assert c.family == "inkling2_loop" and c.quantization == "w4g128", c
+        assert official["quantization_config"]["quant_method"] == "modelopt"  # what the tool replaced
+        other = d / "other.json"
+        other.write_text(json.dumps({**official, "model_type": "qwen3"}))
+        assert "not an inkling2_loop config" in run_inkling_tool(other, d).stderr
+        (d / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.llm.layers.0.attn.wq_du.weight_packed": "x"}})
+        )
+        assert "experts only" in run_inkling_tool(INKLING_OFFICIAL, d).stderr
+        (d / "model.safetensors.index.json").unlink()
+        assert "no model.safetensors.index.json" in run_inkling_tool(INKLING_OFFICIAL, d).stderr
+
+
+def test_inkling_checkpoint():
+    """The W4 checkpoint directory: the config guard passes, and the graph declares every one of the 790 tensors with
+    the dtype and shape the file header has (safetensors headers only)."""
+    path = os.environ.get("WARPC_TEST_INKLING")
+    if not path:
+        raise Skip("WARPC_TEST_INKLING unset")
+    from safetensors import safe_open
+
+    directory = Path(path)
+    if not (directory / "config.json").is_file():
+        raise Skip(f"{path}/config.json missing: write it with warpc/tools/inkling_w4_config.py")
+    source = warpc.sources.open(directory)
+    graph = frontend.build(source, ctx_max=4096, rows_max=8)
+    files = json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"]
+    assert len(files) == 790
+    headers: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for f in sorted(set(files.values())):
+        with safe_open(str(directory / f), framework="pt") as h:
+            for name in h.keys():  # noqa: SIM118
+                s = h.get_slice(name)
+                headers[name] = (s.get_dtype(), tuple(s.get_shape()))
+    assert set(headers) == set(files)
+    read: set[str] = set()
+    for w in graph.weights.values():
+        if w.scheme == "w4g128":
+            *lead, n, k = w.shape
+            base = w.source[: -len("weight")]
+            want = {
+                f"{base}weight_packed": ("I32", (*lead, n, k // 8)),
+                f"{base}weight_scale": ("BF16", (*lead, n, k // 128)),
+            }
+        else:
+            on_disk = (w.shape[0], 1, w.shape[1]) if w.name.endswith("sconv") else w.shape  # [C, 1, W] convs
+            want = {w.source: ("F32" if w.scheme == "f32" else "BF16", on_disk)}
+        for name, header in want.items():
+            assert headers[name] == header, (w.name, name, headers[name], header)
+        read.update(want)
+    assert read == set(headers), sorted(set(headers) - read)[:4]
+    assert (len(graph.weights), len(headers)) == (718, 790)
+    with safe_open(str(directory / files["model.llm.unembed.weight"]), framework="pt") as h:
+        padding = h.get_tensor("model.llm.unembed.weight")[source.config.inkling.unpadded_vocab :]
+    print(f"  {padding.shape[0]} padding rows of the unembedding, max |value| {padding.float().abs().max():.4f}")
+    assert padding.float().abs().max() > 0.01  # not zero: they would win the argmax if the graph kept them
 
 
 def test_open_errors():

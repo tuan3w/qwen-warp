@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(GEMV_WARPS * 32) k_dg(const __grid_constant__ 
     } else if constexpr (MODE == 4) {
       reinterpret_cast<bf16*>(p.out[0])[r] = tb(gate_act(g, p.act) * bf(p.row[r]));
     } else {
-      reinterpret_cast<float*>(p.out[0])[r] = logit_out(g, p.cap);
+      reinterpret_cast<float*>(p.out[0])[r] = logit_out(g, p.cap, p.rnd);
     }
   }
 }

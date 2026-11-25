@@ -13,7 +13,7 @@ from collections.abc import Callable
 from ..compiler import Task
 from ..kvcache import FORMATS
 from ..runtime import Memory
-from . import schedule
+from . import inkling, schedule
 
 
 def _check(L: C.CDLL, rc: int, what: str) -> None:
@@ -57,6 +57,7 @@ def _gemv(L: C.CDLL, mem: Memory, t: Task, T: int, st: int, mode: int) -> None:
         mem.buffer(t.ins["row"]) if mode == 4 else None,
         a.get("act", 0),
         C.c_float(a.get("cap", 0.0)),
+        0,
         schedule.gemv_k_split(a["K"], mode, "nw" in t.weights),
         st,
     )
@@ -213,6 +214,7 @@ LAUNCHERS: dict[str, Callable[[C.CDLL, Memory, Task, int, int], None]] = {
     "g_head": _head,
     "g_ple": _ple,
 }
+LAUNCHERS.update(inkling.LAUNCHERS)
 
 
 # L2 prefetch of the GEMV that consumes an attention's output (a residual GEMV, or the o projection of a layer that

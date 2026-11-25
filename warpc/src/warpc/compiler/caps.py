@@ -4,7 +4,8 @@ A `Cap` is one kernel:
 
   anchor     the graph op the kernel is built around ("linear", "rmsnorm", "attention", "embed")
   emit       (Match, Analysis) -> Region: binds a legal match to the kernel's launch roles
-  segments   how many anchors on one shared input a single launch serves (the q|k|v GEMV: 3); the outputs stay separate
+  segments   how many anchors on one shared input a single launch serves (the q|k|v GEMV: 3); the outputs stay separate;
+             with segment_inputs > 1 the anchors may differ in input (one visit's six projections on three inputs)
   pair       ops that merge two same-input anchors into one output (silu_mul on a gate|up pair: the dual GEMV)
   pre        `Absorb` records of producers folded into the kernel's input side (rmsnorm prologue, the residual add in
              front of a norm, the reshape / qk-norm / rope in front of attention)
@@ -37,17 +38,43 @@ REF_POINTS: dict[str, tuple[str, ...]] = {
     "sigmoid_mul": ("sigmoid", "out"),  # sigmoid(gate) is a bf16 tensor before the product
     "gated_delta_rule": ("beta", "out"),  # sigmoid(b) is rounded before the fp32 recurrence
     "gated_rmsnorm": ("norm", "scale", "out"),  # bf16(x-hat), bf16(x-hat * w), then the fp32 gate product
+    "message_gate": ("input", "hidden"),  # the normed pair and its down projection are bf16 tensors; the output is f32
+    "moe_experts": ("gate", "up", "act", "down", "out"),  # g, u, the activation and y are bf16 tensors per expert
 }
+# Rounding points an op has beyond REF_POINTS when its attrs ask for them: the relative bias is rounded to the
+# activation dtype before it joins the scores.
+_ATTR_POINTS = {"attention": (("rel_proj", "bias"),)}
+# ops whose interior roundings are to the activation dtype whatever dtype they return (an f32 op output has none,
+# except these)
+FIXED_ROUNDING = frozenset({"message_gate"})
 VIEW_OPS = frozenset({"reshape", "split"})
-REDUCTION_OPS = frozenset({"rmsnorm", "argmax", "attention", "attention_read", "gated_rmsnorm"})
+REDUCTION_OPS = frozenset(
+    {
+        "rmsnorm",
+        "argmax",
+        "attention",
+        "attention_read",
+        "gated_rmsnorm",
+        "l2_clip",
+        "attn_res",
+        "message_gate",
+        "moe_route",
+    }
+)
 _LIMIT_SUFFIXES = ("_multiple", "_in", "_max", "_min")
 
 
-def ref_points(op: str, out_dtype: str) -> tuple[str, ...]:
-    """Rounding points of one interpreter node: none for views and non-bf16 outputs, else REF_POINTS or ("out",)."""
-    if op in VIEW_OPS or out_dtype != "bf16":
+def ref_points(op: str, out_dtype: str, attrs: dict | None = None) -> tuple[str, ...]:
+    """Rounding points of one interpreter node: none for views; for an output that is not the activation dtype only the
+    fixed ones (`FIXED_ROUNDING`, minus the boundary itself); else REF_POINTS or ("out",), plus the points the node's
+    attrs add."""
+    if op in VIEW_OPS:
         return ()
-    return REF_POINTS.get(op, ("out",))
+    points = REF_POINTS.get(op, ("out",))
+    if out_dtype == "bf16":
+        extra = tuple(p for attr, p in _ATTR_POINTS.get(op, ()) if attrs and attr in attrs)
+        return (*extra, *points)
+    return tuple(p for p in points if p != "out") if op in FIXED_ROUNDING else ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +125,7 @@ class Cap:
     emit: Callable  # (Match, Analysis) -> Region
     anchor_schemes: tuple[str, ...] = ()  # weight schemes a linear anchor may read: empty = any
     segments: int = 1
+    segment_inputs: int = 1  # > 1: the segments may read different inputs (pairwise independent anchors)
     pair: tuple[str, ...] = ()
     pre: tuple[Absorb, ...] = ()
     post: tuple[Absorb, ...] = ()
@@ -125,10 +153,10 @@ class Cap:
         extra = self.info(c)
         return Verdict(reasons + extra.reasons, extra.ctas)
 
-    def gaps(self, op: str, out_dtype: str) -> tuple[str, ...]:
+    def gaps(self, op: str, out_dtype: str, attrs: dict | None = None) -> tuple[str, ...]:
         """Reference rounding points of `op` this kernel does not reproduce when it absorbs the op."""
         have = set(self.rounds.get(op, ()))
-        return tuple(p for p in ref_points(op, out_dtype) if p not in have)
+        return tuple(p for p in ref_points(op, out_dtype, attrs) if p not in have)
 
 
 def limits_ok(kernel: str, limits: dict, c: dict) -> list[str]:

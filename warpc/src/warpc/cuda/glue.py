@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import inkling
+
 KERNELS = Path(__file__).resolve().parent / "kernels"
 
 _PTR, _INT, _FLOAT, _SIZE = C.c_void_p, C.c_int, C.c_float, C.c_size_t
@@ -26,7 +28,26 @@ SIGNATURES: dict[str, tuple[list, type]] = {
     "warpc_rmsnorm_post": ([_PTR, _PTR, _PTR, _PTR, _INT, _INT, _FLOAT, _PTR], _INT),
     "warpc_ple": ([_PTR, _PTR, _PTR, _PTR, _PTR, _INT, _INT, _INT, _FLOAT, _FLOAT, _FLOAT, _FLOAT, _PTR], _INT),
     "warpc_gemv": (
-        [_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT, _PTR, _PTR, _PTR, _FLOAT, _INT, _PTR, _INT, _FLOAT, _INT, _PTR],
+        [
+            _PTR,
+            _PTR,
+            _PTR,
+            _INT,
+            _INT,
+            _INT,
+            _INT,
+            _PTR,
+            _PTR,
+            _PTR,
+            _FLOAT,
+            _INT,
+            _PTR,
+            _INT,
+            _FLOAT,
+            _INT,
+            _INT,
+            _PTR,
+        ],
         _INT,
     ),
     "warpc_q4_gemv": ([_PTR, _PTR, _PTR, _INT, _INT, _INT, _INT, _PTR, _PTR, _INT, _PTR], _INT),
@@ -47,6 +68,8 @@ SIGNATURES: dict[str, tuple[list, type]] = {
     "warpc_prefetch": ([_PTR, _SIZE, _INT, _INT, _PTR], _INT),
     "warpc_error_string": ([_INT], C.c_char_p),
 }
+
+SIGNATURES.update(inkling.SIGNATURES)
 
 
 def nvcc() -> str:
@@ -106,6 +129,7 @@ def load(sm: int) -> C.CDLL:
     """The kernel library for compute capability `sm`, built on demand, with every entry point's signature set."""
     lib = C.CDLL(str(build(sm)))
     for name, (args, res) in SIGNATURES.items():
-        fn = getattr(lib, name)
-        fn.argtypes, fn.restype = args, res
+        fn = getattr(lib, name, None)  # an entry of a skipped file stays unbound
+        if fn is not None:
+            fn.argtypes, fn.restype = args, res
     return lib

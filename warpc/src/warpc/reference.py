@@ -19,6 +19,8 @@ from .kvcache import FORMATS
 from .sources import Source
 from .sources.w4g128 import dequantize
 
+EXPERT_CHUNK = 16  # stacked w4g128 experts dequantised at once
+
 
 class Interpreter:
     def __init__(self, graph: Graph, source: Source, *, device: str = "cpu", dtype: torch.dtype = torch.bfloat16):
@@ -27,6 +29,8 @@ class Interpreter:
         for name, w in graph.weights.items():
             if w.scheme == "w4g128":
                 self.weights[name] = {k: v.to(device) for k, v in source.raw(w.source).items()}
+            elif w.scheme == "f32":
+                self.weights[name] = source.get(w.source, torch.float32).reshape(w.shape).to(device)
             else:
                 # a q4_0 weight means exactly its decoded values
                 self.weights[name] = source.get(w.source).reshape(w.shape).to(device)
@@ -164,12 +168,18 @@ def _window(a: dict) -> dict:
     return {} if a.get("window") is None else {"window": a["window"]}
 
 
-def _attention(it, a, q, k, v, pos):
+def _attention(it, a, q, k, v, pos, *extra):
     cache = it.states[a["state"]]
     p = pos.long()
     scales = {s: it.weights[a[s]] for s in ("k_scale", "v_scale") if s in a}
+    options = _window(a)
+    if "rel_proj" in a:
+        rel, *extra = extra
+        options["bias"] = rel @ it.weights[a["rel_proj"]].to(rel.dtype)  # [T, Hq, E], rounded once
+    if a.get("sinks"):
+        options["sinks"] = extra[0]
     cache.write(p, k, v, **scales)
-    return cache.attend(q, p, a["scale"], **scales, **_window(a))
+    return cache.attend(q, p, a["scale"], **scales, **options)
 
 
 def _attention_read(it, a, q, pos):
@@ -183,7 +193,104 @@ def _causal_conv1d(it, a, x):
     u = torch.cat([state.t().to(x.dtype), x], 0)  # [W - 1 + T, C], oldest first
     windows = u.float().unfold(0, width, 1)  # [T, C, W]
     state.copy_(u[-(width - 1) :].t())
-    return (windows * w).sum(-1).to(x.dtype)
+    y = (windows * w).sum(-1)
+    if a.get("residual"):
+        y = y + x.float()
+    return (y / a.get("divisor", 1.0)).to(x.dtype)
+
+
+def _dyn_conv1d(it, a, x, taps):
+    state = it.states[a["state"]]
+    static = it.weights[a["weight"]].float()  # [W, C], row 0 = the current row
+    width, c = static.shape
+    heads, t = a["heads"], x.shape[0]
+    u = torch.cat([state.t().to(x.dtype), x], 0)
+    windows = u.float().unfold(0, width, 1).flip(-1)  # [T, C, W], index = lag
+    state.copy_(u[-(width - 1) :].t())
+    w = static.t().reshape(heads, c // heads, width)[None] + taps.float().reshape(t, heads, 1, width)
+    y = (windows.reshape(t, heads, c // heads, width) * w).sum(-1).reshape(t, c)
+    return ((y + x.float()) / a["divisor"]).to(x.dtype)
+
+
+def _l2_clip(it, a, x):
+    xf = x.float()
+    if "scale" in a:
+        xf = xf * it.weights[a["scale"]].float()
+    norm = torch.linalg.vector_norm(xf, dim=-1, keepdim=True)
+    return (xf * (a["threshold"] / (norm + 1e-6)).clamp(max=1.0)).to(x.dtype)
+
+
+def _log_scale(it, a, x, pos):
+    gain = 1.0 + a["alpha"] * torch.log(((pos.float() + 1.0) / a["floor"]).clamp(min=1.0))
+    return (x.float() * gain[:, None, None]).to(x.dtype)
+
+
+def _attn_res(it, a, *rows):
+    keys = _normed(torch.stack([r.float() for r in rows], 1), a["eps"])  # [T, N, H]
+    query = it.weights[a["query"]].float()
+    if "row" in a:
+        query = query[a["row"]]
+    p = torch.softmax(torch.einsum("h,tnh->tn", query, keys) * keys.shape[-1] ** -0.5, -1)
+    return torch.einsum("tn,tnh->th", p, keys)
+
+
+def _message_gate(it, a, x, m):
+    n = torch.cat([_normed(x, a["eps"]), _normed(m, a["eps"])], -1).to(it.dtype)
+    h = F.linear(n, it.weights[a["down"]].to(it.dtype)).float()
+    forget = torch.tanh(F.linear(h, it.weights[a["forget"]].float()))
+    gain = torch.tanh(F.linear(h, it.weights[a["gain"]].float()))
+    return (1 - forget) * x + gain * m
+
+
+def _moe_route(it, a, x):
+    scores = torch.sigmoid(F.linear(x.float(), it.weights[a["weight"]].float()))
+    order = torch.sort(scores + it.weights[a["bias"]].float(), dim=-1, descending=True, stable=True).indices
+    idx = order[:, : a["top_k"]]
+    w = scores.gather(1, idx)
+    total = w[:, 0]
+    for j in range(1, w.shape[1]):
+        total = total + w[:, j]
+    return idx.to(torch.int32), w / (total[:, None] + 1e-20) * a["route_scale"]
+
+
+def _expert_rows(weight, experts: list[int]) -> torch.Tensor:
+    """The matrices of `experts` of a stacked weight: fp32 [n, N, K] dequantised from w4g128, else as stored."""
+    idx = torch.as_tensor(
+        experts, dtype=torch.long, device=(weight["packed"] if isinstance(weight, dict) else weight).device
+    )
+    if isinstance(weight, dict):
+        return dequantize(weight["packed"][idx], weight["scale"][idx])
+    return weight[idx]
+
+
+def _expert_linear(it, x, rows, packed: bool) -> torch.Tensor:
+    """x [m, K] @ rows[N, K]^T: fp32 products and one rounding for dequantised w4g128 rows (as `_linear`)."""
+    if packed:
+        return F.linear(x.float(), rows).to(x.dtype)
+    return F.linear(x, rows.to(it.dtype))
+
+
+def _moe_experts(it, a, x, idx, w):
+    gate, up, down = (it.weights[a[k]] for k in ("gate", "up", "down"))
+    packed = isinstance(gate, dict)
+    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    hit = torch.unique(idx).tolist()  # ascending: the order of the official index_add_
+    gate_cap, up_cap = a.get("gate_cap"), a.get("up_cap")
+    for c0 in range(0, len(hit), EXPERT_CHUNK):
+        chunk = hit[c0 : c0 + EXPERT_CHUNK]
+        wg, wu, wd = (_expert_rows(m, chunk) for m in (gate, up, down))
+        for j, e in enumerate(chunk):
+            tok, slot = torch.where(idx == e)
+            cur = x[tok]
+            g = _expert_linear(it, cur, wg[j], packed).float()
+            u = _expert_linear(it, cur, wu[j], packed).float()
+            if gate_cap is None:
+                act = g * torch.sigmoid(g) * u
+            else:
+                act = torch.tanh(g / gate_cap) * gate_cap * torch.sigmoid(g) * (torch.tanh(u / up_cap) * up_cap)
+            y = _expert_linear(it, act.to(x.dtype), wd[j], packed)
+            out.index_add_(0, tok, y.float() * w[tok, slot, None])
+    return out.to(x.dtype)
 
 
 def _gated_delta_rule(it, a, q, k, v, ga, gb):
@@ -235,6 +342,13 @@ _IMPL = {
     "attention": _attention,
     "attention_read": _attention_read,
     "causal_conv1d": _causal_conv1d,
+    "dyn_conv1d": _dyn_conv1d,
+    "l2_clip": _l2_clip,
+    "log_scale": _log_scale,
+    "attn_res": _attn_res,
+    "message_gate": _message_gate,
+    "moe_route": _moe_route,
+    "moe_experts": _moe_experts,
     "gated_delta_rule": _gated_delta_rule,
     "gated_rmsnorm": _gated_rmsnorm,
 }
