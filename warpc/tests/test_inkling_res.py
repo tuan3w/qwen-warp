@@ -117,8 +117,7 @@ class Rig:
         self.mem = Memory(
             rows_max=ROWS,
             pos=self.pos.data_ptr(),
-            tokens=self.tokens.data_ptr(),
-            ids=self.tokens.data_ptr(),
+            inputs={"@tokens": self.tokens.data_ptr()},
             buffers={k: v.data_ptr() for k, v in self.bufs.items()},
             packs={k: v.data_ptr() for k, v in self.packs.items()},
             states={k: v.data_ptr() for k, v in self.states.items()},

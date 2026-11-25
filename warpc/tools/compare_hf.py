@@ -64,7 +64,7 @@ def teacher_forced_runtime(model: Path, ids: list[int]) -> tuple[torch.Tensor, t
         single.append(m.logits.cpu().clone())
     m.reset()
     # 8-row windows to 704 (no logits: the head graph has one row), then single-token head steps
-    m.prefill(ids[: TF_WINDOWS_TO + 1])  # windows up to 704, the last id as a head step: logits of position 704
+    m.append(ids[: TF_WINDOWS_TO + 1])  # windows up to 704, the last id as a head step: logits of position 704
     windowed = [m.logits.cpu().clone()]
     for t in ids[TF_WINDOWS_TO + 1 :]:
         m.step(t)

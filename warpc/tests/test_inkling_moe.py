@@ -584,9 +584,8 @@ def test_lowered_vs_interpreter():
         mem = Memory(
             rows_max=8,
             pos=0,
-            tokens=0,
-            ids=0,
-            buffers={**{k: v.data_ptr() for k, v in bufs.items()}, "@x": x_in.data_ptr(), "@res": res_in.data_ptr()},
+            inputs={"@x": x_in.data_ptr(), "@res": res_in.data_ptr()},
+            buffers={k: v.data_ptr() for k, v in bufs.items()},
             packs={k: v.data_ptr() for k, v in packs.items()},
             states={k: v.data_ptr() for k, v in states.items()},
             constants={},

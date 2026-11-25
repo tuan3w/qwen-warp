@@ -862,6 +862,23 @@ def test_qwen35_graph_on_the_cuda_table():
         raise AssertionError("the CUDA table claimed an fp8 cache")
 
 
+def test_gather_roles_follow_the_caps():
+    """Task.gather is the Cap's `gather`, on exactly the tasks of those kernels: the embedding table, and the exact bf16
+    head of the int4_refine kernel (its int4 copy is scanned, the plain bf16 head scans its whole table)."""
+    g = frontend.build(Qwen35Shapes(), ctx_max=4096)
+    for head, want in (
+        ("bf16", {"g_embed": ("table",)}),
+        ("int4_refine", {"g_embed": ("table",), "g_head_refine": ("w",)}),
+    ):
+        backend = CudaBackend(head)
+        plan = lower(g, backend, rows_max=8)
+        got = {t.kernel: t.gather for t in plan.tasks if t.gather}
+        assert got == want, (head, got)
+        for t in plan.tasks:
+            assert t.gather == backend.caps.by_kernel[t.kernel].gather
+            assert set(t.gather) <= set(t.weights), t
+
+
 def test_prologue_absorbs_producers_of_epilogue_operands():
     """The epilogue chain is matched before the prologue closure: a gate's reshapes in front of the sigmoid_mul a
     kernel applies after its linear are absorbed into the same region."""

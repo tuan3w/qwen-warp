@@ -200,7 +200,7 @@ def test_int4_rot_past_the_exact_window_and_16k_positions():
         source = tiny_source(family)
         model = warpc.compile(source, ctx_max=ctx, kv="int4_rot")
         want, want_logits = stepwise_reference(source, prompt, 8, "int4_rot", ctx)
-        model.prefill(prompt)
+        model.append(prompt)
         err = float((model.logits.float().cpu() - want_logits).abs().max())
         # measured 0.0055 (llama) and 0.0040 (hd 256), as close as the bf16 cache's 0.0050 and 0.0040; the same
         # kernels against the fp32 reference: 0.014 and 0.019; int4_rot against the bf16 cache: 0.036 and 0.043
@@ -251,10 +251,10 @@ def test_runtime_and_facade_contract():
     model.step(got[0])  # the 16th position
     assert "exceed" in expect(ValueError, model.step, got[0])
     model.reset()
-    assert "prefill needs at least one token" in expect(ValueError, model.prefill, [])
+    assert "append needs at least one token" in expect(ValueError, model.append, [])
     assert "cache is empty" in expect(ValueError, model.decode, 1)
-    assert "exceed" in expect(ValueError, model.prefill, list(range(17)))
-    assert model.prefill(TINY_PROMPT) == got[0] and model.step(got[0]) == got[1]
+    assert "exceed" in expect(ValueError, model.append, list(range(17)))
+    assert model.append(TINY_PROMPT) == got[0] and model.step(got[0]) == got[1]
 
 
 def test_gguf_file():
@@ -272,7 +272,7 @@ def test_gguf_file():
     if qwen3_06b and source.quant("model.layers.0.self_attn.q_proj.weight") == "Q4_0":
         assert got == QWEN3_06B_Q4_0, got
     model.reset()
-    first = model.prefill(PROMPT)
+    first = model.append(PROMPT)
     assert first == got[0] and int(torch.argmax(model.logits)) == first and model.logits.shape == (c.vocab_size,)
     assert model.step(first) == got[1] and model.step(got[1]) == got[2]
 
@@ -401,7 +401,7 @@ def prefill_logits(model, ids, rows: int) -> torch.Tensor:
     saved, rt._rows_max = rt._rows_max, rows
     try:
         model.reset()
-        model.prefill(ids)
+        model.append(ids)
     finally:
         rt._rows_max = saved
     return model.logits.clone()

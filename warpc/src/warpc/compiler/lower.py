@@ -43,7 +43,8 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
     _assign_buffers(graph, regions, order, plan)
 
     def buffer(v: str) -> str:
-        return v if v.startswith("@") else plan.buffer_of[v]
+        """A graph input is bound by the runtime under "@<name>"; every other value lives in a plan buffer."""
+        return v if v.startswith("@") else f"@{v}" if v in graph.inputs else plan.buffer_of[v]
 
     def constant(role: str, values: tuple[float, ...]) -> str:
         """The plan constant holding `values`: one per distinct table, shared by every task that reads it."""
@@ -65,6 +66,7 @@ def lower(graph: Graph, backend: Backend, *, rows_max: int) -> Plan:
                 ins={k: buffer(v) for k, v in r.ins.items()},
                 outs={k: buffer(v) for k, v in r.outs.items()},
                 weights=dict(r.weights),
+                gather=backend.caps.by_kernel[r.kernel].gather,
                 states=dict(r.states),
                 constants={role: constant(role, values) for role, values in r.constants.items()},
                 attrs=dict(r.attrs),

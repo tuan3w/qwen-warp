@@ -9,6 +9,7 @@ import torch
 
 from .config import Gemma4Text, InklingConfig, LinearAttention, ModelConfig
 from .gguf import GGUFSource
+from .requantize import Requantized, draft_vocab, quantize_w4
 from .safetensors import SafetensorsSource
 
 
@@ -54,7 +55,10 @@ __all__ = [
     "InklingConfig",
     "LinearAttention",
     "ModelConfig",
+    "Requantized",
     "SafetensorsSource",
     "Source",
+    "draft_vocab",
     "open",
+    "quantize_w4",
 ]

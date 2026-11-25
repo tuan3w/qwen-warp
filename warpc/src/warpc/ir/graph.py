@@ -6,7 +6,7 @@ Cross-call memory is only through declared states, and every op that touches a s
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 Dim = int | str
@@ -198,6 +198,23 @@ class Graph:
             if v not in self.types:
                 raise ValueError(f"unknown output {v}")
             self.outputs[alias] = v
+
+    def pruned(self, outputs: Iterable[str]) -> Graph:
+        """The graph without the nodes that neither feed the named outputs (aliases) nor write a state: the same
+        weights, states and inputs, the kept nodes in order, only those outputs. A window plan lowers it
+        without the head."""
+        need = {self.outputs[a] for a in outputs}
+        keep = []
+        for n in reversed(self.nodes):
+            if states_of(n) or any(o in need for o in n.outs):
+                keep.append(n)
+                need.update(n.ins)
+        g = Graph(self.name)
+        g.inputs, g.weights, g.states, g.types = self.inputs, self.weights, self.states, self.types
+        g.nodes = keep[::-1]
+        g.outputs = {a: self.outputs[a] for a in outputs}
+        g._count = self._count
+        return g
 
     def verify(self) -> None:
         """Every input defined before use, every named weight and state declared (states of the op's kind), every

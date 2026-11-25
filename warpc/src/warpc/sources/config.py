@@ -294,6 +294,7 @@ class ModelConfig:
     sliding_window: int | None = None  # the window of the sliding_attention layers
     gemma: Gemma4Text | None = None
     inkling: InklingConfig | None = None
+    mtp_layers: int = 0  # the checkpoint's multi-token-prediction decoder layers (text_config.mtp_num_hidden_layers)
 
     def __post_init__(self):
         factors = self.rope_freq_factors
@@ -388,6 +389,7 @@ def _qwen35_extras(text: dict, hf: dict, common: dict) -> dict:
             conv_kernel=int(text["linear_conv_kernel_dim"]),
         ),
         "quantization": "w4g128" if hf.get("quantization_config") else None,
+        "mtp_layers": int(text.get("mtp_num_hidden_layers") or 0),
     }
 
 

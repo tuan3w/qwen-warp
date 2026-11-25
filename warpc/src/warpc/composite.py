@@ -9,12 +9,13 @@ the task that touches it): a layer's KV, conv or recurrent state is sized and la
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 import torch
 
 from .compiler import Backend, CapsTable, Pack, Plan, Task
 from .ir import Graph, StateDecl
+from .kvcache import RowSection
 from .runtime import Executor, Launch, Memory, merge_sides
 from .sources import Source
 
@@ -68,8 +69,11 @@ class CompositeExecutor:
     def state_nbytes(self, state: StateDecl, rows_max: int) -> int:
         return self._executors[self._state_owner[state.name]].state_nbytes(state, rows_max)
 
-    def pack(self, pack: Pack) -> torch.Tensor:
-        return self._executors[self._pack_owner[pack.name]].pack(pack)
+    def pack(self, pack: Pack, *, host: bool = False) -> torch.Tensor:
+        return self._executors[self._pack_owner[pack.name]].pack(pack, host=host)
+
+    def pack_nbytes(self, pack: Pack) -> int:
+        return self._executors[self._pack_owner[pack.name]].pack_nbytes(pack)
 
     def schedule(self, mem: Memory, tasks: Sequence[Task], T: int) -> list[Launch]:
         launches = []
@@ -79,9 +83,32 @@ class CompositeExecutor:
             launches.append(launch)
         return merge_sides(tasks, launches)
 
-    def advance(self, mem: Memory, T: int, stream: int) -> None:
+    def advance(self, mem: Memory, T: int, accepted: torch.Tensor, stream: int) -> None:
         for name, ex in self._executors.items():
-            ex.advance(_OwnerMemory.of(mem, name), T, stream)
+            ex.advance(_OwnerMemory.of(mem, name), T, accepted, stream)
+
+    def _owned(self, states: Mapping[str, torch.Tensor]) -> dict[str, dict[str, torch.Tensor]]:
+        by: dict[str, dict[str, torch.Tensor]] = {name: {} for name in self._executors}
+        for s, t in states.items():
+            by[self._state_owner[s]][s] = t
+        return by
+
+    def materialize(self, states: Mapping[str, torch.Tensor]) -> None:
+        for name, owned in self._owned(states).items():
+            self._executors[name].materialize(owned)
+
+    def save(self, mem: Memory, states: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for name, owned in self._owned(states).items():
+            out |= self._executors[name].save(_OwnerMemory.of(mem, name), owned)
+        return out
+
+    def load(self, mem: Memory, states: Mapping[str, torch.Tensor], saved: Mapping[str, torch.Tensor]) -> None:
+        for name, owned in self._owned(states).items():
+            self._executors[name].load(_OwnerMemory.of(mem, name), owned, saved)
+
+    def kv_sections(self, state: StateDecl, rows_max: int) -> dict[str, RowSection]:
+        return self._executors[self._state_owner[state.name]].kv_sections(state, rows_max)
 
     def reset(self, mem: Memory) -> None:
         for name, ex in self._executors.items():

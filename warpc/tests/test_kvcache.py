@@ -10,6 +10,7 @@ engine comparisons. The engine is built for 4 KV heads of head dim 256; only its
 """
 
 import ctypes
+import itertools
 import os
 
 import torch
@@ -218,6 +219,26 @@ def test_warpc_prep_kernel_writes_the_engine_bytes():
         for name in ("vc", "vs", "vx", "vr"):
             got, want = section(buf, ctx, name), section(ekv.cpu(), ctx, name)
             assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), name
+
+
+def test_row_sections_and_aux_range_partition_the_buffer() -> None:
+    """The per-position planes of every format fit their layout without overlapping, and the exact rows (sink, ring)
+    are the contiguous tail `aux_range` names: what a KV export carries per row and what a snapshot carries as state."""
+    nkv, hd, rows_max = 4, 256, 8
+    for name, fmt in FORMATS.items():
+        for ctx in (64, 1000):
+            secs = fmt.row_sections(ctx, nkv, hd, rows_max)
+            spans = sorted((s.offset, s.offset + s.nbytes) for s in secs.values())
+            assert all(a[1] <= b[0] for a, b in itertools.pairwise(spans)), (name, spans)
+            total = fmt.nbytes(ctx, nkv, hd, rows_max)
+            assert spans[-1][1] <= total and all(s.rows == ctx for s in secs.values()), name
+            aux = fmt.aux_range(ctx, nkv, hd, rows_max)
+            assert (aux is not None) == fmt.exact_rows, name
+            if aux:
+                assert aux[0] >= spans[-1][1] and aux[0] + aux[1] == total, (name, aux, spans[-1])
+    sections = INT4_ROT.row_sections(1000, nkv, hd, rows_max)
+    assert {n: s.row_bytes for n, s in sections.items()} == {"kc": 128, "vc": 128, "ks": 4, "vs": 4}
+    assert INT4_ROT.aux_range(1000, nkv, hd, rows_max)[1] == 2 * nkv * 4 * hd * 2 + 2 * nkv * 512 * hd * 2
 
 
 if __name__ == "__main__":

@@ -146,6 +146,18 @@ def _argmax(it, a, x):
     return x.argmax(-1).to(torch.int32)
 
 
+def _concat(it, a, x, y):
+    return torch.cat([x, y], -1)
+
+
+def _select_row(it, a, x, i):
+    return x[i.long()]
+
+
+def _take(it, a, i):
+    return torch.tensor(a["table"], dtype=torch.int32, device=i.device)[i.long()]
+
+
 def _rope(it, a, q, *rest):
     *ks, pos = rest
     rd = a["rotary_dim"]
@@ -338,6 +350,9 @@ _IMPL = {
     "split": _split,
     "cast": _cast,
     "argmax": _argmax,
+    "concat": _concat,
+    "select_row": _select_row,
+    "take": _take,
     "rope": _rope,
     "attention": _attention,
     "attention_read": _attention_read,

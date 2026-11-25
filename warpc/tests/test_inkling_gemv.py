@@ -155,8 +155,7 @@ class Rig:
         self.mem = Memory(
             ROWS,
             zero.data_ptr(),
-            zero.data_ptr(),
-            zero.data_ptr(),
+            {},
             {k: v.data_ptr() for k, v in self.bufs.items()},
             {k: v.data_ptr() for k, v in self.packs.items()},
             {k: v.data_ptr() for k, v in self.states.items()},

@@ -12,6 +12,7 @@ import itertools
 import os
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -19,12 +20,13 @@ from harness import Skip, run
 from warpc import frontend, sources
 from warpc.compiler import Pack, lower
 from warpc.errors import LoweringError
-from warpc.ir import WeightDecl
+from warpc.ir import Graph, TType, WeightDecl
 from warpc.kvcache import FORMATS
 from warpc.sources import ModelConfig
 from warpc.swiftmk import SwiftmkBackend
 from warpc.swiftmk import lib as smk
-from warpc.swiftmk.executor import ring_advance
+from warpc.swiftmk.executor import ring_commit
+from warpc.swiftmk.launch import LAUNCHERS
 from warpc.swiftmk.pack import Packer, quant_head_i4, w4_scale_offset
 
 # the hand engine's 64-layer step (engine.cu smk_run_step): per layer the input norm (+ the residual add from layer 1),
@@ -265,6 +267,100 @@ def test_dense_graph_is_refused_by_the_offset_limit():
         raise AssertionError("a graph without norm offsets lowered onto the swiftmk table")
 
 
+def _head_graph(n: int, k: int, scheme: str, *, head: bool = True) -> Graph:
+    """x[T, k] -> linear (n rows, `scheme`) -> cast f32 -> argmax (the head pattern), or the linear alone."""
+    g = Graph("head")
+    x = g.input("x", TType(("T", k), "bf16"))
+    g.weight(WeightDecl("hw", (n, k), scheme, "hw"))
+    y = g.op("linear", [x], weight="hw")
+    if not head:
+        g.output(y=y)
+    else:
+        logits = g.op("cast", [y], dtype="f32")
+        g.output(logits=logits, ids=g.op("argmax", [logits]))
+    g.verify()
+    return g
+
+
+def test_w4_head_is_chosen_for_the_head_pattern_only():
+    for head in ("bf16", "int4_refine"):
+        be = SwiftmkBackend(head)
+        plan = lower(_head_graph(512, 256, "w4g128"), be, rows_max=8)
+        assert [t.kernel for t in plan.tasks] == ["s_w4_head"], (head, plan.summary())
+        (t,) = plan.tasks
+        assert t.attrs == {"N": 512, "K": 256} and set(t.weights) == {"w"} and t.gather == ()
+        assert list(plan.packs) == [("w4r", ("hw",))], plan.packs
+        plain = lower(_head_graph(512, 256, "w4g128", head=False), be, rows_max=8)
+        assert [t.kernel for t in plain.tasks] == ["s_w4_gemv"], (head, plain.summary())
+    dense = lower(_head_graph(512, 256, "dense"), SwiftmkBackend(), rows_max=8)
+    assert [t.kernel for t in dense.tasks] == ["s_head"], dense.summary()
+    try:
+        lower(_head_graph(520, 256, "w4g128"), SwiftmkBackend(), rows_max=8)
+    except LoweringError as e:
+        assert "N=520 is not a multiple of 16" in str(e), str(e)
+    else:
+        raise AssertionError("a head with N not a multiple of 16 lowered onto s_w4_head")
+
+
+def test_27b_gather_roles():
+    """Task.gather is set on exactly the tasks whose kernel reads a weight by row gather only: the embedding, and the
+    exact head of the int4_refine kernel (its int4 copy is scanned)."""
+    src = sources.open(_swift27())
+    g = frontend.build(src, ctx_max=4608, kv="bf16")
+    for head, kernel, want in (("bf16", "s_head", ()), ("int4_refine", "s_head_refine", ("w",))):
+        plan = lower(g, SwiftmkBackend(head), rows_max=8)
+        got = {t.kernel: t.gather for t in plan.tasks if t.gather}
+        assert got == {"s_embed": ("table",), **({kernel: want} if want else {})}, (head, got)
+
+
+class _Mem:
+    """What a swiftmk launcher reads of a runtime: packs, buffers, zeroed scratch."""
+
+    def __init__(self, packs: dict, buffers: dict):
+        self.packs, self.buffers, self._scratch = packs, buffers, {}
+
+    def buffer(self, name: str) -> int:
+        return self.buffers[name].data_ptr()
+
+    def scratch(self, name: str, nbytes: int) -> int:
+        if name not in self._scratch:
+            self._scratch[name] = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+        return self._scratch[name].data_ptr()
+
+
+def test_w4_head_equals_the_direct_calls():
+    """s_w4_head's logits and ids == smk_w4r_gemv (F32 epilogue) + smk_argmax called directly, bit for bit: the draft
+    head of the hand engine (68,864 rows, K = 5120), T = 1..4."""
+    lib = _lib()
+    gen = torch.Generator().manual_seed(5)
+    n, k = 68864, 5120
+    g = _head_graph(n, k, "w4g128")
+    plan = lower(g, SwiftmkBackend(), rows_max=8)
+    (task,) = plan.tasks
+    raw = {"hw": _random_w4(n, k, gen)}
+    pack = Packer(g.weights, _W4Source(raw, {})).build(next(iter(plan.packs.values())))
+    x = torch.randn(8, k, generator=gen).to(torch.bfloat16).cuda()
+    got_logits = torch.full((8, n), float("nan"), dtype=torch.float32, device="cuda")
+    got_ids = torch.full((8,), -1, dtype=torch.int32, device="cuda")
+    mem = _Mem({"hw": pack.data_ptr()}, {"@x": x, task.outs["logits"]: got_logits, task.outs["ids"]: got_ids})
+    ex = SimpleNamespace(lib=lib)
+    st = _stream()
+    ws = torch.zeros(lib.smk_argmax_ws_bytes(), dtype=torch.uint8, device="cuda")
+    for T in range(1, 5):
+        run_task = LAUNCHERS[task.kernel](ex, mem, task, T)
+        want_logits = torch.empty(T, n, dtype=torch.float32, device="cuda")
+        want_ids = torch.empty(T, dtype=torch.int32, device="cuda")
+        p = pack.data_ptr()
+        e = _epi(smk.EPI_F32, [want_logits])
+        lib.check(lib.smk_w4r_gemv(p, p + w4_scale_offset(n, k), x.data_ptr(), n, k, T, e, st), "w4r")
+        lib.check(lib.smk_argmax(want_logits.data_ptr(), T, n, want_ids.data_ptr(), None, ws.data_ptr(), st), "argmax")
+        run_task(st)
+        torch.cuda.synchronize()
+        assert torch.equal(got_logits[:T], want_logits), f"T={T}: logits differ"
+        assert torch.equal(got_ids[:T], want_ids), f"T={T}: ids differ"
+        assert torch.equal(want_ids.long(), want_logits.argmax(-1)), f"T={T}: argmax is not the lowest maximal index"
+
+
 # engine.h smk_layer_w / smk_model_w, transcribed for the ring test's engine
 class _LayerW(C.Structure):
     _fields_ = [
@@ -334,7 +430,7 @@ def test_swiftmk_ring():
             torch.cuda.synchronize()
             lib.check(cd.smk_engine_read(h, 0, C.cast(ds, C.c_void_p), C.sizeof(ds)), "read")
             hand.append((ds[DS_CUR], ds[DS_PEND]))
-            ring_advance(cur, pend, T, tmax + 1)
+            ring_commit(cur, pend, torch.full((1,), T, dtype=torch.int32, device="cuda"), T, tmax + 1)
             ours.append((int(cur), int(pend)))
         wraps = sum(1 for (_, a), (_, b) in itertools.pairwise(hand) if (a >> 13) != (b >> 13))
         assert wraps >= 4, f"the T sequence crossed the delta-buffer wrap only {wraps} times"

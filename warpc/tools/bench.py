@@ -2,7 +2,7 @@
 
   uv run --package warpc python warpc/tools/bench.py ENGINE MODEL [--ctx-max N] [--tokens N] [--repeats N] \
       [--kv FORMAT] [--tokenizer DIR] [--json FILE] [--backend cuda|swiftmk|composite] \
-      [--kernels K,...] [--head bf16|int4_refine] \
+      [--kernels K,...] [--head bf16|int4_refine] [--mtp K] [--host-tables] [--window] [--forge-position] \
       [--prompt-files F... --prompt-len L...] [--gpu-memory-utilization U...] [--language-model-only]
 
 ENGINE is warpc, llama-server, vllm or swift-engine (the hand engine of this repository, 27B checkpoint only); MODEL an
@@ -20,6 +20,14 @@ the tokens - 1 tokens after the first: warpc and swift-engine by measure.py (one
 length, decode rounds continuing it, nvidia-smi clock samples, host overhead per token), vllm by its engine-core token
 timestamps (a fresh request per round). --ctx-max defaults to the longest prompt plus every round's tokens. Each cell
 records the KV cache bytes per token of the 16 attention layers.
+
+--mtp K: greedy MTP speculation with K drafts per cycle (vllm: num_speculative_tokens; swift-engine: the hand's
+SpecEngine with the prompt-lookup hybrid off; warpc: backend composite with the three data-movement kernels unless
+--kernels says otherwise, so the hand's kernels do all model compute). warpc and the hand engine then also report the
+tokens per cycle and the histogram of accepted drafts of the timed rounds; both decode a round as whole groups of 8
+cycles until it holds at least --tokens - 1 tokens (the same tokens over the same spans on both sides).
+--host-tables keeps the embedding and rescoring head in pinned host memory (warpc: compile(host_tables=True), hand:
+Engine(host_tables=True)): needed to fit more than about 80k tokens of context.
 """
 
 import argparse
@@ -38,10 +46,12 @@ import swift_worker
 import vllm_worker
 import warpc
 from backends import BACKENDS, make_backend
+from warpc.windows import plan_windows
 
 PROMPT = [785, 6722, 315, 9625, 374]  # "The capital of France is" in Qwen3's vocabulary; valid ids in every vocabulary
 ENGINES = ("warpc", "llama-server", "vllm", "swift-engine")
 ROWS = 8  # prompt step rows: the hand engine's Engine(tmax=8) chunk
+SHORT = swift_worker.SHORT  # the real prompt under a forged position
 
 
 def bench_warpc(model: Path, ctx_max: int, tokens: int, repeats: int, kv: str, backend=None) -> dict:
@@ -52,7 +62,7 @@ def bench_warpc(model: Path, ctx_max: int, tokens: int, repeats: int, kv: str, b
     rates = []
     for _ in range(repeats + 1):
         compiled.reset()
-        compiled.prefill(PROMPT)
+        compiled.append(PROMPT)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         compiled.decode(tokens)
@@ -62,8 +72,11 @@ def bench_warpc(model: Path, ctx_max: int, tokens: int, repeats: int, kv: str, b
 
 
 def _backend(args):
-    """(backend, the hand engine's library or None) of --backend / --head / --kernels."""
-    backend = make_backend(args.backend, args.head, args.kernels)
+    """(backend, the hand engine's library or None) of --backend / --head / --kernels; with --mtp and no --kernels the
+    composite takes only the three data-movement kernels (the hand's kernels do all model compute); so does a window
+    run (its prefill packs are the hand library's)."""
+    glue = "g_select_row,g_take,g_concat" if (args.mtp or args.window) and args.backend == "composite" else None
+    backend = make_backend(args.backend, args.head, args.kernels or glue, window=args.window)
     if args.backend == "cuda":
         return backend, None
     from warpc.swiftmk import lib
@@ -82,34 +95,71 @@ def bench_warpc_long(args, ctx_max: int) -> dict:
     backend, library = _backend(args)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
-    compiled = warpc.compile(args.model, ctx_max=ctx_max, rows_max=ROWS, kv=args.kv, backend=backend)
+    compiled = warpc.compile(
+        args.model,
+        ctx_max=ctx_max,
+        rows_max=ROWS,
+        kv=args.kv,
+        backend=backend,
+        speculate=args.mtp,
+        host_tables=args.host_tables,
+        window_rows=4096 if args.window else 0,
+    )
     compile_s = time.perf_counter() - t0
-    rt, n = compiled._runtime, args.tokens - 1
+    rt, n, k = compiled._runtime, args.tokens - 1, args.mtp
+    spec = compiled.decoder if k else None
+    free, total = torch.cuda.mem_get_info()
     cells = {}
     for length in args.prompt_len:
-        ids = long_prompt(args, length)
+        ids = long_prompt(args, SHORT if args.forge_position else length)
         compiled.reset()
         t0 = time.perf_counter()
-        compiled.prefill(ids)
+        compiled.append(ids, ends=None if args.forge_position or not args.window else plan_windows(ids))
+        if args.forge_position:  # timing only: the position moves, the cache rows below it stay as they are (zeros)
+            rt.pos.fill_(length)
+            rt.position = length
+            if k:
+                spec._last_hidden_pos = length
+                spec.start(k)
+        torch.cuda.synchronize()
         prefill_s = time.perf_counter() - t0
 
         def replay_events() -> tuple[float, int]:
-            s = measure.replay_seconds(rt._graphs[(1, True)].replay, n)
-            rt._position += n
+            s = measure.replay_seconds(rt.graph(1, ("ids",)).replay, n)
+            rt.position += n
             return s, n
 
         def decode() -> int:
-            compiled.decode(n)
-            return n
+            if not k:
+                compiled.decode(n)
+                return n
+            got = 0
+            while got < n:  # whole groups of 8 cycles as the hand's rounds: the same tokens over the same spans
+                got += len(spec.cycles(8))
+            return got
 
-        cell = measure.rounds(decode, args.repeats, replay_events)
+        before = spec.stats if k else None
+        cell = measure.rounds(decode, args.repeats, None if k else replay_events)
+        if k:
+            after = spec.stats
+            cycles, emitted = after.cycles - before.cycles, after.emitted - before.emitted
+            cell |= {
+                "tokens_per_cycle": emitted / cycles,
+                "cycles": cycles,
+                "accepted": [a - b for a, b in zip(after.accepted, before.accepted, strict=True)],
+                "cycle_ms": 1000 * emitted / cycles / cell["tok_s"],
+            }
         cells[str(length)] = {**cell, "prefill_s": prefill_s, "ctx_max": ctx_max}
+    used = torch.cuda.mem_get_info()
     result = {
         "cells": cells,
         "plan": compiled.plan.summary(),
         "compile_s": compile_s,
         "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
+        "device_gib_after_load": (total - free) / 2**30,
+        "device_gib_after_decode": (used[1] - used[0]) / 2**30,
         "kv_bytes_per_token": swift_worker.KV_BYTES_PER_TOKEN.get(args.kv),
+        "mtp": k,
     }
     if library is not None:
         result |= {"lib": str(library.path), "lib_sha256": library.sha256}
@@ -119,7 +169,11 @@ def bench_warpc_long(args, ctx_max: int) -> dict:
 def bench_swift(args, ctx_max: int) -> dict:
     mode = ["bench", "--prompt-files", *map(str, args.prompt_files), "--prompt-len", *map(str, args.prompt_len)]
     mode += ["--tokens", str(args.tokens), "--repeats", str(args.repeats), "--mtp", str(args.mtp)]
-    return swift_worker.spawn(args.model, kv=args.kv, head=args.head, ctx_max=ctx_max, mode=mode)
+    mode += ["--forge-position"] if args.forge_position else []
+    mode += ["--fast-prefill"] if args.window else []
+    return swift_worker.spawn(
+        args.model, kv=args.kv, head=args.head, ctx_max=ctx_max, mode=mode, host_tables=args.host_tables
+    )
 
 
 def bench_vllm_long(args) -> dict:
@@ -181,7 +235,20 @@ def main():
         "--gpu-memory-utilization", type=float, nargs="+", default=[0.93, 0.90, 0.87], help="vllm, tried in order"
     )
     ap.add_argument("--language-model-only", action="store_true", help="vllm: skip the vision tower")
-    ap.add_argument("--mtp", type=int, default=0, help="vllm / swift-engine: MTP draft tokens (0: plain decode)")
+    ap.add_argument(
+        "--mtp", type=int, default=0, help="warpc / vllm / swift-engine: MTP draft tokens (0: plain decode)"
+    )
+    ap.add_argument("--host-tables", action="store_true", help="warpc / swift-engine: tables in pinned host memory")
+    ap.add_argument(
+        "--forge-position",
+        action="store_true",
+        help="timing only: prefill 385 tokens, then move the position to --prompt-len over the empty cache",
+    )
+    ap.add_argument(
+        "--window",
+        action="store_true",
+        help="warpc: the window prefill (SwiftmkBackend(window=True), plan_windows ends); swift-engine: FastPrefill",
+    )
     args = ap.parse_args()
     if args.prompt_files or args.ids_file:
         if not args.prompt_len:

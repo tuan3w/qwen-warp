@@ -30,6 +30,7 @@ from harness import Skip, run
 from inkling_common import INKLING_OFFICIAL, INKLING_W4G128, InklingShapes, inkling_w4
 from warpc import frontend
 from warpc.errors import UnsupportedModel
+from warpc.ir import Graph, TType
 from warpc.reference import _IMPL, Interpreter
 from warpc.sources import ModelConfig
 
@@ -205,7 +206,7 @@ def test_graph_shape():
         model.save_pretrained(tmp)
         source = warpc.sources.open(tmp)
         graph = frontend.build(source, ctx_max=64)
-        assert set(graph.inputs) == {"tokens", "pos"} and set(graph.outputs) == {"logits", "ids"}
+        assert set(graph.inputs) == {"tokens", "pos"} and set(graph.outputs) == {"hidden", "logits", "ids"}
         assert graph.weights["lm_head"].source == "model.embed_tokens.weight"  # tied
         assert {w.scheme for w in graph.weights.values()} == {"dense"}
         assert [s.shape for s in graph.states.values()] == [(2, 64, 2, 32)] * 3
@@ -621,6 +622,313 @@ def test_real_qwen35_checkpoint():
     c = source.config
     print(f"  {len(graph.nodes)} nodes, {len(graph.weights)} weights {schemes}, {len(graph.states)} states")
     assert schemes["w4g128"] == 400 and c.layer_types.count("attention") == 16, schemes
+
+
+def test_data_movement_ops():
+    """concat, select_row and take on the reference interpreter: exact, and ill-typed uses refused."""
+    g = Graph("move")
+    x = g.input("x", TType(("T", 3), "bf16"))
+    y = g.input("y", TType(("T", 2), "bf16"))
+    i = g.input("i", TType((1,), "i32"))
+    table = (7, 0, 16777215, 42)
+    g.output(cat=g.op("concat", [x, y]), row=g.op("select_row", [x, i]), id=g.op("take", [i], table=table))
+    g.verify()
+    assert [g.types[v] for v in g.outputs.values()] == [
+        TType(("T", 5), "bf16"),
+        TType((1, 3), "bf16"),
+        TType((1,), "i32"),
+    ]
+    a, b = torch.randn(4, 3).bfloat16(), torch.randn(4, 2).bfloat16()
+    it = Interpreter(g, None)
+    for k in range(4):
+        out = it.run({"x": a, "y": b, "i": torch.tensor([k], dtype=torch.int32)})
+        assert torch.equal(out["cat"], torch.cat([a, b], 1)) and torch.equal(out["row"], a[k : k + 1])
+        assert out["id"].dtype == torch.int32 and out["id"].tolist() == [table[k]]
+
+    def refused(op, ins, attrs, needle):
+        h = Graph("bad")
+        for n, t in ins.items():
+            h.input(n, t)
+        try:
+            h.op(op, list(ins), **attrs)
+        except ValueError as e:
+            assert needle in str(e), str(e)
+        else:
+            raise AssertionError(f"{op} {attrs} accepted")
+
+    row, idx = TType(("T", 3), "bf16"), TType((1,), "i32")
+    refused("concat", {"x": row, "y": TType(("T", 2), "f32")}, {}, "concat")
+    refused("concat", {"x": row, "y": TType((2, 2), "bf16")}, {}, "concat")
+    refused("select_row", {"x": row, "i": TType((2,), "i32")}, {}, "select_row")
+    refused("select_row", {"x": row, "i": TType((1,), "f32")}, {}, "select_row")
+    for bad in ((), (-1,), (1 << 24,), [1, 2], (1.5,)):
+        refused("take", {"i": idx}, {"table": bad}, "take: table")
+    refused("take", {"i": TType((2,), "i32")}, {"table": (1,)}, "take")
+
+
+def tiny_mtp_source(tmp: str, **overrides):
+    """A tiny Qwen3.5 checkpoint in `tmp` plus the 15 `mtp.*` tensors of the real one (random, bf16-representable) and
+    mtp_num_hidden_layers = 1; returns (model, the source, the mtp tensors)."""
+    from safetensors.torch import load_file, save_file
+
+    model = tiny_qwen35(**overrides)
+    model.save_pretrained(tmp)
+    c = model.config
+    H, FF, hd = c.hidden_size, c.intermediate_size, c.head_dim
+    nq, nkv = c.num_attention_heads, c.num_key_value_heads
+    shapes = {
+        "fc": (H, 2 * H),
+        "pre_fc_norm_embedding": (H,),
+        "pre_fc_norm_hidden": (H,),
+        "norm": (H,),
+        "layers.0.input_layernorm": (H,),
+        "layers.0.post_attention_layernorm": (H,),
+        "layers.0.self_attn.q_proj": (2 * nq * hd, H),
+        "layers.0.self_attn.k_proj": (nkv * hd, H),
+        "layers.0.self_attn.v_proj": (nkv * hd, H),
+        "layers.0.self_attn.o_proj": (H, nq * hd),
+        "layers.0.self_attn.q_norm": (hd,),
+        "layers.0.self_attn.k_norm": (hd,),
+        "layers.0.mlp.gate_proj": (FF, H),
+        "layers.0.mlp.up_proj": (FF, H),
+        "layers.0.mlp.down_proj": (H, FF),
+    }
+    gen = torch.Generator().manual_seed(11)
+    mtp = {}
+    for name, shape in shapes.items():
+        scale = 0.3 if "norm" in name else shape[-1] ** -0.5
+        mtp[f"mtp.{name}.weight"] = (torch.randn(shape, generator=gen) * scale).bfloat16().float()
+    path = Path(tmp) / "model.safetensors"
+    save_file({**load_file(path), **mtp}, path)
+    cfg = json.loads((Path(tmp) / "config.json").read_text())
+    cfg["mtp_num_hidden_layers"] = 1
+    (Path(tmp) / "config.json").write_text(json.dumps(cfg))
+    return model, warpc.sources.open(tmp), mtp
+
+
+class MtpOracle:
+    """The MTP module as vLLM wraps it (qwen3_5_mtp.py): fc(cat[norm(embed(token)), norm(hidden)]), then a
+    transformers `Qwen3_5DecoderLayer` of a full-attention layer loaded with the mtp.layers.0.* weights, then `norm` and
+    the target's lm_head, causal attention over the whole sequence of (token, hidden) pairs (no cache: every call
+    recomputes the sequence)."""
+
+    def __init__(self, model, mtp: dict[str, torch.Tensor]):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5DecoderLayer,
+            Qwen3_5RMSNorm,
+            Qwen3_5TextRotaryEmbedding,
+        )
+
+        c = model.config
+        self.mtp, self.embed, self.head = mtp, model.model.embed_tokens.weight.detach(), model.lm_head.weight.detach()
+        self.layer = Qwen3_5DecoderLayer(c, c.layer_types.index("full_attention")).float().eval()
+        prefix = "mtp.layers.0."
+        self.layer.load_state_dict(
+            {k[len(prefix) : -len(".weight")] + ".weight": v for k, v in mtp.items() if k.startswith(prefix)}
+        )
+        self.rotary = Qwen3_5TextRotaryEmbedding(c)
+        self.norm = Qwen3_5RMSNorm
+        self.eps = c.rms_norm_eps
+
+    def _norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        n = self.norm(x.shape[-1], eps=self.eps)
+        n.weight.data = self.mtp[f"mtp.{name}.weight"]
+        return n(x)
+
+    @torch.no_grad()
+    def rows(self, tokens: torch.Tensor, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """tokens [S], hidden [S, H] -> post-norm rows [S, H] and their logits [S, V]."""
+        S = tokens.shape[0]
+        x = torch.cat(
+            [self._norm(self.embed[tokens.long()], "pre_fc_norm_embedding"), self._norm(hidden, "pre_fc_norm_hidden")],
+            -1,
+        )
+        x = torch.nn.functional.linear(x, self.mtp["mtp.fc.weight"])[None]
+        position_ids = torch.arange(S).view(1, 1, -1).expand(3, 1, -1)
+        mask = torch.full((S, S), float("-inf")).triu(1)[None, None]
+        x = self.layer(
+            x, position_embeddings=self.rotary(x, position_ids), attention_mask=mask, position_ids=position_ids[0]
+        )
+        x = self._norm(x[0], "norm")
+        return x, torch.nn.functional.linear(x, self.head)
+
+
+def check_mtp_windows(source, oracle: MtpOracle, draft_ids=None, atol: float = 2e-4) -> None:
+    """The draft graph on windows of pairs against the oracle: a window of 6 rows at 0 (select a row in the middle), a
+    window of 4 at 6 accepting 2 and then the chain's single rows at 8 and 9 over the KV rows the window left."""
+    c = source.config
+    graph = frontend.build_draft(source, ctx_max=32)
+    it = Interpreter(graph, source, dtype=torch.float32)
+    gen = torch.Generator().manual_seed(12)
+    tok = torch.randint(0, c.vocab_size, (16,), generator=gen)
+    hid = torch.randn(16, c.hidden_size, generator=gen)
+    seq_tok, seq_hid = [], []  # the pair at each cache position, as the last call to touch it left it
+
+    def step(at: int, tokens: torch.Tensor, hidden: torch.Tensor, sel: int) -> None:
+        T = tokens.shape[0]
+        del seq_tok[at:], seq_hid[at:]
+        seq_tok.extend(tokens.tolist()), seq_hid.extend(hidden)
+        out = it.run(
+            {
+                "tokens": tokens.int(),
+                "pos": torch.arange(at, at + T, dtype=torch.int32),
+                "hidden": hidden,
+                "sel": torch.tensor([sel], dtype=torch.int32),
+            }
+        )
+        norm_rows, logits = oracle.rows(torch.tensor(seq_tok), torch.stack(seq_hid))
+        want, want_logits = norm_rows[at + sel], logits[at + sel]
+        assert out["hidden"].shape == (1, c.hidden_size) and out["logits"].shape[0] == 1
+        err = (out["hidden"][0] - want).abs().max().item()
+        assert torch.allclose(out["hidden"][0], want, atol=atol, rtol=atol), (at, sel, err)
+        if draft_ids is None:
+            assert torch.allclose(out["logits"][0], want_logits, atol=atol, rtol=atol), (at, sel)
+            assert out["ids"].tolist() == [int(want_logits.argmax())], (at, sel)
+        else:
+            assert out["ids"].tolist() == [draft_ids[int(out["logits"][0].argmax())]], (at, sel)
+
+    step(0, tok[:6], hid[:6], 3)
+    step(6, tok[6:10], hid[6:10], 1)  # accepts 2 rows: rows 8, 9 of the window are junk
+    step(8, tok[10:11], hid[10:11], 0)  # the chain row over the junk row's slot
+    step(9, tok[11:12], hid[11:12], 0)
+    step(10, tok[12:16], hid[12:16], 3)  # the next window; the junk is long overwritten
+
+
+def test_mtp_draft_matches_the_vllm_wrapped_layer():
+    """O3: reference.py on `build_draft` (fp32) against transformers' decoder layer wrapped as vLLM wraps it: fc over
+    the two normed halves, the layer, norm, the full head; select_row, a multi-row window and single rows through the
+    KV state."""
+    with tempfile.TemporaryDirectory() as tmp:
+        model, source, mtp = tiny_mtp_source(tmp)
+        graph = frontend.build_draft(source, ctx_max=32)
+        assert set(graph.inputs) == {"tokens", "pos", "hidden", "sel"} and set(graph.outputs) == {
+            "hidden",
+            "logits",
+            "ids",
+        }
+        assert graph.types[graph.outputs["hidden"]] == TType((1, 64), "bf16")
+        assert graph.types[graph.outputs["logits"]] == TType((1, 128), "f32")
+        assert graph.types[graph.outputs["ids"]] == TType((1,), "i32")
+        assert list(graph.states) == ["mtp.kv"] and graph.states["mtp.kv"].shape == (2, 32, 2, 32)
+        assert {n.op for n in graph.nodes} >= {"concat", "select_row"} and "take" not in {n.op for n in graph.nodes}
+        assert all(w.startswith("mtp.") or w in ("embed", "lm_head") for w in graph.weights), list(graph.weights)
+        assert graph.weights["embed"].source == "model.embed_tokens.weight"
+        assert graph.weights["lm_head"].source == "lm_head.weight"
+        assert {n.attrs.get("offset") for n in graph.nodes if n.op == "rmsnorm"} == {1.0}
+        check_mtp_windows(source, MtpOracle(model, mtp))
+
+
+def test_mtp_draft_requantized_head_maps_ids_back():
+    """With a Requantized source the head is the pseudo-tensor mtp.draft_head.weight (w4g128) and the argmax goes
+    through `take` to full-vocabulary ids; the target graph is untouched by the wrapper."""
+    import numpy as np
+
+    from warpc.sources.requantize import MTP_MATRICES, Requantized
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # every linear's K a multiple of the 128-column group, as in test_qwen35_w4g128_checkpoint
+        _, base, _ = tiny_mtp_source(tmp, hidden_size=128, intermediate_size=256, linear_value_head_dim=32)
+        ids = np.arange(3, 128, 2, dtype=np.int64)
+        source = Requantized(base, matrices=MTP_MATRICES, draft_ids=ids)
+        graph = frontend.build_draft(source, ctx_max=32)
+        head = graph.weights["mtp.draft_head"]
+        assert (head.scheme, head.shape, head.source) == ("w4g128", (len(ids), 128), "mtp.draft_head.weight")
+        assert "lm_head" not in graph.weights and graph.weights["embed"].source == "model.embed_tokens.weight"
+        schemes = {n: w.scheme for n, w in graph.weights.items()}
+        assert schemes["mtp.fc"] == schemes["mtp.q"] == schemes["mtp.down"] == "w4g128", schemes
+        assert schemes["mtp.ln1"] == schemes["mtp.norm"] == schemes["embed"] == "dense", schemes
+        take = next(n for n in graph.nodes if n.op == "take")
+        assert take.attrs["table"] == tuple(int(i) for i in ids)
+        assert graph.types[graph.outputs["logits"]] == TType((1, len(ids)), "f32")
+        assert graph.types[graph.outputs["ids"]] == TType((1,), "i32")
+        target = frontend.build(source, ctx_max=32)
+        assert not any(n.startswith("mtp.") for n in target.weights) and set(target.outputs) == {
+            "hidden",
+            "logits",
+            "ids",
+        }
+        it = Interpreter(graph, source, dtype=torch.float32)
+        gen = torch.Generator().manual_seed(13)
+        for _ in range(3):  # random windows: the id is the table entry of the logits' argmax
+            T = 3
+            out = it.run(
+                {
+                    "tokens": torch.randint(0, 128, (T,), generator=gen).int(),
+                    "pos": torch.arange(T, dtype=torch.int32),
+                    "hidden": torch.randn(T, 128, generator=gen),
+                    "sel": torch.tensor([T - 1], dtype=torch.int32),
+                }
+            )
+            assert out["ids"].tolist() == [int(ids[int(out["logits"][0].argmax())])]
+            it.reset()
+
+
+def test_mtp_draft_guards():
+    """Only a one-layer MTP head of a Qwen3.5 checkpoint has a draft graph; the KV format is checked."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _, source, _ = tiny_mtp_source(tmp)
+        try:
+            frontend.build_draft(source, ctx_max=32, draft_kv="fp4")
+        except ValueError as e:
+            assert "fp4" in str(e), str(e)
+        else:
+            raise AssertionError("an unknown draft KV format accepted")
+        cfg = json.loads((Path(tmp) / "config.json").read_text())
+        for layers in (0, 2):
+            (Path(tmp) / "config.json").write_text(json.dumps({**cfg, "mtp_num_hidden_layers": layers}))
+            try:
+                frontend.build_draft(warpc.sources.open(tmp), ctx_max=32)
+            except UnsupportedModel as e:
+                assert f"{layers} MTP layers" in str(e), str(e)
+            else:
+                raise AssertionError(f"{layers} MTP layers accepted")
+        (Path(tmp) / "config.json").write_text(json.dumps(cfg))
+        from safetensors.torch import load_file, save_file
+
+        path = Path(tmp) / "model.safetensors"
+        tensors = load_file(path)
+        del tensors["mtp.fc.weight"], tensors["mtp.norm.weight"]
+        save_file(tensors, path)
+        try:
+            frontend.build_draft(warpc.sources.open(tmp), ctx_max=32)
+        except UnsupportedModel as e:
+            assert "mtp.fc.weight" in str(e) and "mtp.norm.weight" in str(e), str(e)
+        else:
+            raise AssertionError("a checkpoint without the MTP tensors accepted")
+    model = tiny_model("llama")
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        try:
+            frontend.build_draft(warpc.sources.open(tmp), ctx_max=32)
+        except UnsupportedModel as e:
+            assert "llama" in str(e), str(e)
+        else:
+            raise AssertionError("a llama checkpoint has no draft graph")
+
+
+def test_real_mtp_head_shapes():
+    """The 27B checkpoint: every weight of the draft graph exists with the declared shape (the draft head is the
+    lm_head rows of the vocabulary list)."""
+    path = os.environ.get("WARPC_TEST_SWIFT27")
+    if not path:
+        raise Skip("WARPC_TEST_SWIFT27 unset")
+    from safetensors import safe_open
+
+    from warpc.sources.requantize import Requantized
+
+    source = Requantized.mtp(warpc.sources.open(path))
+    graph = frontend.build_draft(source, ctx_max=4096)
+    files = json.loads((Path(path) / "model.safetensors.index.json").read_text())["weight_map"]
+    for w in graph.weights.values():
+        name = "lm_head.weight" if w.source == "mtp.draft_head.weight" else w.source
+        with safe_open(str(Path(path) / files[name]), framework="pt") as h:
+            shape = tuple(h.get_slice(name).get_shape())
+        if w.source == "mtp.draft_head.weight":  # the rows of lm_head named by the vocabulary list
+            assert shape[0] >= w.shape[0] and shape[1:] == w.shape[1:], (w.name, shape, w.shape)
+        else:
+            assert shape == w.shape, (w.name, w.source, shape, w.shape)
+    assert len(graph.weights) == 17 and set(graph.states) == {"mtp.kv"}, len(graph.weights)
+    print(f"  {len(graph.nodes)} nodes, {len(graph.weights)} weights")
 
 
 INKLING_ORACLE = Path(__file__).resolve().parent / "oracle" / "inkling_hf.py"

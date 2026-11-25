@@ -131,8 +131,7 @@ class Rig:
         self.mem = Memory(
             rows_max=ROWS_MAX,
             pos=self.pos.data_ptr(),
-            tokens=0,
-            ids=0,
+            inputs={},
             buffers={k: v.data_ptr() for k, v in self.buffers.items()},
             packs={k: v.data_ptr() for k, v in self.packs.items()},
             states={k: v.data_ptr() for k, v in self.states.items()},
