@@ -2474,7 +2474,7 @@ wheels = [
 
 [[package]]
 name = "qwen-warp"
-version = "0.12.0"
+version = "0.13.0"
 source = { virtual = "." }
 dependencies = [
     { name = "warpc", extra = ["prefill"] },

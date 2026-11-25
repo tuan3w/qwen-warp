@@ -1,6 +1,6 @@
 [project]
 name = "qwen-warp"
-version = "0.12.0"
+version = "0.13.0"
 description = "Workspace root of qwen-warp; the code is warpc, a compiler from model checkpoints to fused CUDA kernels replayed as CUDA graphs"
 readme = "README.md"
 license = { file = "LICENSE" }
