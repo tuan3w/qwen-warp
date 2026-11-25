@@ -36,6 +36,32 @@ _QWEN35_REQUIRED = (
 _QWEN35_LAYERS = {"full_attention": "attention", "linear_attention": "linear_attention"}
 _GEMMA4_REQUIRED = ("layer_types", "sliding_window", "rope_parameters", "head_dim")
 _GEMMA4_LAYERS = ("sliding_attention", "full_attention")
+# the checkpoint's own key names (the HF class accepts aliases of some; this reads one spelling)
+_INKLING_REQUIRED = (
+    "num_key_value_heads",
+    "head_dim",
+    "swa_num_attention_heads",
+    "swa_num_key_value_heads",
+    "swa_head_dim",
+    "sliding_window_size",
+    "local_layer_ids",
+    "d_rel",
+    "rel_extent",
+    "log_scaling_n_floor",
+    "log_scaling_alpha",
+    "qk_l2_clip_threshold",
+    "rel_l2_clip_threshold",
+    "sconv_kernel_size",
+    "n_routed_experts",
+    "num_experts_per_tok",
+    "route_scale",
+    "mlp_gate_softcap",
+    "mlp_up_softcap",
+    "final_logit_softcapping",
+    "n_layers_per_attn_res_block",
+    "unpadded_vocab_size",
+    "loop_config",
+)
 
 
 def _rope_settings(hf: dict) -> dict:
@@ -124,6 +150,38 @@ def _qwen35_unsupported(text: dict, hf: dict) -> list[str]:
     return bad
 
 
+def _inkling_unsupported(text: dict, hf: dict) -> list[str]:
+    bad = [f"missing {key}" for key in _INKLING_REQUIRED if text.get(key) is None]
+    if text.get("n_shared_experts"):
+        bad.append(f"n_shared_experts={text['n_shared_experts']} (no shared expert)")
+    for key in ("q_bias", "o_bias"):
+        if text.get(key):
+            bad.append(f"{key}=True")
+    # the keys of the checkpoint's config that switch a behaviour the graph fixes: absent means the official default
+    for key in ("use_value_norm_no_gamma", "attn_res_normalize_values", "use_gate_bias"):
+        if text.get(key) is False:
+            bad.append(f"{key}=False")
+    if text.get("scoring_func", "sigmoid") != "sigmoid":
+        bad.append(f"scoring_func={text['scoring_func']!r} (only sigmoid)")
+    loop = text.get("loop_config") or {}
+    if loop.get("is_varloop"):
+        bad.append("loop_config.is_varloop")
+    block = text.get("n_layers_per_attn_res_block")
+    if block and loop.get("core_start") is not None:
+        edges = (loop["core_start"], loop.get("core_end"))
+        if loop["core_start"] <= 0 or any(e is None or e % block for e in edges):
+            bad.append(f"loop_config core {edges} (a positive multiple of n_layers_per_attn_res_block={block})")
+    if hf.get("quantization_config"):
+        q = hf["quantization_config"]
+        if q.get("quant_method") == "modelopt":
+            bad.append(f"quantization_config 'modelopt' {q.get('quant_algo')} (requantise the experts to W4G128)")
+        else:
+            bad += _w4g128_unsupported(q)
+            if q.get("warpc_layout") != "stacked-experts":
+                bad.append(f"quantization_config warpc_layout {q.get('warpc_layout')!r} (only 'stacked-experts')")
+    return bad
+
+
 def _plain_inv_freq(theta: float, rotary_dim: int) -> torch.Tensor:
     """fp32 theta^(-2j / rotary_dim) per rotary pair j, the expression of transformers and of llama.cpp's converter."""
     return 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
@@ -179,8 +237,37 @@ class LinearAttention:
 
 
 @dataclass(frozen=True)
+class InklingConfig:
+    """Inkling-2 geometry: the sliding layers' own head counts and window, the relative bias, the clips, the experts,
+    the block residual and the loop."""
+
+    swa_heads: int
+    swa_kv_heads: int
+    swa_head_dim: int
+    d_rel: int
+    rel_extent: int  # relative-bias extent of the full layers (a sliding layer's is its window)
+    log_floor: int  # full layers scale q and r by 1 + log_alpha * log(max((pos + 1) / log_floor, 1))
+    log_alpha: float
+    qk_clip: float
+    rel_clip: float
+    conv_kernel: int
+    experts: int
+    top_k: int
+    expert_width: int
+    route_scale: float
+    gate_cap: float
+    up_cap: float
+    block: int  # layers per attention-residual block
+    loop_start: int
+    loop_end: int
+    passes: int
+    gate_rank: int
+    unpadded_vocab: int  # rows of the unembedding that are tokens; the rest of vocab_size is padding
+
+
+@dataclass(frozen=True)
 class ModelConfig:
-    family: str  # "llama" | "mistral" | "qwen3" | "qwen3_5" | "gemma4"
+    family: str  # "llama" | "mistral" | "qwen3" | "qwen3_5" | "gemma4" | "inkling2_loop"
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -189,7 +276,7 @@ class ModelConfig:
     num_kv_heads: int
     head_dim: int
     rms_eps: float
-    rope_theta: float
+    rope_theta: float | None  # None: no rope (Inkling)
     # per rotary pair: the divisor of theta^(-2j / rotary_dim) (Llama 3.1 scaling); None: plain theta
     rope_freq_factors: tuple[float, ...] | None
     qk_norm: bool
@@ -197,15 +284,16 @@ class ModelConfig:
     rotary_dim: int  # the leading dims of a head that rope rotates (dense: head_dim)
     norm_offset: float = 0.0  # every RMSNorm computes x-hat * (norm_offset + w)
     attn_output_gate: bool = False  # the attention output is multiplied by sigmoid of half of q_proj
-    layer_types: tuple[str, ...] = ()  # per layer; qwen3_5 "attention" | "linear_attention", gemma4 the config's
-    # "sliding_attention" | "full_attention"; empty: all attention
+    layer_types: tuple[str, ...] = ()  # per layer; qwen3_5 "attention" | "linear_attention", gemma4 and inkling2_loop
+    # the config's "sliding_attention" | "full_attention"; empty: all attention
     linear: LinearAttention | None = None
-    quantization: str | None = None  # "w4g128": compressed-tensors int4 linears
+    quantization: str | None = None  # "w4g128": compressed-tensors int4 linears (Inkling: the experts)
     activation: str = "silu"  # the MLP gate: "silu" | "gelu_tanh"
     logit_softcap: float | None = None  # logits = cap * tanh(logits / cap)
     embed_scale: float = 1.0  # the embedding rows are multiplied by this
     sliding_window: int | None = None  # the window of the sliding_attention layers
     gemma: Gemma4Text | None = None
+    inkling: InklingConfig | None = None
 
     def __post_init__(self):
         factors = self.rope_freq_factors
@@ -244,7 +332,7 @@ class ModelConfig:
             raise UnsupportedModel(
                 f"cannot build this model faithfully: model_type {model_type!r} (supported: {supported})"
             )
-        text = (hf.get("text_config") or hf) if family in ("qwen3_5", "gemma4") else hf
+        text = (hf.get("text_config") or hf) if family in ("qwen3_5", "gemma4", "inkling2_loop") else hf
         unsupported, extras = _FAMILIES[family]
         bad = _common_unsupported(text, windowed=family == "gemma4") + unsupported(text, hf)
         if bad:
@@ -372,15 +460,58 @@ def _gemma4_extras(text: dict, hf: dict, common: dict) -> dict:
     }
 
 
+def _inkling_extras(text: dict, hf: dict, common: dict) -> dict:
+    full = set(range(common["num_layers"])) - set(text["local_layer_ids"])
+    loop = text["loop_config"]
+    return {
+        "rope_theta": None,
+        "rope_freq_factors": None,
+        "qk_norm": False,
+        "rotary_dim": 0,
+        "layer_types": tuple(
+            "full_attention" if i in full else "sliding_attention" for i in range(common["num_layers"])
+        ),
+        "quantization": "w4g128" if hf.get("quantization_config") else None,
+        "sliding_window": int(text["sliding_window_size"]),
+        "logit_softcap": float(text["final_logit_softcapping"]),
+        "inkling": InklingConfig(
+            swa_heads=int(text["swa_num_attention_heads"]),
+            swa_kv_heads=int(text["swa_num_key_value_heads"]),
+            swa_head_dim=int(text["swa_head_dim"]),
+            d_rel=int(text["d_rel"]),
+            rel_extent=int(text["rel_extent"]),
+            log_floor=int(text["log_scaling_n_floor"]),
+            log_alpha=float(text["log_scaling_alpha"]),
+            qk_clip=float(text["qk_l2_clip_threshold"]),
+            rel_clip=float(text["rel_l2_clip_threshold"]),
+            conv_kernel=int(text["sconv_kernel_size"]),
+            experts=int(text["n_routed_experts"]),
+            top_k=int(text["num_experts_per_tok"]),
+            expert_width=common["intermediate_size"],
+            route_scale=float(text["route_scale"]),
+            gate_cap=float(text["mlp_gate_softcap"]),
+            up_cap=float(text["mlp_up_softcap"]),
+            block=int(text["n_layers_per_attn_res_block"]),
+            loop_start=int(loop["core_start"]),
+            loop_end=int(loop["core_end"]),
+            passes=int(loop["num_passes"]),
+            gate_rank=int(loop["gate_rank"]),
+            unpadded_vocab=int(text["unpadded_vocab_size"]),
+        ),
+    }
+
+
 _FAMILY_OF = {
     **{f: f for f in _QK_NORM},
     "qwen3_5": "qwen3_5",
     "qwen3_5_text": "qwen3_5",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4",
+    "inkling2_loop": "inkling2_loop",
 }
 _FAMILIES = {
     **dict.fromkeys(_QK_NORM, (_dense_unsupported, _dense_extras)),
     "qwen3_5": (_qwen35_unsupported, _qwen35_extras),
     "gemma4": (_gemma4_unsupported, _gemma4_extras),
+    "inkling2_loop": (_inkling_unsupported, _inkling_extras),
 }

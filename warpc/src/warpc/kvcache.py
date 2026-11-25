@@ -107,8 +107,18 @@ class ExactCache:
         self.rows[0].index_copy_(0, slots, k)
         self.rows[1].index_copy_(0, slots, v)
 
-    def attend(self, q: torch.Tensor, pos: torch.Tensor, scale: float, window: int | None = None) -> torch.Tensor:
-        """Row t attends to the positions pos_t - window + 1 .. pos_t (0 .. pos_t without a window)."""
+    def attend(
+        self,
+        q: torch.Tensor,
+        pos: torch.Tensor,
+        scale: float,
+        window: int | None = None,
+        bias: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Row t attends to the positions pos_t - window + 1 .. pos_t (0 .. pos_t without a window). bias [T, Hq, E]:
+        the score of the key d = pos_t - p positions back gets bias[t, h, d] (nothing for d >= E). sinks [T, Hq]: one
+        more logit per row and head with a zero value; the probability it takes is dropped."""
         ring = self.rows.shape[1]
         last = int(pos.max())
         first = 0 if window is None else max(0, int(pos.min()) - window + 1)
@@ -121,9 +131,19 @@ class ExactCache:
         vv = self.rows[1, slots].repeat_interleave(hq // hkv, 1).float()
         sc = torch.einsum("thd,lhd->htl", q.float(), kk) * scale
         dist = pos[:, None] - where[None, :]
+        if bias is not None:
+            extent = bias.shape[-1]
+            index = dist.clamp(0, extent - 1)[:, None, :].expand(-1, hq, -1)
+            gathered = bias.float().gather(-1, index).masked_fill(((dist < 0) | (dist >= extent))[:, None, :], 0.0)
+            sc = sc + gathered.transpose(0, 1)
         mask = dist < 0 if window is None else (dist < 0) | (dist >= window)
-        pr = torch.softmax(sc.masked_fill(mask[None], float("-inf")), -1).to(q.dtype).float()
-        out = torch.einsum("htl,lhd->thd", pr, vv).to(q.dtype)
+        sc = sc.masked_fill(mask[None], float("-inf"))
+        if sinks is not None:
+            sc = torch.cat([sc, sinks.float().t()[:, :, None]], -1)
+        pr = torch.softmax(sc, -1)
+        if sinks is not None:
+            pr = pr[..., :-1]
+        out = torch.einsum("htl,lhd->thd", pr.to(q.dtype).float(), vv).to(q.dtype)
         return out.reshape(q.shape[0], hq * q.shape[2])
 
 

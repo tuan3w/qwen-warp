@@ -198,14 +198,18 @@ def _window(a: dict, s: StateDecl, op: str) -> None:
     _need(window is None or s.cache == "bf16", f"{op}: a window needs a bf16 cache, not {s.cache}")
 
 
-@_op("attention", weights=("k_scale", "v_scale"), states=("state",), state_kind="kv")
+@_op("attention", weights=("k_scale", "v_scale", "rel_proj"), states=("state",), state_kind="kv")
 def _attention(g, a, ins):
     """Write k, v at positions pos into the KV state (in its cache format), then causal softmax attention of row t
     over cache[0..pos_t]; GQA; fp32 softmax. Cache format fp8 reads its per-tensor scales from the [1] weights
     attrs["k_scale"] / attrs["v_scale"], which no other format takes. attrs["window"] (int, default None): row t sees
     only the positions p with 0 <= pos_t - p < window. A state with R rows holds position p in slot p mod R; the step
-    needs R >= window + rows - 1 (the write precedes the read), else the reference raises."""
-    q, k, v, pos = ins
+    needs R >= window + rows - 1 (the write precedes the read), else the reference raises. Inkling's two extras, bf16
+    caches only: the weight attrs["rel_proj"] [d_rel, E] with the input rel [T, Hq, d_rel] after pos adds the bias
+    bias[t, h, d] = (rel[t, h] @ rel_proj)[d], rounded to the activation dtype, to the score of the key d = pos_t - p
+    positions back (nothing when d >= E); attrs["sinks"] True with the input sinks [T, Hq] after rel adds one logit
+    per row and head to the softmax with a zero value (the probability mass it takes is dropped)."""
+    q, k, v, pos, *extra = ins
     s = _state(g, a)
     hq, d = q.shape[1], q.shape[2]
     hkv = k.shape[1]
@@ -226,7 +230,19 @@ def _attention(g, a, ins):
             _need(_weight(g, a, key).shape == (1,), f"attention: {key} must be a [1] weight")
     else:
         _need(not scales, f"attention: cache {s.cache} takes no scales")
-    return [TType((q.shape[0], hq * d), q.dtype)]
+    t = q.shape[0]
+    _need(len(extra) == ("rel_proj" in a) + bool(a.get("sinks")), f"attention: {len(extra)} extra inputs for its attrs")
+    if extra:
+        _need(s.cache == "bf16", f"attention: a relative bias or sinks need a bf16 cache, not {s.cache}")
+    if "rel_proj" in a:
+        proj, rel = _weight(g, a, "rel_proj"), extra[0]
+        _need(
+            len(proj.shape) == 2 and rel == TType((t, hq, proj.shape[0]), q.dtype),
+            f"attention: rel {rel} vs rel_proj {proj.shape}",
+        )
+    if a.get("sinks"):
+        _need(extra[-1] == TType((t, hq), q.dtype), f"attention: sinks {extra[-1]} vs [{t}, {hq}]")
+    return [TType((t, hq * d), q.dtype)]
 
 
 @_op("attention_read", weights=(), reads=("state",), state_kind="kv")
@@ -249,13 +265,120 @@ def _attention_read(g, a, ins):
 def _causal_conv1d(g, a, ins):
     """Depthwise causal conv over time, no bias, no activation: y[t, c] = sum_j w[c, j] * u[t + j, c] over the rows
     u = [state (the W-1 inputs before this window, oldest first) | x], fp32 inside, one rounding; the state then holds
-    the last W-1 rows of u."""
+    the last W-1 rows of u. attrs["residual"] (default False) adds x to the sum and attrs["divisor"] (default 1.0)
+    divides it, before the rounding: y = (conv + x * residual) / divisor."""
     (x,) = ins
     w, s = _weight(g, a), _state(g, a)
     _need(
         len(x.shape) == 2 and len(w.shape) == 2 and w.shape[0] == x.shape[1], f"causal_conv1d: x {x.shape}, w {w.shape}"
     )
     _need(w.shape[1] >= 2 and s.shape == (w.shape[0], w.shape[1] - 1), f"causal_conv1d: state {s.shape}, w {w.shape}")
+    _need(a.get("divisor", 1.0) > 0, "causal_conv1d: divisor must be positive")
+    return [x]
+
+
+@_op("dyn_conv1d", states=("state",), state_kind="conv")
+def _dyn_conv1d(g, a, ins):
+    """Depthwise causal conv whose taps depend on the row: x [T, C] and taps [T, heads * W]; channel c belongs to head
+    c // (C / heads), and tap lag l (0 = the current row) of row t has the weight weight[l, c] + taps[t, head * W + l];
+    y[t, c] = (sum_l w_l * u[t - l, c] + x[t, c]) / divisor over u = [state | x] as in causal_conv1d, fp32 inside, one
+    rounding."""
+    x, taps = ins
+    w, s = _weight(g, a), _state(g, a)
+    heads = a["heads"]
+    width, c = w.shape if len(w.shape) == 2 else (0, 0)
+    _need(
+        len(x.shape) == 2 and c == x.shape[1] and width >= 2 and c % heads == 0,
+        f"dyn_conv1d: x {x.shape}, weight {w.shape}, heads {heads}",
+    )
+    _need(s.shape == (c, width - 1), f"dyn_conv1d: state {s.shape}, weight {w.shape}")
+    _need(taps.shape == (x.shape[0], heads * width) and taps.dtype == x.dtype, f"dyn_conv1d: taps {taps}, x {x}")
+    _need(a["divisor"] > 0, "dyn_conv1d: divisor must be positive")
+    return [x]
+
+
+@_op("l2_clip", weights=("scale",))
+def _l2_clip(g, a, ins):
+    """Per-head L2 clip of x [T, H, D]: x_s = x * scale (the optional [H, D] weight), then x_s * min(1, threshold /
+    (|x_s| + 1e-6)) over the last dim, fp32 inside, one rounding."""
+    (x,) = ins
+    _need(len(x.shape) == 3 and a["threshold"] > 0, f"l2_clip: x {x.shape}, threshold {a.get('threshold')}")
+    if "scale" in a:
+        _need(_weight(g, a, "scale").shape == tuple(x.shape[1:]), f"l2_clip: scale vs x {x.shape}")
+    return [x]
+
+
+@_op("log_scale", weights=())
+def _log_scale(g, a, ins):
+    """Position-dependent gain of x [T, H, D] at positions pos i32[T]: x * (1 + alpha * log(max((pos + 1) / floor, 1))),
+    fp32 inside, one rounding."""
+    x, pos = ins
+    _need(len(x.shape) == 3 and pos.dtype == "i32" and pos.shape == (x.shape[0],), f"log_scale: x {x.shape}, pos {pos}")
+    return [x]
+
+
+@_op("attn_res", weights=("query",))
+def _attn_res(g, a, ins):
+    """Block attention residual read over rows r_1..r_n [T, H] (any dtype, widened to fp32; the last is the partial
+    block): normalise each unweighted (attrs["eps"]), p = softmax_n(<query, norm_n> * H^-0.5), out = sum_n p_n *
+    norm_n, f32 [T, H]. The weight `query` is [H], or [N, H] with attrs["row"] choosing the row."""
+    _need(
+        len(ins) >= 1 and all(t.shape == ins[0].shape and len(t.shape) == 2 for t in ins), "attn_res: equal [T, H] rows"
+    )
+    q = _weight(g, a, "query")
+    h = ins[0].shape[-1]
+    if "row" in a:
+        _need(len(q.shape) == 2 and q.shape[1] == h and 0 <= a["row"] < q.shape[0], f"attn_res: query {q.shape}, row")
+    else:
+        _need(q.shape == (h,), f"attn_res: query {q.shape} vs H {h}")
+    return [TType(ins[0].shape, "f32")]
+
+
+@_op("message_gate", weights=("down", "forget", "gain"))
+def _message_gate(g, a, ins):
+    """Merge a loop message m into x (both f32 [T, H]): n = [rms(x); rms(m)] unweighted (attrs["eps"]), rounded to the
+    activation dtype; h = n @ down[R, 2H]^T rounded to the activation dtype; f = tanh(h @ forget[H, R]^T), g = tanh(h @
+    gain[H, R]^T) in fp32; (1 - f) * x + g * m, f32."""
+    x, m = ins
+    _need(x == m and x.dtype == "f32" and len(x.shape) == 2, f"message_gate: x {x}, m {m}")
+    down, forget, gain = (_weight(g, a, k) for k in ("down", "forget", "gain"))
+    r, h = down.shape[0], x.shape[-1]
+    _need(down.shape == (r, 2 * h) and forget.shape == (h, r) and gain.shape == (h, r), "message_gate: weight shapes")
+    return [x]
+
+
+@_op("moe_route", weights=("weight", "bias"))
+def _moe_route(g, a, ins):
+    """Sigmoid router: s = sigmoid(x_f32 @ weight[E, H]^T); the top_k experts by s + bias[E], descending (ties to the
+    lower id); w = s[idx] / (sum + 1e-20) * route_scale, the sum a left fold in idx order. idx i32 [T, k], w f32
+    [T, k]."""
+    (x,) = ins
+    w, b = _weight(g, a), _weight(g, a, "bias")
+    k = a["top_k"]
+    _need(
+        len(w.shape) == 2 and w.shape[1] == x.shape[-1] and b.shape == (w.shape[0],) and 0 < k <= w.shape[0],
+        f"moe_route: weight {w.shape}, bias {b.shape}, top_k {k}",
+    )
+    _need(a["scoring"] == "sigmoid", f"moe_route: scoring {a['scoring']!r} (only sigmoid)")
+    return [TType((x.shape[0], k), "i32"), TType((x.shape[0], k), "f32")]
+
+
+@_op("moe_experts", weights=("gate", "up", "down"))
+def _moe_experts(g, a, ins):
+    """Routed SwiGLU experts, stacked weights gate / up [E, I, H] and down [E, H, I]. For each expert some row routes
+    to, in ascending id: g = x @ gate^T and u = x @ up^T (rounded), act = softcap(g, gate_cap) * sigmoid(g) *
+    softcap(u, up_cap) in fp32 (both caps None: silu(g) * u), rounded; y = act @ down^T rounded; out_t += y * w_t,e in
+    fp32 over the experts; the sum is rounded to x's dtype."""
+    x, idx, w = ins
+    gate, up, down = (_weight(g, a, k) for k in ("gate", "up", "down"))
+    _need(len(gate.shape) == 3 and up.shape == gate.shape, f"moe_experts: gate {gate.shape}, up {up.shape}")
+    e, i, h = gate.shape
+    _need(down.shape == (e, h, i) and h == x.shape[-1], f"moe_experts: down {down.shape}, x {x.shape}")
+    _need(
+        idx.dtype == "i32" and w.dtype == "f32" and idx.shape == w.shape and idx.shape[0] == x.shape[0],
+        f"moe_experts: idx {idx}, w {w}",
+    )
+    _need((a.get("gate_cap") is None) == (a.get("up_cap") is None), "moe_experts: both caps or neither")
     return [x]
 
 

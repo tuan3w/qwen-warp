@@ -211,7 +211,7 @@ def emu_gemv(
     return out
 
 
-def gemv(L, w, x, N, K, T, mode, outs, segs=(), w2=None, nw=None, eps=0.0, row=None, act=0, cap=0.0):
+def gemv(L, w, x, N, K, T, mode, outs, segs=(), w2=None, nw=None, eps=0.0, row=None, act=0, cap=0.0, rnd=0):
     o = (C.c_void_p * 3)(*[t.data_ptr() for t in outs])
     ends = (C.c_int * 3)(*[sum(segs[: j + 1]) for j in range(3)]) if segs else None
     call(
@@ -232,6 +232,7 @@ def gemv(L, w, x, N, K, T, mode, outs, segs=(), w2=None, nw=None, eps=0.0, row=N
         row.data_ptr() if row is not None else None,
         act,
         C.c_float(cap),
+        rnd,
         schedule.gemv_k_split(K, mode, nw is not None),
     )
 
@@ -457,25 +458,34 @@ def test_gemv_row():
 
 def test_head_softcap():
     """The head GEMV: fp32 logits = the accumulator (cap 0, the dense head) and cap * tanhf(acc / cap) with a softcap,
-    bitwise against the emulation (true division, CUDA's tanhf); the interpreter's softcap is counted against it
-    (torch on the GPU divides by a Python scalar as a multiply by the reciprocal; on the CPU tanh is the C library's).
-    Argmax over the capped values, lowest index on a tie: two equal rows, and two rows whose accumulators differ but
-    whose capped values are both exactly cap."""
+    bitwise against the emulation (true division, CUDA's tanhf); with rnd the accumulator is rounded to bf16 first
+    (the interpreter's linear output: Inkling's head), capped or not. The interpreter's softcap is counted against
+    the unrounded one (torch on the GPU divides by a Python scalar as a multiply by the reciprocal; on the CPU tanh is
+    the C library's). Argmax over the capped values, lowest index on a tie: two equal rows, and two rows whose
+    accumulators differ but whose capped values are both exactly cap."""
     L = lib()
     K, N, cap = 1536, 262144, 30.0
     w = rand(N, K, std=K**-0.5) * 8
     x = rand(1, K, std=2.0)
     plain, capped = zeros(1, N, dtype=torch.float32), zeros(1, N, dtype=torch.float32)
+    rounded_plain, rounded_capped = zeros(1, N, dtype=torch.float32), zeros(1, N, dtype=torch.float32)
     gemv(L, w, x, N, K, 1, 2, [plain])
     gemv(L, w, x, N, K, 1, 2, [capped], cap=cap)
+    gemv(L, w, x, N, K, 1, 2, [rounded_plain], rnd=1)
+    gemv(L, w, x, N, K, 1, 2, [rounded_capped], cap=cap, rnd=1)
     acc = emu_gemv(w, x).T
     assert torch.equal(plain, acc), differing(plain, acc)
     cap_t = torch.tensor(cap, device=DEV)  # a tensor divisor: a true division
     want = cap_t * torch.tanh(acc / cap_t)
     assert torch.equal(capped, want), differing(capped, want)
+    rounded = acc.to(BF).float()
+    assert torch.equal(rounded_plain, rounded), differing(rounded_plain, rounded)
+    want_rounded = cap_t * torch.tanh(rounded / cap_t)
+    assert torch.equal(rounded_capped, want_rounded), differing(rounded_capped, want_rounded)
     gpu, cpu = ref("softcap", {"cap": cap}, acc), ref("softcap", {"cap": cap}, acc.cpu()).to(DEV)
     print(
         f"  head N={N}: dense logits bitwise = accumulator; softcapped logits bitwise = cap * tanh(acc / cap);"
+        f" with rnd bitwise = bf16(acc) and cap * tanh(bf16(acc) / cap);"
         f" interpreter softcap differs in {differing(capped, gpu)} (GPU) / {differing(capped, cpu)} (CPU) of {N},"
         f" rel L2 {rel(capped, cpu):.1e}, max |logit| {capped.abs().max():.3f}"
     )

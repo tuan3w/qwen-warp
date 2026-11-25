@@ -58,11 +58,11 @@ static cudaError_t launch_ks(const GemvP& p, int T, int ks, cudaStream_t st) {
 extern "C" {
 
 // mode 0: segments (end[0..2] are cumulative row ends, out[0..2]); mode 1: gate/up pair (w = gate, w2 = up, N rows each, out[0] bf16 [T][N], act 0 silu / 1 gelu_tanh);
-// mode 2: fp32 out[0], softcapped with `cap` when cap > 0; mode 3: residual add in place (out[0] = h); mode 4: out[0] = bf16(act(y) * row), row a bf16 [T][N] operand (act as mode 1).
+// mode 2: fp32 out[0], softcapped with `cap` when cap > 0, the accumulator rounded to bf16 first when rnd; mode 3: residual add in place (out[0] = h); mode 4: out[0] = bf16(act(y) * row), row a bf16 [T][N] operand (act as mode 1).
 // rpw: rows per warp of k_gemv (1, 2, 4; the caller's schedule). ks > 1: the K-split kernel (mode 0, no norm, K = 2048 ks, ks in 3, 4, 6, 8); its reduction order differs from ks = 1's.
 int warpc_gemv(const void* w, const void* w2, const void* x, int N, int K, int T, int mode, const int* end, void* const* out, const void* nw, float eps, int rpw, const void* row,
-               int act, float cap, int ks, cudaStream_t st) {
-  if (K % 256 || T < 1 || T > STEP_ROWS || (rpw != 1 && rpw != 2 && rpw != 4) || mode < 0 || mode > 4 || (mode == 4 && !row)) return cudaErrorInvalidValue;
+               int act, float cap, int rnd, int ks, cudaStream_t st) {
+  if (K % 256 || T < 1 || T > STEP_ROWS || (rpw != 1 && rpw != 2 && rpw != 4) || mode < 0 || mode > 4 || (mode == 4 && !row) || ((cap != 0.f || rnd) && mode != 2)) return cudaErrorInvalidValue;
   if (ks != 1 && (mode != 0 || nw || K != 2048 * ks)) return cudaErrorInvalidValue;
   GemvP p;
   p.w = reinterpret_cast<const bf16*>(w);
@@ -73,6 +73,7 @@ int warpc_gemv(const void* w, const void* w2, const void* x, int N, int K, int T
   p.row = reinterpret_cast<const bf16*>(row);
   p.act = act;
   p.cap = cap;
+  p.rnd = rnd;
   p.N = N;
   p.K = K;
   for (int i = 0; i < 3; i++) {

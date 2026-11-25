@@ -12,7 +12,7 @@ from __future__ import annotations
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
 from ..ir import Q4_0_BLOCK_ELEMS
 from ..kvcache import FORMATS, RotatedInt4Format
-from . import schedule
+from . import inkling, schedule
 
 # GeForce RTX 3090 (sm_86): measured launch cost inside a CUDA graph, DRAM bandwidth, SM count. The cost model uses
 # these on any GPU; the kernels themselves are built for the device the runtime runs on.
@@ -622,6 +622,7 @@ _ATTN_LIMITS = {
 # chunks of 32 keys, i.e. past 1024 positions).
 # order = tie-break of the cost model: the kernels with the most absorbed work first
 CAPS = [
+    *inkling.CAPS,
     Cap(
         "g_attn",
         "attention",

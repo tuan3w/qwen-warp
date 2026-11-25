@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..ir import Graph
 from ..kvcache import FORMATS
 from ..sources import Source
-from . import dense, gemma4, qwen35
+from . import dense, gemma4, inkling, qwen35
 
 ROWS_MAX = 8  # the default step bound of `compile`
 _BUILDERS = {
@@ -14,6 +14,7 @@ _BUILDERS = {
     "qwen3": dense.build,
     "qwen3_5": qwen35.build,
     "gemma4": gemma4.build,
+    "inkling2_loop": inkling.build,
 }
 
 

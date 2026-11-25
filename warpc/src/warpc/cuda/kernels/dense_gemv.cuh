@@ -3,7 +3,7 @@
 
 // GEMV y[T][N] = x[T][K] W[N][K]^T. One warp per RPW rows (a row is read by the 32 lanes with 16-byte loads), fp32 accumulation, the 32 lane partials summed with a fixed butterfly: the
 // reduction order depends on K only. mode 0: bf16 outputs split by row range (up to 3 segments); mode 1: gate/up pair, out = bf16(act(bf16(gate))) * bf16(up),
-// rounded to bf16 (rows of w = gate, rows of w2 = up; act 0 silu, 1 gelu_tanh); mode 2: fp32 out[0] [T][N], softcapped when cap > 0; mode 3: residual add, out[0] is the residual stream h [T][N] and
+// rounded to bf16 (rows of w = gate, rows of w2 = up; act 0 silu, 1 gelu_tanh); mode 2: fp32 out[0] [T][N], with cap > 0 the soft-capped head cap * tanh(acc / cap), the accumulator first rounded to bf16 when rnd is set; mode 3: residual add, out[0] is the residual stream h [T][N] and
 // h = bf16(h + bf16(y)) in place (each element belongs to one row, so no cross-block ordering is needed); mode 4: out[0] [T][N] = bf16(act(bf16(y)) * row), row a bf16 [T][N] operand.
 // With nw != NULL the input rows are normalised in the prologue exactly as k_rmsnorm does (every warp computes the row statistics itself).
 struct GemvP {
@@ -13,7 +13,8 @@ struct GemvP {
   const bf16* nw;  // != NULL: x is the raw residual stream and is RMS-normalised on the fly with this weight (prologue fusion)
   float eps;
   const bf16* row;  // mode 4: the [T][N] operand of the gated product
-  float cap;        // mode 2: > 0 stores cap * tanhf(acc / cap) instead of the accumulator
+  float cap;        // mode 2: 0 = no softcap, else the logit is cap * tanhf(acc / cap)
+  int rnd;          // mode 2: 1 = the accumulator is rounded to bf16 first (the interpreter's linear output), 0 = the fp32 accumulator
   int act;          // modes 1, 4: 0 silu, 1 gelu_tanh
   int N, K;
   int end[3];
@@ -28,8 +29,11 @@ __device__ __forceinline__ float gate_act(float g, int act) {
   const float kBeta = 0.7978845608028654f, kKappa = 0.044715f;  // sqrt(2 / pi)
   return rb(0.5f * a * (1.f + tanhf(kBeta * (a + kKappa * (a * a * a)))));
 }
-// The fp32 logits of mode 2: the accumulator, softcapped when cap > 0.
-__device__ __forceinline__ float logit_out(float g, float cap) { return cap > 0.f ? cap * tanhf(g / cap) : g; }
+// The fp32 logits of mode 2: the accumulator (rounded to bf16 first when rnd), softcapped when cap > 0.
+__device__ __forceinline__ float logit_out(float g, float cap, int rnd) {
+  const float v = rnd ? rb(g) : g;
+  return cap > 0.f ? cap * tanhf(v / cap) : v;
+}
 
 template <int T, int RPW, int MODE, int U>
 __global__ void __launch_bounds__(GEMV_WARPS * 32) k_gemv(const __grid_constant__ GemvP p) {
@@ -133,7 +137,7 @@ __global__ void __launch_bounds__(GEMV_WARPS * 32) k_gemv(const __grid_constant_
     } else if (MODE == 4) {
       reinterpret_cast<bf16*>(p.out[0])[(size_t)lane * p.N + r] = tb(gate_act(g, p.act) * bf(p.row[(size_t)lane * p.N + r]));
     } else {
-      reinterpret_cast<float*>(p.out[0])[(size_t)lane * p.N + r] = logit_out(g, p.cap);
+      reinterpret_cast<float*>(p.out[0])[(size_t)lane * p.N + r] = logit_out(g, p.cap, p.rnd);
     }
   }
 }

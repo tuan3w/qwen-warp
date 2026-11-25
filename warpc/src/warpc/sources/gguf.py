@@ -174,7 +174,7 @@ class GGUFSource:
     def __contains__(self, name: str) -> bool:
         return name in self._index
 
-    def get(self, name: str) -> torch.Tensor:
+    def get(self, name: str, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         t, heads = self._index[name]
         kind = t.tensor_type.name
         shape = tuple(int(n) for n in reversed(t.shape))
@@ -187,7 +187,8 @@ class GGUFSource:
         if heads:
             x = _unpermute(x, heads)
         out = torch.from_numpy(np.require(x, requirements=("C", "W")))
-        return out.view(torch.bfloat16) if kind == "BF16" else out.to(torch.bfloat16)
+        out = out.view(torch.bfloat16) if kind == "BF16" else out
+        return out.to(dtype)
 
     def quant(self, name: str) -> str | None:
         kind = self._index[name][0].tensor_type.name

@@ -16,10 +16,22 @@ def inputs(g: Graph) -> tuple[str, str]:
     return g.input("tokens", TType(("T",), "i32")), g.input("pos", TType(("T",), "i32"))
 
 
-def weight(g: Graph, source: Source, missing: list[str], decl: str, tensor: str, shape, *, linear: bool = False) -> str:
+def weight(
+    g: Graph,
+    source: Source,
+    missing: list[str],
+    decl: str,
+    tensor: str,
+    shape,
+    *,
+    linear: bool = False,
+    scheme: str | None = None,
+) -> str:
+    """Declare a weight: dense (bf16) unless `scheme` says otherwise or, for a linear, the source stores it packed."""
     if tensor not in source:
         missing.append(tensor)
-    scheme = _SCHEMES.get(source.quant(tensor), "dense") if linear and tensor in source else "dense"
+    if scheme is None:
+        scheme = _SCHEMES.get(source.quant(tensor), "dense") if linear and tensor in source else "dense"
     return g.weight(WeightDecl(decl, tuple(shape), scheme, tensor))
 
 
@@ -50,6 +62,11 @@ def head(
     if softcap:
         logits = g.op("softcap", [logits], cap=float(softcap), name="logits")
     g.output(logits=logits, ids=g.op("argmax", [logits], name="ids"))
+    finish(g, missing)
+
+
+def finish(g: Graph, missing: list[str]) -> None:
+    """The missing-tensor report and the verification every family ends with."""
     if missing:
         raise UnsupportedModel(f"checkpoint lacks {len(missing)} tensors the graph reads: {', '.join(missing[:4])}")
     g.verify()

@@ -34,6 +34,9 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 - Gemma 4 E2B (the text decoder: sliding-window and global attention layers with their own head dims, KV sharing, per-layer
   input embeddings, sandwich norms, softcapped logits; bf16 weights) on the CUDA backend, bf16 KV only. The 31B / 26B-A4B
   variants (`attention_k_eq_v`, MoE) and every other Gemma 4 setting the graph cannot reproduce raise `UnsupportedModel`.
+- Inkling-2-Mini (`inkling2_loop`: 24 layers run as 48 visits, block attention residuals, relative-bias attention with sinks
+  and a sliding window, short convolutions, a 128-expert W4G128 MoE): compiled and run on the CUDA backend from the INT4
+  checkpoint, with the reference interpreter checked against the official implementation ([Inkling-2-Mini](#inkling-2-mini)).
 - GGUF: F32, F16, BF16, Q8_0, Q4_0 and Q4_1 are decoded by warpc, bit-identical to ggml; other block formats go through the
   `gguf` package; IQ formats are rejected. Q4_0 linears stay in their 18-byte blocks on the device and run a fused
   dequantising GEMV; every other weight is bf16.
@@ -48,13 +51,13 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 | Module | Role |
 |---|---|
 | `sources/` | `open(path)`: safetensors (float and W4G128) and GGUF readers behind one `Source` (HF tensor names, `ModelConfig`) |
-| `frontend/` | `Source` to `ir.Graph`, one module per family (`dense`, `qwen35`, `gemma4`) over shared helpers |
+| `frontend/` | `Source` to `ir.Graph`, one module per family (`dense`, `qwen35`, `gemma4`, `inkling`) over shared helpers |
 | `ir/` | the graph and its op vocabulary |
 | `reference.py` | pure-torch interpreter of a graph, the test oracle |
 | `kvcache.py` | KV formats: sizes and reference quantisation |
 | `compiler/` | target-independent: the fusion pass over a capability table, lowering to a `Plan`; the `Backend` protocol |
 | `runtime.py` | `Runtime`: buffers, states, CUDA graphs, position and token feedback; the `Executor` protocol a backend implements |
-| `cuda/` | the CUDA backend: capability table, executor (launchers, weight packing), kernels |
+| `cuda/` | the CUDA backend: capability table, executor (launchers, weight packing), kernels; `cuda/inkling/` holds the four Inkling kernel families |
 | `swiftmk/` | the `swiftmk` backend: the hand engine's kernel library behind a capability table (ctypes binding, packing) |
 | `model.py` | `compile()` and `Model` |
 
@@ -75,6 +78,10 @@ uv run --package warpc python warpc/tests/test_swiftmk.py   # GPU, $WARPC_SWIFTM
 uv run --package warpc python warpc/tests/test_gemma4.py        # Gemma 4: CPU, and the compiled tiny model on the GPU
 uv run --package warpc python warpc/tests/test_gemma4_rows.py   # GPU: the Gemma row / GEMV kernels, one by one
 uv run --package warpc python warpc/tests/test_gemma4_attn.py   # GPU: the attention kernels against the reference
+uv run --package warpc python warpc/tests/test_inkling_res.py    # the Inkling kernel families, GPU and nvcc:
+uv run --package warpc python warpc/tests/test_inkling_gemv.py   # attn_res / controllers / convolution, GEMVs and head,
+uv run --package warpc python warpc/tests/test_inkling_attn.py   # attention, MoE (the CPU parts need no device)
+uv run --package warpc python warpc/tests/test_inkling_moe.py
 ```
 
 | Variable | Effect |
@@ -86,6 +93,9 @@ uv run --package warpc python warpc/tests/test_gemma4_attn.py   # GPU: the atten
 | `WARPC_SWIFTMK_LIB` | `engine/build/libswiftmk.so` (built by `make engine`): the `swiftmk` backend's library and tests, and the `int4_rot` byte-identity test against the engine |
 | `WARPC_TEST_SWIFT27` | the Qwen3.5 27B checkpoint directory: its graph (`test_frontend.py`), lowering onto `swiftmk` (`test_swiftmk.py`), the reference on the GPU (`test_cuda.py`) |
 | `WARPC_TEST_GEMMA4` | a Gemma 4 E2B text checkpoint directory: its header and graph (`test_gemma4.py`) |
+| `WARPC_TEST_INKLING` | the Inkling-2-Mini W4G128 directory (with the `config.json` that `tools/inkling_w4_config.py` writes): its header test (`test_sources.py`), real layers in the MoE kernel test, the reference and the compiled model on the GPU (`test_cuda.py`; each needs the card alone, about 15 GB) |
+| `WARPC_INKLING_QUALITY` | optional, `test_cuda.py`: a directory with the old tree's interpreter logit dumps `ref-{0..3}.pt` of the four quality texts; `test_inkling_reference_real` prints the agreement with them (no bound) |
+| `WARPC_INKLING_REF_PYTHON` | the python (or venv) of an environment with transformers' official `inkling2_loop` (commit 046bdb8): the tiny-model oracle `tests/oracle/inkling_hf.py` (`test_frontend.py`) |
 
 A test whose prerequisite is missing prints `skip` with the reason.
 
@@ -103,6 +113,80 @@ side stream beside the qkv|z GEMV. KV caches: `bf16`, `fp8` (checkpoint scales),
 library file, prompt ids, `ctx_max` and 8-row prompt steps, and checks all 256 greedy ids and the fp32 logits of the
 first 16 head steps for equality. `warpc/tools/bench.py` measures warpc, the hand engine (`swift-engine`) and vLLM on long
 prompts (`--prompt-files`, `--prompt-len`).
+
+## Inkling-2-Mini
+
+`warpc.compile(W4_DIR, ctx_max=N)` runs Inkling-2-Mini (`inkling2_loop`, 26.4B parameters, 3.4B active) from its INT4
+checkpoint on the CUDA backend, greedy, one sequence, bf16 KV cache, prompt steps of up to 8 rows. The 24 layers of
+weights run as 48 layer visits (layers 6 to 17 three times) with their own KV states and four short-convolution states
+each. The checkpoint directory has no `config.json`: `warpc/tools/inkling_w4_config.py OFFICIAL_CONFIG W4_DIR` writes the
+official one with the W4G128 `quantization_config` the tensors have (`warpc_layout: stacked-experts`: the experts are
+rank-3 `[E, N, K / 8]` tensors). Weights are 14.74 GiB on the device and the 8 full-attention visits cost 32 KiB of KV per
+position (the 40 sliding visits keep a ring of window + rows - 1 = 1,031 positions), so 65,536 positions fit in 17 GiB.
+Not supported: speculation, the old tree's int4 candidate head, quantised KV caches.
+
+The graph has 2,168 nodes, 718 weights and 240 states; the CUDA table claims every node with 340 tasks of ten kernels
+(`test_compiler.py::test_inkling_real_graph_lowers_with_every_rounding_point_accounted_for`):
+
+| family (`cuda/inkling/`) | kernels (tasks per step) | does |
+|---|---|---|
+| `res` | `g_attn_res` (96), `g_msg_gate` (48) | block-residual reads (up to 48 queries over identical rows in one launch) with the RMSNorm and cast of their consumer; the loop's rank-64 message controllers |
+| `gemv` | `g_gemv_multi` (48), `g_gemv_convres` (8), `g_gemv_convres_add` (40), `g_head_softcap` (1) | the q, r, k, v, sink, gate projections of a visit on up to three inputs in one launch; the output projection with the short convolution and the residual add in its epilogue; the unembedding (`warpc_gemv` mode 2 with its `cap` argument) with bf16-rounded logits, the soft cap, the vocabulary split and the argmax |
+| `attn` | `g_attn_rel` (48) | a visit's whole attention block in three launches: prep (clips, log scaling, k / v convolutions, KV write at slot `pos mod R`), split-K flash decode with the relative bias gathered per key distance, sinks and the window, merge with the output gate |
+| `moe` | `g_moe` (48) | router + top-8 + the 8 experts + the MLP convolution in one persistent launch (every block resident), contributions summed in ascending expert id |
+
+The rest: `g_embed` (1), `g_rmsnorm` (2). The one rounding point a kernel leaves open is `attention.p` (it keeps the
+probabilities in fp32); `check_rounding` on the real graph finds no other. Pack kinds the family code needed are the
+generic ones: `f32` (fp32 weights as stored: the queries, the router bias), `dense_t` (a transposed matrix: the relative
+bias projection) and `w4g128_experts` (one layer's stacked gate, up and down: the one layout only a kernel family reads).
+`g_head_softcap` and the dense `g_head` (Gemma 4's softcap) share `warpc_gemv` mode 2 (an argument `cap`, 0 for a head
+without one, and `rnd`: 1 rounds the accumulator to bf16 first, the interpreter's linear output, as the Inkling head
+does; the dense head keeps the fp32 accumulator). They stay two capabilities because the dense head's `tolerance` (the
+unrounded accumulator) is not true of a head that rounds, and the Inkling head drops the padding rows. Dense decode with
+the shared kernel, three alternating visits of
+`tools/bench.py`, medians: Qwen3-0.6B Q4_0 686.3 tok/s before, 685.8 after (-0.07%); bf16 576.3 before, 576.7 after
+(+0.07%).
+
+### Checks
+
+| check | result |
+|---|---|
+| reference against the official model (tiny models, fp32, 16 visits, `test_frontend.py`, needs `WARPC_INKLING_REF_PYTHON`) | dense experts: per-visit relative L2 3.5e-7 to 1.5e-5 (the official model's own response to 1e-7 noise: up to 1.4e-5, bound 5 times that), logits max error 4.9e-5, same argmax; W4G128 experts: 4.2e-7 to 1.1e-5, 3.8e-5; windows of 10, 1, 1, 4, 3, 1, 4 rows against the full pass 3.6e-5 and against the official cache 3.1e-5; six semantic slips (no sink mass, no window, bias off by one, conv divisor, no log scaling, route scale 1.01) each move the logits by more than 0.05 |
+| each kernel family against the reference (`test_inkling_*.py`) | `attn_res` relative L2 at most 6.1e-5, controllers 1.6e-3 on the bf16-rounded norm output (hidden activations at most one ulp off), convolutions bit-equal, GEMV segments bit-equal to `warpc_gemv` and the head within 1.6e-5 of the oracle, attention 275 cases (ring wraps, 33,000 positions, log scaling) within 2 bf16 ulp + 2^-7 of the row maximum, MoE routing equal to float64 except true ties and output at most 3.4e-4 relative L2 on real layers; rows per step, determinism and graph replay leave no bit changed |
+| real weights, reference on the GPU (`test_cuda.py::test_inkling_reference_real`) | four texts, 622 predicted positions: perplexity 3.6996 (the old tree: 3.7102) |
+| tiny model compiled (`test_inkling_tiny`: real widths, 16 visits, a window of 16 that 36 positions wrap) | 14 of 14 decided greedy ids equal; logits 0.0202 relative L2 from the bf16 reference on average against 0.0311 between the bf16 and the fp32 reference; windows of 8, 4, 1 rows bit-identical |
+| real weights compiled (`test_inkling_compiled_real`) | KL(reference \| compiled) 0.00301, top-1 98.23% (11 of 622 differ, every one a near tie, top-2 gap < 0.5), perplexity 3.6996 -> 3.7078; logits after 41 tokens bit-identical for windows 8, 4, 1 |
+
+The tiny random model is chaotic (its bf16 and fp32 references differ by 0.3% to 15% in the logits of a position; the old
+tree measured activations of the real model drifting by up to 9% after a visit), so free-running ids part after a few
+tokens in any bf16 implementation, and the gate is the model's own noise. The same holds for the real model: any two bf16 realisations of it differ by KL 0.0019 to 0.0030 on the four texts
+(622 positions, one of them with KL 0.19), the old tree measured 0.00263 between its interpreter and itself with the
+embedding table perturbed by 2^-9, so the compiled gate is 1.25 times that, 0.0033, not the design's 0.0026.
+
+The reference's agreement with the old tree's interpreter dumps (KL 0.00288, top-1 98.07%) is the same floor: the old store
+rounded the dequantised expert weights to bf16 and multiplied in bf16, the reference multiplies the fp32 dequantisation.
+With the old rounding emulated (a local experiment, not committed) the same code gives KL 0.00195, top-1 99.04%, no
+disagreement that is not a near tie, and the first visit differs from the dump by 1e-5 (against 3.2e-3 with fp32
+experts). Between the two expert variants of the new code: KL 0.00286. `test_inkling_reference_real` prints the agreement
+with the dumps and asserts no bound on it.
+
+| KL(first \| second), 622 positions | mean | top-1 |
+|---|---|---|
+| old dumps \| reference, fp32 experts | 0.00288 | 98.07% |
+| old dumps \| reference, bf16-rounded experts | 0.00195 | 99.04% |
+| reference fp32 experts \| bf16-rounded experts | 0.00286 | 98.07% |
+| reference fp32 experts \| compiled | 0.00301 | 98.23% |
+| reference bf16-rounded experts \| compiled | 0.00228 | 98.55% |
+| old dumps \| compiled | 0.00207 | 98.23% |
+
+### Against vLLM
+
+vLLM 0.34.0 cannot run this architecture. Its registry has `InklingForCausalLM`, `InklingForConditionalGeneration` and
+`InklingMTPModel`, all in `vllm.models.inkling`, whose configs are `model_type` `inkling_model`, `inkling_mm_model`,
+`inkling_vision_model` and `inkling_audio_model` (Inkling 1). This checkpoint is `Inkling2LoopForConditionalGeneration`,
+`model_type` `inkling2_loop` (text config `inkling2_loop_text`). No file of the installed `vllm` mentions `inkling2`,
+`cross_pass` or `middle_cycle`, and transformers 5.18.0 in the same environment has only `models/inkling`. The W4G128 layout
+is warpc's own, so even a vLLM with the architecture would need the original NVFP4 / MXFP8 checkpoint. No number.
 
 ## Measured
 
@@ -240,3 +324,34 @@ projection beside the attention, and the post-norm residual add as one kernel.
 `tools/compare_hf.py MODEL TOKENS WORK it|rt|cmp|freerun` runs the four stages (its docstring names the files: the token
 fixture and the transformers dumps it compares with); `bench.py warpc MODEL --ids-file TOKENS --prompt-len ...` the speed
 rows.
+
+### Inkling-2-Mini decode speed
+
+RTX 3090 (350 W limit), INT4 checkpoint, bf16 head and KV cache, 5.28 GB read per token (roofline 5.64 ms at 936 GB/s).
+Old protocol (256 back-to-back T = 1 graph replays at positions 16 to 272 after a 16-token prompt, `ctx_max` 320, best of
+5 rounds), the old tree's script run from an out-of-tree copy and the new tree alternating in one lease, two visits:
+
+| | ms/token, visit 1 / 2 | tok/s |
+|---|---|---|
+| old tree, no schedule passes | 8.386 / 8.410 | 119.2 / 118.9 |
+| old tree, passes split, gate, moeconv, glue | 7.883 / 7.890 | 126.9 / 126.7 |
+| warpc (340 tasks) | 7.895, 7.894 / 7.902, 7.903 | 126.7, 126.7 / 126.6, 126.5 |
+
+warpc is at 106% of the old tree without its passes and 99.8% of it with them (the design's gate: 98%, 116.5 and 124.3
+tok/s). The old tree's int4 candidate head (7.20 ms with the passes) is not ported.
+
+`tools/bench.py warpc` with long prompts (the prompt cut from `engine/src/*.cu` with the checkpoint's tokenizer, one
+prefill in 8-row steps, then 256 tokens per round, median of 5 rounds, tok/s from the arrival of the tokens after the
+first, so the decode loop's per-token copy to the host is included):
+
+| prompt (tokens) | 16 | 4,096 | 16,384 | 32,768 | 65,536 |
+|---|---|---|---|---|---|
+| tok/s | 121.9 | 119.3 | 112.4 | 105.6 | 92.9 |
+| prefill (s) | - | 10.9 | 48.1 | 104.2 | 250.5 |
+
+Peak device memory at 65,536 positions: 16.98 GiB. Each kernel against the old tree's on the same inputs (CUDA graphs of
+back-to-back launches, `attn_res` and controllers at 1 and 8 rows, attention and prep at positions 272 and 3,000, the
+MoE at 1 to 8 rows): `attn_res` 1.00 to 1.08 times as fast, controllers 1.05 to 1.49, prep 1.09 to 1.60, attention
+0.99 to 1.60 (the full-attention split at 3,000 positions streams the same bytes: 0.99 and 1.00), MoE 0.986 to 1.013, its
+T = 1 kernel 4,448 SASS instructions against 4,408. These comparisons need the old tree's kernels built out of tree and are
+not in the test suite.
