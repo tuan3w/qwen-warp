@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.0 - 2026-11-25
+
 ### Added
 
 - `warpc/`: an experimental compiler, separate from the engine, for dense decoder-only models (Llama, Mistral, Qwen3) from Hugging Face safetensors or GGUF files to fused CUDA kernels replayed as CUDA graphs; GGUF Q4_0 weights run through a fused dequantising GEMV. On the RTX 3090, Qwen3-0.6B Q4_0 decodes at 706 tok/s against 568 tok/s for llama.cpp's `llama-server` on the same file ([warpc/README.md](warpc/README.md)). It is a uv workspace member: `uv sync --all-packages`.
