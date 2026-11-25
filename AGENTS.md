@@ -66,6 +66,21 @@ what it supports, its limits. Do not add a markdown file for a feature, a design
   directory level.
 - User-visible changes get a bullet under `Unreleased` in `CHANGELOG.md`.
 
+## Commits
+
+Semantic commits (Conventional Commits): `type(scope): subject`.
+
+- Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`. A `perf` commit puts its
+  measurement in the body; a `fix` says what was wrong.
+- Scope: the area changed, such as `cuda`, `compiler`, `sources`, `frontend`, `kernels`, `tools`; leave it out for
+  repository-wide changes.
+- Subject: imperative, lower case, no trailing period, at most 72 characters.
+- Body, when the subject is not enough: why, not what the diff shows; measurements with their conditions; what was not
+  verified. Wrap at 100 columns.
+- A breaking change adds `!` after the type or scope and a `BREAKING CHANGE:` footer.
+- One logical change per commit: do not mix a refactor with a behaviour change.
+- A pull request title uses the same form. Merge commits keep GitHub's default message.
+
 ## Pull requests
 
 - One topic per pull request; stack them when one builds on another, and retarget to `main` as the base merges. History uses
