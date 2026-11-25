@@ -19,11 +19,18 @@ import torch
 from ..compiler import Pack
 from ..ir import Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, WeightDecl
 from ..sources import Source
-from . import inkling
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, w4
 
 PACK_KINDS = ("dense", "dense_cat", "dense_t", "f32", "q4_0", "q4_0_cat")
 # layouts only a kernel family reads: kind -> (packer, pack) -> device tensor
-FAMILY_PACKS = {**inkling.PACKS}
+FAMILY_PACKS = {
+    **inkling.PACKS,
+    **hybrid.PACKS,
+    **w4.PACKS,
+    **attn_gated.PACKS,
+    **deltanet.PACKS,
+    **head_refine.PACKS,
+}
 
 
 class Packer:

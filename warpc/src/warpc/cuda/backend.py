@@ -12,11 +12,11 @@ import torch
 from ..compiler import Pack, Plan, Task
 from ..ir import STATE_DTYPE, Graph, StateDecl
 from ..kvcache import FORMATS
-from ..runtime import Launch, Memory
+from ..runtime import Launch, Memory, merge_sides
 from ..sources import Source
 from . import glue, launch, schedule
 from .pack import Packer
-from .table import TABLE
+from .table import table
 
 _STATE_BYTES = {"bf16": 2, "f32": 4}
 
@@ -54,7 +54,7 @@ class CudaExecutor:
             nbytes = launch.prefetch_bytes(t, tasks[i + 1]) if T == 1 and i + 1 < len(tasks) else 0
             side = (functools.partial(launch.prefetch, self._lib, mem, tasks[i + 1], nbytes),) if nbytes else ()
             out.append(Launch(main, side))
-        return out
+        return merge_sides(tasks, out)
 
     def advance(self, mem: Memory, T: int, stream: int) -> None:
         pass
@@ -64,8 +64,14 @@ class CudaExecutor:
 
 
 class CudaBackend:
+    """`head` picks the lm_head kernel: "bf16" (the exact head) or "int4_refine" (an int4 g128 copy of the head with the
+    top 16 per row rescored exactly: approximate logits, the hand engine's default head)."""
+
     name = "cuda"
-    caps = TABLE
+
+    def __init__(self, head: str = "bf16"):
+        self.head = head
+        self.caps = table(head)
 
     def executor(self, graph: Graph, plan: Plan, source: Source) -> CudaExecutor:
         return CudaExecutor(graph, source)

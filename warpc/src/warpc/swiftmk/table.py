@@ -197,7 +197,7 @@ def _emit_ab(m, A):
         outs={"o0": la.outs[0], "o1": lb.outs[0]},
         weights={"w": name},
         packs=[Pack(name, "dense_cat", [wa, wb])],
-        attrs={"N": na + nb, "na": na, "K": A.graph.weights[wa].shape[1]},
+        attrs={"N": na + nb, "na": na, "K": A.graph.weights[wa].shape[1], "side": True},
         numerics="bf16 weights, one warp per row, fp32 accumulation, one bf16 rounding",
     )
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 from ..compiler import Absorb, Cap, CapsTable, Pack, Region, Target, Verdict
 from ..ir import Q4_0_BLOCK_ELEMS
 from ..kvcache import FORMATS, RotatedInt4Format
-from . import inkling, schedule
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, schedule, w4
 
 # GeForce RTX 3090 (sm_86): measured launch cost inside a CUDA graph, DRAM bandwidth, SM count. The cost model uses
 # these on any GPU; the kernels themselves are built for the device the runtime runs on.
@@ -623,6 +623,11 @@ _ATTN_LIMITS = {
 # order = tie-break of the cost model: the kernels with the most absorbed work first
 CAPS = [
     *inkling.CAPS,
+    *hybrid.CAPS,
+    *attn_gated.CAPS,
+    *deltanet.CAPS,
+    *w4.CAPS,
+    *head_refine.CAPS,
     Cap(
         "g_attn",
         "attention",
@@ -825,5 +830,19 @@ CAPS = [
     ),
 ]
 
-# an unfused attention is still prep + split + merge; a reshape is a view
-TABLE = CapsTable(CAPS, RTX3090, _unfused_ctas, {"attention": 3, "attention_read": 3, "reshape": 0, "split": 0})
+# the lm_head kernels, one per head: the exact bf16 head, or the int4 copy with exact rescoring of its top candidates
+HEADS = {"bf16": "g_head", "int4_refine": "g_head_refine"}
+
+
+def table(head: str = "bf16") -> CapsTable:
+    """The capability table with the head kernel `head` names (HEADS) and without the other one. An unfused attention
+    is still prep + split + merge; a reshape or a split is a view."""
+    if head not in HEADS:
+        raise ValueError(f"unknown head {head!r} (known: {', '.join(HEADS)})")
+    drop = {k for h, k in HEADS.items() if h != head}
+    caps = [c for c in CAPS if c.kernel not in drop]
+    launches = {"attention": 3, "attention_read": 3, "reshape": 0, "split": 0}
+    return CapsTable(caps, RTX3090, _unfused_ctas, launches, prefer_rank=True)
+
+
+TABLE = table()

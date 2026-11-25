@@ -1,7 +1,8 @@
 """Single-stream greedy decode throughput of one checkpoint on warpc, llama.cpp's llama-server, vLLM or the hand engine.
 
   uv run --package warpc python warpc/tools/bench.py ENGINE MODEL [--ctx-max N] [--tokens N] [--repeats N] \
-      [--kv FORMAT] [--tokenizer DIR] [--json FILE] [--backend cuda|swiftmk] [--head bf16|int4_refine] \
+      [--kv FORMAT] [--tokenizer DIR] [--json FILE] [--backend cuda|swiftmk|composite] \
+      [--kernels K,...] [--head bf16|int4_refine] \
       [--prompt-files F... --prompt-len L...] [--gpu-memory-utilization U...] [--language-model-only]
 
 ENGINE is warpc, llama-server, vllm or swift-engine (the hand engine of this repository, 27B checkpoint only); MODEL an
@@ -36,6 +37,7 @@ import prompts
 import swift_worker
 import vllm_worker
 import warpc
+from backends import BACKENDS, make_backend
 
 PROMPT = [785, 6722, 315, 9625, 374]  # "The capital of France is" in Qwen3's vocabulary; valid ids in every vocabulary
 ENGINES = ("warpc", "llama-server", "vllm", "swift-engine")
@@ -59,10 +61,14 @@ def bench_warpc(model: Path, ctx_max: int, tokens: int, repeats: int, kv: str, b
     return {"rates": rates[1:], "plan": compiled.plan.summary(), "compile_s": compile_s, "peak_gib": peak}
 
 
-def _swiftmk_backend(head: str):
-    from warpc.swiftmk import SwiftmkBackend, lib
+def _backend(args):
+    """(backend, the hand engine's library or None) of --backend / --head / --kernels."""
+    backend = make_backend(args.backend, args.head, args.kernels)
+    if args.backend == "cuda":
+        return backend, None
+    from warpc.swiftmk import lib
 
-    return SwiftmkBackend(head=head), lib.load()
+    return backend, lib.load()
 
 
 def long_prompt(args, length: int) -> list[int]:
@@ -73,7 +79,7 @@ def long_prompt(args, length: int) -> list[int]:
 
 
 def bench_warpc_long(args, ctx_max: int) -> dict:
-    backend, library = _swiftmk_backend(args.head) if args.backend == "swiftmk" else (None, None)
+    backend, library = _backend(args)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     compiled = warpc.compile(args.model, ctx_max=ctx_max, rows_max=ROWS, kv=args.kv, backend=backend)
@@ -165,7 +171,8 @@ def main():
     ap.add_argument("--kv", default="bf16", help="KV cache format (warpc's names; vllm: bf16 = auto, or fp8)")
     ap.add_argument("--tokenizer", type=Path, help="vllm on a GGUF file: the HF directory of the same model")
     ap.add_argument("--json", type=Path, help="also write the result to this file")
-    ap.add_argument("--backend", choices=("cuda", "swiftmk"), default="cuda", help="warpc backend")
+    ap.add_argument("--backend", choices=BACKENDS, default="cuda", help="warpc backend")
+    ap.add_argument("--kernels", help="composite: the warpc kernels admitted, comma-separated (default: all)")
     ap.add_argument("--head", choices=("bf16", "int4_refine"), default="bf16", help="swiftmk / swift-engine head")
     ap.add_argument("--prompt-files", type=Path, nargs="+", help="text the long prompts are cut from")
     ap.add_argument("--ids-file", type=Path, help="warpc: JSON with 'speed': {length: prompt ids}, instead of files")
@@ -203,7 +210,7 @@ def main():
         ap.error("swift-engine needs --prompt-files / --prompt-len")
     ctx_max = args.ctx_max or 4096
     if args.engine == "warpc":
-        backend = _swiftmk_backend(args.head)[0] if args.backend == "swiftmk" else None
+        backend = _backend(args)[0]
         result = bench_warpc(args.model, ctx_max, args.tokens, args.repeats, args.kv, backend)
     elif args.engine == "llama-server":
         result = bench_llama_server(args.model, ctx_max, args.tokens, args.repeats)

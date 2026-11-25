@@ -834,20 +834,32 @@ class Qwen35Shapes:
 
 
 def test_qwen35_graph_on_the_cuda_table():
-    """The 27B graph (4 layers, the checkpoint's prefix and schemes) verifies, and the CUDA table refuses it naming the
-    ops it has no kernel for: the stage-2 progress readout."""
+    """The 27B graph (4 layers, the checkpoint's prefix and schemes) verifies and lowers onto the CUDA table alone (the
+    stage 2 exit test): one task per hand-engine launch, and the fp8 cache, which has no warpc kernel, is refused naming
+    its limit."""
     g = frontend.build(Qwen35Shapes(), ctx_max=4096)
     assert g.weights["embed"].source == "model.language_model.embed_tokens.weight"
     schemes = Counter(w.scheme for w in g.weights.values())
     assert schemes["w4g128"] == 4 * 3 + 3 * 3 + 4, schemes  # MLPs, qkv / z / out, q / k / v / o
     assert g.weights["L0.qkv"].nbytes == 10240 * 5120 // 2 + 10240 * 40 * 2
+    got = Counter(t.kernel for t in lower(g, BACKEND, rows_max=8).tasks)
+    assert got == {
+        "g_embed": 1,
+        "g_rmsnorm_zc": 1,
+        "g_rmsnorm_zc_add": 8,
+        "g_gemv_small": 3,
+        "g_w4_gemv": 4 * 2 + 3 + 1,  # qkv|z (3), q|k|v (1), out / o / down (4)
+        "g_w4_gemv_silu": 4,
+        "g_deltanet": 3,
+        "g_attn_gated": 1,
+        "g_head": 1,
+    }, got
     try:
-        lower(g, BACKEND, rows_max=8)
+        lower(frontend.build(Qwen35Shapes(), ctx_max=4096, kv="fp8"), BACKEND, rows_max=8)
     except LoweringError as e:
-        for op in ("gated_delta_rule", "causal_conv1d", "gated_rmsnorm", "sigmoid_mul", "split", "silu x3"):
-            assert op in str(e), (op, str(e))
+        assert "cache=fp8" in str(e), str(e)
     else:
-        raise AssertionError("the CUDA table claimed a Qwen3.5 graph")
+        raise AssertionError("the CUDA table claimed an fp8 cache")
 
 
 def test_prologue_absorbs_producers_of_epilogue_operands():
@@ -911,7 +923,7 @@ def test_glue_signatures_and_constants_match_the_kernel_sources():
     #defines that schedule.py mirrors agree with it."""
     src = "\n".join(p.read_text() for p in sorted(glue.KERNELS.glob("*.c*")))
     for name, (args, _) in glue.SIGNATURES.items():
-        m = re.search(r"\b(?:int|size_t|const char\*) " + name + r"\(([^)]*)\)", src)
+        m = re.search(r"\b(?:int|size_t|const char\*|const void\*) " + name + r"\(([^)]*)\)", src)
         assert m, name
         params = [p for p in m.group(1).split(",") if p.strip()]
         assert len(params) == len(args), (name, len(params), len(args))
