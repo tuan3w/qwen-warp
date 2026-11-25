@@ -58,7 +58,11 @@ TINY = {
     "max_position_embeddings": 256,
 }
 E2B_ROPE = {
-    "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+    "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional",
+    },
     "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
 }
 
@@ -182,15 +186,43 @@ def errors(outs: dict, ref_logits, ref_layers) -> tuple[list[float], float]:
 
 # ---------------------------------------------------------------------------------------------------------- config
 def test_gemma4_config():
-    nested = {"model_type": "gemma4", "text_config": e2b_text_config(), "vision_config": {}, "audio_config": {}}
+    nested = {
+        "model_type": "gemma4",
+        "text_config": e2b_text_config(),
+        "vision_config": {},
+        "audio_config": {},
+    }
     for hf in (nested, e2b_text_config()):
         c = ModelConfig.from_hf(hf)
         g = c.gemma
-        assert (c.family, c.num_layers, c.head_dim, c.num_heads, c.num_kv_heads) == ("gemma4", 35, 256, 8, 1)
-        assert (c.activation, c.logit_softcap, c.sliding_window, c.tie_embeddings) == ("gelu_tanh", 30.0, 512, True)
+        assert (c.family, c.num_layers, c.head_dim, c.num_heads, c.num_kv_heads) == (
+            "gemma4",
+            35,
+            256,
+            8,
+            1,
+        )
+        assert (c.activation, c.logit_softcap, c.sliding_window, c.tie_embeddings) == (
+            "gelu_tanh",
+            30.0,
+            512,
+            True,
+        )
         assert c.embed_scale == float(1536**0.5)
-        assert (g.global_head_dim, g.global_kv_heads, g.kv_shared_layers, g.per_layer_hidden) == (512, 1, 20, 256)
-        assert [g.owner(c.layer_types, i) for i in (14, 15, 18, 19, 33, 34)] == [14, 13, 13, 14, 13, 14]
+        assert (
+            g.global_head_dim,
+            g.global_kv_heads,
+            g.kv_shared_layers,
+            g.per_layer_hidden,
+        ) == (512, 1, 20, 256)
+        assert [g.owner(c.layer_types, i) for i in (14, 15, 18, 19, 33, 34)] == [
+            14,
+            13,
+            13,
+            14,
+            13,
+            14,
+        ]
         assert c.rope_theta == 10000.0 and len(c.rope_inv_freq()) == 128
         full = c.rope_inv_freq(F_)
         assert len(full) == 256 and full[63] > 0 and not any(full[64:])
@@ -212,14 +244,20 @@ def test_gemma4_config():
             assert key.split("_config")[0] in str(e) or key in str(e), (key, str(e))
         else:
             raise AssertionError(f"{key}={value!r} accepted")
-    rope = {**E2B_ROPE, "full_attention": {**E2B_ROPE["full_attention"], "rope_type": "yarn"}}
+    rope = {
+        **E2B_ROPE,
+        "full_attention": {**E2B_ROPE["full_attention"], "rope_type": "yarn"},
+    }
     try:
         ModelConfig.from_hf({**e2b_text_config(), "rope_parameters": rope})
     except UnsupportedModel as e:
         assert "yarn" in str(e)
     else:
         raise AssertionError("yarn accepted")
-    tail = {**e2b_text_config(), "layer_types": [S] * 34 + [F_]}  # the sharing full layer has no full owner
+    tail = {
+        **e2b_text_config(),
+        "layer_types": [S] * 34 + [F_],
+    }  # the sharing full layer has no full owner
     try:
         ModelConfig.from_hf(tail)
     except UnsupportedModel:
@@ -276,11 +314,19 @@ def test_gemma4_matches_transformers():
     graph = m.graph(rows_max=T)  # the one-shot pass needs a ring of window + 24 - 1 rows
     ring_graph = m.graph()
     # ring of window 6 + 8 - 1 = 13 rows < 24 positions: the sliding owners wrap; global owners hold 64
-    assert {n: s.shape[1] for n, s in ring_graph.states.items()} == {"L0.kv": 13, "L1.kv": 13, "L2.kv": 64}
+    assert {n: s.shape[1] for n, s in ring_graph.states.items()} == {
+        "L0.kv": 13,
+        "L1.kv": 13,
+        "L2.kv": 64,
+    }
     full = m.interpreter(graph).run(feed(ids, 0, T))
     it = m.interpreter(ring_graph)
     layer_errs, logit_err = errors(full, ref_logits, ref_layers)
-    print("per-layer rel L2:", " ".join(f"{e:.1e}" for e in layer_errs), f"| logits {logit_err:.1e}")
+    print(
+        "per-layer rel L2:",
+        " ".join(f"{e:.1e}" for e in layer_errs),
+        f"| logits {logit_err:.1e}",
+    )
     assert max(layer_errs) < GATE and logit_err < GATE, (layer_errs, logit_err)
     assert (full["ids"] == ref_logits.argmax(-1)).all()
     plan = (8, 1, 1, 4, 3, 1, 6)
@@ -297,11 +343,22 @@ def test_gemma4_matches_transformers():
     cache, hf_parts, at = DynamicCache(config=m.cfg), [], 0
     with torch.no_grad():
         for w in plan:
-            hf_parts.append(m.hf(input_ids=ids[None, at : at + w], past_key_values=cache, use_cache=True).logits[0])
+            hf_parts.append(
+                m.hf(
+                    input_ids=ids[None, at : at + w],
+                    past_key_values=cache,
+                    use_cache=True,
+                ).logits[0]
+            )
             at += w
     assert rel(win, torch.cat(hf_parts)) < GATE
     it.reset()  # a prefill window then single steps, the serving pattern
-    dec = torch.cat([it.run(feed(ids, 0, 8))["logits"], *[it.run(feed(ids, t, t + 1))["logits"] for t in range(8, T)]])
+    dec = torch.cat(
+        [
+            it.run(feed(ids, 0, 8))["logits"],
+            *[it.run(feed(ids, t, t + 1))["logits"] for t in range(8, T)],
+        ]
+    )
     assert rel(dec, full["logits"]) < GATE
     it.reset()
     try:
@@ -316,7 +373,10 @@ def test_gemma4_variants():
     """No PLE, no softcap, no sharing, the default 5:1 layer pattern."""
     kw = {k: v for k, v in TINY.items() if k not in ("layer_types", "final_logit_softcapping")}
     kw.update(
-        hidden_size_per_layer_input=0, num_kv_shared_layers=0, use_double_wide_mlp=False, final_logit_softcapping=None
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=0,
+        use_double_wide_mlp=False,
+        final_logit_softcapping=None,
     )
     m = Tiny(kw)
     ids = torch.randint(0, 120, (T,), generator=torch.Generator().manual_seed(2))
@@ -389,7 +449,9 @@ def graph_slips(graph: Graph, hf_graph_widths: tuple[int, int]) -> dict[str, Gra
             graph, "rope", rope_where(full_dim, inv_freq=plain(1e4, full_dim))
         ),
         "proportional rope with half the angles": patched(
-            graph, "rope", rope_where(full_dim, inv_freq=plain(1e6, full_dim, full_dim // 16))
+            graph,
+            "rope",
+            rope_where(full_dim, inv_freq=plain(1e6, full_dim, full_dim // 16)),
         ),
         "embedding not scaled by sqrt(H)": patched(graph, "embed", weights_to_unscaled("embed")),
         "PLE table not scaled by sqrt(D)": patched(graph, "embed", weights_to_unscaled("ple_embed")),
@@ -403,7 +465,9 @@ def graph_slips(graph: Graph, hf_graph_widths: tuple[int, int]) -> dict[str, Gra
             graph, "attention_read", lambda n, g: n.attrs.update(window=None)
         ),
         "norm with 1 + weight": patched(
-            graph, "rmsnorm", lambda n, g: n.attrs.update(offset=1.0) if "weight" in n.attrs else None
+            graph,
+            "rmsnorm",
+            lambda n, g: n.attrs.update(offset=1.0) if "weight" in n.attrs else None,
         ),
         "softcap missing": patched(graph, "softcap", lambda n, g: n.attrs.update(cap=1e9)),
         "layer_scalar ignored": patched(graph, "scale", scalar_ignored),
@@ -426,7 +490,12 @@ def test_gemma4_slips():
     graph = m.graph(rows_max=T)
     table = []
     for name, bad in graph_slips(graph, (16, 32)).items():
-        table.append((name, *errors(m.interpreter(bad).run(feed(ids, 0, T)), ref_logits, ref_layers)))
+        table.append(
+            (
+                name,
+                *errors(m.interpreter(bad).run(feed(ids, 0, T)), ref_logits, ref_layers),
+            )
+        )
     orig = dict(_IMPL)
     erf_gelu = lambda it, a, g_, u: F.gelu(g_) * u  # noqa: E731
     raw_v = lambda it, a, x: orig["rmsnorm"](it, a, x) if "weight" in a else x  # noqa: E731
@@ -436,7 +505,16 @@ def test_gemma4_slips():
     ):
         _IMPL[op] = impl
         try:
-            table.append((name, *errors(m.interpreter(graph).run(feed(ids, 0, T)), ref_logits, ref_layers)))
+            table.append(
+                (
+                    name,
+                    *errors(
+                        m.interpreter(graph).run(feed(ids, 0, T)),
+                        ref_logits,
+                        ref_layers,
+                    ),
+                )
+            )
         finally:
             _IMPL[op] = orig[op]
     assert len(table) == 15 + 1, len(table)
@@ -457,7 +535,7 @@ def test_gemma4_rejected_by_dense_caps():
         lower(graph, CudaBackend(), rows_max=8)
     except LoweringError as e:
         text = str(e)
-        for needle in ("scale", "softcap", "gelu_mul", "attention_read", "weighted"):
+        for needle in ("scale", "softcap", "gelu_mul", "attention_read", "rmsnorm"):
             assert needle in text, (needle, text)
     else:
         raise AssertionError("the dense table lowered a Gemma 4 graph")
@@ -547,7 +625,10 @@ def test_gemma4_checkpoint():
     for i, s in graph.states.items():
         layer = int(i[1:].split(".")[0])
         full = source.config.layer_types[layer] == F_
-        assert s.shape == (2, 4096 if full else ring, 1, 512 if full else 256), (i, s.shape)
+        assert s.shape == (2, 4096 if full else ring, 1, 512 if full else 256), (
+            i,
+            s.shape,
+        )
     reads = {n.attrs["state"] for n in graph.nodes if n.op == "attention_read"}
     assert reads == {"L13.kv", "L14.kv"}, reads
     config = json.loads((Path(path) / "config.json").read_text())
@@ -620,7 +701,10 @@ def test_gemma4_tiny_compiled():
         at += len(chunk)
     want = [int(out["ids"][-1])]
     while len(want) < new:
-        feed = {"tokens": torch.tensor(want[-1:], dtype=torch.int32), "pos": torch.tensor([at], dtype=torch.int32)}
+        feed = {
+            "tokens": torch.tensor(want[-1:], dtype=torch.int32),
+            "pos": torch.tensor([at], dtype=torch.int32),
+        }
         want.append(int(it.run(feed)["ids"][-1]))
         at += 1
     assert got == want, (got, want)

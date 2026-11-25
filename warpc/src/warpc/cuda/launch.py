@@ -13,7 +13,7 @@ from collections.abc import Callable
 from ..compiler import Task
 from ..kvcache import FORMATS
 from ..runtime import Memory
-from . import inkling, schedule
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, schedule, w4
 
 
 def _check(L: C.CDLL, rc: int, what: str) -> None:
@@ -191,7 +191,15 @@ def _attention(L: C.CDLL, mem: Memory, t: Task, T: int, st: int) -> None:
 
 
 def _head(L: C.CDLL, mem: Memory, t: Task, T: int, st: int) -> None:
-    _gemv(L, mem, t, T, st, 2)
+    n, k = t.attrs["N"], t.attrs["K"]
+    if T == 1 and n % 4 == 0 and k % 256 == 0:
+        # one row: the CUDA-core head GEMV whose fp32 order is libswiftmk's (smk_bf16_gemv_f32), bit-identical logits
+        rc = L.warpc_head_gemv(
+            mem.packs[t.weights["w"]], mem.buffer(t.ins["x"]), n, k, mem.buffer(t.outs["logits"]), st
+        )
+        _check(L, rc, t.kernel)
+    else:
+        _gemv(L, mem, t, T, st, 2)
     ws = mem.scratch("argmax_ws", L.warpc_argmax_ws_bytes())
     logits, ids = mem.buffer(t.outs["logits"]), mem.buffer(t.outs["ids"])
     _check(L, L.warpc_argmax(logits, T, t.attrs["N"], ids, ws, st), t.kernel)
@@ -214,7 +222,8 @@ LAUNCHERS: dict[str, Callable[[C.CDLL, Memory, Task, int, int], None]] = {
     "g_head": _head,
     "g_ple": _ple,
 }
-LAUNCHERS.update(inkling.LAUNCHERS)
+for _family in (inkling, hybrid, w4, attn_gated, deltanet, head_refine):
+    LAUNCHERS.update(_family.LAUNCHERS)
 
 
 # L2 prefetch of the GEMV that consumes an attention's output (a residual GEMV, or the o projection of a layer that

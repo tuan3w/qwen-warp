@@ -431,7 +431,14 @@ def _candidates(A: Analysis, table: CapsTable, strict: bool) -> tuple[list[Match
                 out.setdefault(m.key(), m)
     # stable sort: table order within a depth
     reasons = {i: [t for _, t in sorted(lst, key=lambda x: x[0])] for i, lst in rej.items()}
-    return list(out.values()), reasons
+    cands = list(out.values())
+    if table.prefer_rank:
+        first: dict[frozenset, Match] = {}
+        for m in cands:
+            if m.covers not in first or m.rank < first[m.covers].rank:
+                first[m.covers] = m
+        cands = list(first.values())
+    return cands, reasons
 
 
 def _components(cands: list[Match]) -> list[list[Match]]:

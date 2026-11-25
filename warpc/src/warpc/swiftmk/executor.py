@@ -18,7 +18,7 @@ import torch
 
 from ..compiler import Pack, Plan, Task
 from ..ir import Graph, StateDecl
-from ..runtime import Launch, Memory
+from ..runtime import Launch, Memory, merge_sides
 from ..sources import Source
 from .launch import LAUNCHERS
 from .lib import Library
@@ -69,22 +69,7 @@ class SwiftmkExecutor:
         return t
 
     def schedule(self, mem: Memory, tasks: Sequence[Task], T: int) -> list[Launch]:
-        launches: list[Launch] = []
-        prev: Task | None = None
-        for t in tasks:
-            fn = LAUNCHERS[t.kernel](self, mem, t, T)
-            if t.kernel == "s_ab_gemv" and prev is not None and prev.kernel == "s_w4_gemv" and prev.ins == t.ins:
-                # the hand engine's overlap (engine.cu): in_proj_a|b on the side stream beside the qkv|z GEMV, which
-                # neither reads what a|b writes nor writes what it reads
-                p_in, p_out = set(prev.ins.values()), set(prev.outs.values())
-                s_in, s_out = set(t.ins.values()), set(t.outs.values())
-                if p_in & s_out or p_out & (s_in | s_out):
-                    raise AssertionError(f"{t.kernel} cannot run beside {prev.kernel}: they share a buffer")
-                launches[-1] = Launch(launches[-1].main, (*launches[-1].side, fn))
-            else:
-                launches.append(Launch(fn))
-            prev = t
-        return launches
+        return merge_sides(tasks, [Launch(LAUNCHERS[t.kernel](self, mem, t, T)) for t in tasks])
 
     def advance(self, mem: Memory, T: int, stream: int) -> None:
         if torch.cuda.current_stream().cuda_stream != stream:

@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import inkling
+from . import attn_gated, deltanet, head_refine, hybrid, inkling, w4
 
 KERNELS = Path(__file__).resolve().parent / "kernels"
 
@@ -70,6 +70,10 @@ SIGNATURES: dict[str, tuple[list, type]] = {
 }
 
 SIGNATURES.update(inkling.SIGNATURES)
+
+
+for _family in (hybrid, w4, attn_gated, deltanet, head_refine):
+    SIGNATURES.update(_family.SIGNATURES)
 
 
 def nvcc() -> str:

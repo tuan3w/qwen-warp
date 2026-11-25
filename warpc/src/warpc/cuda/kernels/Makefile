@@ -65,6 +65,17 @@ $(ATTN_OBJS): $(OBJ)/%.o: dense_attn_inst.cu $(HDR)
 $(foreach h,$(ATTN_HDS) 512,$(foreach p,$(ATTN_PARTS) 64,\
   $(eval $(OBJ)/dense_attn_inst_hd$(h)_p$(p).o: DEFS = -DATTN_HD=$(h) -DATTN_PARTS=$(p))))
 
+# qwen35_attn (the gated hd-256 attention): the split kernels, one object per configuration. bf16 cache: k_split per (n-tiles of 8 query columns)_(key slices); int4_rot:
+# k_split_i4 per key slices. The key slices are the hand engine's (the outputs are bit for bit its).
+Q35ATTN_BF16 := 1_4 2_4 3_2 4_2 5_1 6_1
+Q35ATTN_I4 := 4 2
+Q35ATTN_OBJS := $(foreach c,$(Q35ATTN_BF16),$(OBJ)/qwen35_attn_inst_bf16_$(c).o) $(foreach c,$(Q35ATTN_I4),$(OBJ)/qwen35_attn_inst_i4_$(c).o)
+$(Q35ATTN_OBJS): $(OBJ)/%.o: qwen35_attn_inst.cu $(HDR)
+	@$(CC_CACHED)
+$(foreach c,$(Q35ATTN_BF16),$(eval $(OBJ)/qwen35_attn_inst_bf16_$(c).o: DEFS = -DQ35_I4=0 -DQ35_NT=$(firstword $(subst _, ,$(c))) -DQ35_KS=$(lastword $(subst _, ,$(c)))))
+$(foreach c,$(Q35ATTN_I4),$(eval $(OBJ)/qwen35_attn_inst_i4_$(c).o: DEFS = -DQ35_I4=1 -DQ35_KS=$(c)))
+OBJS += $(Q35ATTN_OBJS)
+
 # link into a temporary name and rename: a loader never sees a half-written library
 $(OUT): $(OBJS) $(GEMV_OBJS) $(KS_OBJS) $(Q4GEMV_OBJS) $(ATTN_OBJS)
 	@mkdir -p $(BUILD)

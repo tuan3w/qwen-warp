@@ -28,9 +28,9 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 
 - Families: Llama, Mistral, Qwen3. Anything else raises `UnsupportedModel` naming the setting (projection biases, sliding
   window, rope scaling, ...).
-- Qwen3.5 (Gated DeltaNet + gated attention hybrids, including compressed-tensors W4A16 group-128 checkpoints): graph and
-  reference interpreter; the CUDA table refuses its ops with a `LoweringError` that lists them. The `swiftmk` backend runs
-  the 27B checkpoint on the hand engine's kernels (below).
+- Qwen3.5 (Gated DeltaNet + gated attention hybrids, including compressed-tensors W4A16 group-128 checkpoints): graph,
+  reference interpreter and the CUDA kernels for the 27B INT4 checkpoint with a `bf16` or `int4_rot` KV cache; the
+  `swiftmk` backend runs it on the hand engine's kernels, and the `fp8` KV cache only there (below).
 - Gemma 4 E2B (the text decoder: sliding-window and global attention layers with their own head dims, KV sharing, per-layer
   input embeddings, sandwich norms, softcapped logits; bf16 weights) on the CUDA backend, bf16 KV only. The 31B / 26B-A4B
   variants (`attention_k_eq_v`, MoE) and every other Gemma 4 setting the graph cannot reproduce raise `UnsupportedModel`.
@@ -57,8 +57,9 @@ Token ids in, token ids out (no tokenizer). `prefill`, `step`, `decode`, `logits
 | `kvcache.py` | KV formats: sizes and reference quantisation |
 | `compiler/` | target-independent: the fusion pass over a capability table, lowering to a `Plan`; the `Backend` protocol |
 | `runtime.py` | `Runtime`: buffers, states, CUDA graphs, position and token feedback; the `Executor` protocol a backend implements |
-| `cuda/` | the CUDA backend: capability table, executor (launchers, weight packing), kernels; `cuda/inkling/` holds the four Inkling kernel families |
+| `cuda/` | the CUDA backend: capability table, executor (launchers, weight packing), kernels; `cuda/inkling/` holds the four Inkling kernel families, one module per Qwen3.5 kernel family (`hybrid`, `w4`, `deltanet`, `attn_gated`, `head_refine`) |
 | `swiftmk/` | the `swiftmk` backend: the hand engine's kernel library behind a capability table (ctypes binding, packing) |
+| `composite.py` | `CompositeBackend`: two backends behind one table, the primary's kernels preferred, each task run by its owner |
 | `model.py` | `compile()` and `Model` |
 
 The kernel library is built with nvcc on first use and cached by source digest and GPU architecture.
@@ -82,6 +83,15 @@ uv run --package warpc python warpc/tests/test_inkling_res.py    # the Inkling k
 uv run --package warpc python warpc/tests/test_inkling_gemv.py   # attn_res / controllers / convolution, GEMVs and head,
 uv run --package warpc python warpc/tests/test_inkling_attn.py   # attention, MoE (the CPU parts need no device)
 uv run --package warpc python warpc/tests/test_inkling_moe.py
+uv run --package warpc python warpc/tests/test_composite.py # CPU
+uv run --package warpc python warpc/tests/test_stage2.py    # CPU, $WARPC_TEST_SWIFT27: the 27B lowers onto the CUDA kernels alone
+# GPU, $WARPC_SWIFTMK_LIB: each family's kernel against the hand kernel (set WARPC_W4_SPEED, WARPC_ATTN_SPEED,
+# WARPC_HEAD_SPEED for the speed rows)
+uv run --package warpc python warpc/tests/test_hybrid.py    # norms, head, a|b
+uv run --package warpc python warpc/tests/test_w4.py
+uv run --package warpc python warpc/tests/test_deltanet.py
+uv run --package warpc python warpc/tests/test_attn_gated.py
+uv run --package warpc python warpc/tests/test_head_refine.py
 ```
 
 | Variable | Effect |
@@ -187,6 +197,68 @@ vLLM 0.34.0 cannot run this architecture. Its registry has `InklingForCausalLM`,
 `model_type` `inkling2_loop` (text config `inkling2_loop_text`). No file of the installed `vllm` mentions `inkling2`,
 `cross_pass` or `middle_cycle`, and transformers 5.18.0 in the same environment has only `models/inkling`. The W4G128 layout
 is warpc's own, so even a vLLM with the architecture would need the original NVFP4 / MXFP8 checkpoint. No number.
+
+## The CUDA kernels of the Qwen3.5 hybrid
+
+`CudaBackend(head="bf16" | "int4_refine")` lowers the same 27B graph onto warpc's own kernels, with no `libswiftmk` in the
+process: the plan is task for task the hand engine's step (499 launches), and every kernel is bit-identical to the hand
+kernel it replaces (`HAND_TO_WARPC` in `tests/test_stage2.py`). The fp8 KV cache has no warpc kernel and is refused
+naming its limit; `CompositeBackend(CudaBackend(), SwiftmkBackend())` runs the kernels of its first backend where both
+match the same nodes and the second's elsewhere (`kernels=` admits a subset: the way each family was gated one at a time).
+
+| kernel (module) | replaces | numerics = the hand kernel's | kernel gate |
+|---|---|---|---|
+| `g_embed` | `smk_embed` | row gather | bitwise |
+| `g_rmsnorm_zc`, `g_rmsnorm_zc_add` (`hybrid`) | `smk_rmsnorm` | zero-centred norm, one 16-byte chunk per thread, the warp-tree sum, `1 / sqrt`, residual add in place | bitwise, H up to 8192, T 1..8 |
+| `g_head` (`launch._head`) | `smk_bf16_gemv_f32` + `smk_argmax` | T = 1: the CUDA-core head GEMV, two fma chains per 256-column tile | bitwise logits |
+| `g_gemv_small` (`hybrid`) | `smk_bf16_gemv_small` (in_proj_a\|b, on the side stream) | one 128-thread block per row | bitwise, T 1..8 |
+| `g_w4_gemv`, `g_w4_gemv_silu` (`w4`) | `smk_w4r_gemv` (segments, gate\|up with the SiLU epilogue) | m16n8k16 mma per 128-k group, fp32 group scale, K split; the order is written in `w4g128_gemv.cuh` | bitwise against a CPU model of the tensor core (gate 1), rows invariant (2), bitwise against the hand kernel (3) |
+| `g_deltanet` (`deltanet`) | `swiftmk_deltanet_step_lazy2` | conv + SiLU in fp32, the hand's summation trees; plain in-place state | bitwise, T 1..8, 1,025 real decode steps on 3 layers |
+| `g_attn_gated` (`attn_gated`) | `swiftmk_attn_step` (bf16 and `int4_rot` caches) | fp64 rope angles, the hand's split geometry and, for `int4_rot`, its fp16 score accumulation | KV buffers equal byte for byte, outputs bitwise, T 1..8, ctx 385 to 16k |
+| `g_head_refine` (`head_refine`) | `smk_headq_gemv` + `smk_headq_select_rescore` | int4 head, top 16 rescored exactly | candidates, exact logits, logits buffer and ids bitwise |
+
+`warpc/tools/gate27.py` is the end-to-end gate: `reference` records the hand engine's ids and logits on 3 disjoint prompts
+of 385 and 4,096 tokens (256 greedy ids, fp32 logits of the first 16 head steps), `check --backend cuda|composite
+[--kernels ...]` runs warpc on the same cells and passes a cell iff the ids are equal and every step's `max|d logits| <
+0.5 (top1 - top2)`. Every cell of every configuration run (each family alone against the hand kernels, then
+`CudaBackend()` for `bf16` and `int4_rot` caches and for the int4 head) was bitwise: all ids and all logits equal.
+
+Speed, one lease, CUDA graphs, median of 200 replays (`tests/test_*.py`, `tests/ab_util.py`), warpc against the hand
+kernel, one decode row:
+
+| family | per launch, warpc / hand (us) | launches per step | per step, warpc / hand (us) |
+|---|---|---|---|
+| rmsnorm (+ add), 5120 | 2.20 / 2.20 | 129 | 284 / 284 |
+| a\|b GEMV, 96 x 5120 | 3.58 / 3.58 | 48 (side stream) | 172 / 172 |
+| W4 qkv\|z 16384 x 5120 | 50.5 / 50.5 | 48 | 2,424 / 2,424 |
+| W4 q\|k\|v 14336 x 5120 | 44.2 / 44.1 | 16 | 707 / 706 |
+| W4 out, o 5120 x 6144 | 20.4 / 20.3 | 64 | 1,306 / 1,299 |
+| W4 gate\|up + SiLU 34816 x 5120 | 104.1 / 104.4 | 64 | 6,662 / 6,682 |
+| W4 down 5120 x 17408 | 53.3 / 53.1 | 64 | 3,411 / 3,398 |
+| DeltaNet T = 1 | 11.0 / 12.2 | 48 | 529 / 587 |
+| attention bf16, ctx 385 / 4,096 | 12.8 / 12.9, 29.1 / 29.9 | 16 | 205 / 206, 466 / 478 |
+| attention `int4_rot`, ctx 385 / 4,096 | 19.6 / 21.0, 23.3 / 23.3 | 16 | 314 / 336, 373 / 373 |
+| head, 248,320 x 5120 | 2,880 / 2,876 | 1 | 2,880 / 2,876 |
+| int4 head + select | 762.6 + 11.4 / 764.0 + 11.6 | 1 | 774 / 776 |
+
+The W4 GEMVs stream 857 GB/s (hand: 856, DRAM peak 936) at T = 1. Rows 2..8 (prompt steps) are not slower than the hand
+kernel for W4 (0.996 to 1.021 of its speed), but DeltaNet at 3..8 rows is 75 to 87% of the hand's lazy step (the hand
+skips the 3 MB state write of a step; counting the flush it pays later, warpc is 2.0 to 2.6 times faster) and bf16
+attention at 4..8 rows is 85 to 97% of the hand's.
+
+End to end, `bench.py warpc MODEL --backend cuda` (warpc kernels only) against `bench.py swift-engine` (the hand engine),
+the protocol of the 27B table under Measured (bf16 head, the prompt cut from `engine/src/*.cu`, tok/s of the 255 tokens
+after the first, median of 5 rounds, median of two A/B visits). Prefill in 8-row steps: 4,096 tokens in 9.1 s against
+9.3 s, 16,384 in 37.6 s against 38.1 s.
+
+| KV cache | prompt | warpc kernels | hand engine |
+|---|---|---|---|
+| bf16 | 385 | 51.45 | 51.40 |
+| bf16 | 4,096 | 50.67 | 50.64 |
+| bf16 | 16,384 | 48.49 | 48.46 |
+| int4_rot | 385 | 51.20 | 51.16 |
+| int4_rot | 4,096 | 50.96 | 50.92 |
+| int4_rot | 16,384 | 50.39 | 50.36 |
 
 ## Measured
 

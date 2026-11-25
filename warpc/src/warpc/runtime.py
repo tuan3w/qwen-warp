@@ -77,6 +77,25 @@ class Executor(Protocol):
         ...
 
 
+def merge_sides(tasks: Sequence[Task], launches: Sequence[Launch]) -> list[Launch]:
+    """`launches[i]` is task i's Launch. A task marked attrs["side"] (a small GEMV that may overlap a heavier one: the
+    a|b projections beside the qkv|z GEMV, as the hand engine does) rides as `side` of the preceding Launch when the
+    preceding task reads the same input. Refused if the two race on a buffer: the side task must neither read what the
+    main task writes nor write what it reads or writes."""
+    out: list[Launch] = []
+    for i, (t, ln) in enumerate(zip(tasks, launches, strict=True)):
+        prev = tasks[i - 1] if i else None
+        if not t.attrs.get("side") or prev is None or prev.ins != t.ins:
+            out.append(ln)
+            continue
+        p_in, p_out = set(prev.ins.values()), set(prev.outs.values())
+        s_in, s_out = set(t.ins.values()), set(t.outs.values())
+        if p_in & s_out or p_out & (s_in | s_out):
+            raise AssertionError(f"{t.kernel} cannot run beside {prev.kernel}: they share a buffer")
+        out[-1] = Launch(out[-1].main, (*out[-1].side, ln.main, *ln.side))
+    return out
+
+
 def _live_tasks(graph: Graph, plan: Plan, needed: set[str]) -> list[Task]:
     """Dead-task elimination: a node is live if it feeds a needed value or writes a state; a task is live if a node it
     covers is."""

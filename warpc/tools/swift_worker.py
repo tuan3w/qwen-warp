@@ -5,6 +5,7 @@ own, writing its result to --out. bench.py and compare27.py start it through `sp
       --ctx-max N --out FILE [--engine-dir DIR] MODE ...
     bench --prompt-files F... --prompt-len L... --tokens N --repeats R
     trace --prompt-files F... --prompt-len L --tokens N --trace-steps S
+    traces --prompt-files F... --prompt-len L... --slices K --tokens N --trace-steps S  (every length x slice)
     ring
 
 The engine is `Engine(ctx_max, kv_fp8, head, tmax=8, state_slots=1)` with 8-row prefill chunks: the configuration
@@ -123,6 +124,24 @@ def trace(e, args) -> dict:
     return {"trace": str(args.trace_out)}
 
 
+def traces(e, args) -> dict:
+    """The first --tokens ids and the first --trace-steps fp32 logits of the greedy continuation of every cell."""
+    import torch
+
+    cells = []
+    for length, k, ids in prompts.cells(args.model, args.prompt_files, args.prompt_len, args.slices):
+        e.reset()
+        out = [e.prefill(ids, chunk=8)]
+        logits = [e.logits(1)[0].clone()]
+        for _ in range(1, args.trace_steps):
+            out += e.decode(1)
+            logits.append(e.logits(1)[0].clone())
+        out += e.decode(args.tokens - len(out))
+        cells.append({"length": length, "slice": k, "prompt": ids, "ids": out, "logits": torch.stack(logits).cpu()})
+    torch.save(cells, args.trace_out)
+    return {"trace": str(args.trace_out), "cells": len(cells)}
+
+
 def ring(e, args) -> dict:
     import torch
 
@@ -154,11 +173,17 @@ def main():
     t.add_argument("--tokens", type=int, default=256)
     t.add_argument("--trace-steps", type=int, default=16)
     t.add_argument("--trace-out", type=Path, required=True, help="torch.save file of ids and logits")
+    ts = modes.add_parser("traces", help="trace for every (prompt length, slice) cell, one file")
+    prompts.add_arguments(ts)
+    prompts.add_slices(ts)
+    ts.add_argument("--tokens", type=int, default=256)
+    ts.add_argument("--trace-steps", type=int, default=16)
+    ts.add_argument("--trace-out", type=Path, required=True, help="torch.save file: a list of cells")
     modes.add_parser("ring")
     args = ap.parse_args()
     lib = library(args.engine_dir)
     e = engine(args)
-    result = {"bench": bench, "trace": trace, "ring": ring}[args.mode](e, args)
+    result = {"bench": bench, "trace": trace, "traces": traces, "ring": ring}[args.mode](e, args)
     result |= {"lib": str(lib), "lib_sha256": sha256(lib), "engine": "hand", "kv": args.kv, "head": args.head}
     args.out.write_text(json.dumps(result))
 

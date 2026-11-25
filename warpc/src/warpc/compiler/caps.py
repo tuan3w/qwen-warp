@@ -185,6 +185,8 @@ class CapsTable:
 
     unfused_ctas      (node, Analysis) -> CTAs the backend's kernel for that node alone would launch
     unfused_launches  op -> launches the backend makes for that node alone (default 1; a view is 0)
+    prefer_rank       of two capabilities that match the same nodes, the earlier one wins whatever the cost model says
+                      (a composite table lists its preferred kernels first: their gain estimates need not be comparable)
     """
 
     def __init__(
@@ -193,6 +195,7 @@ class CapsTable:
         target: Target,
         unfused_ctas: Callable,
         unfused_launches: dict[str, int] | None = None,
+        prefer_rank: bool = False,
     ):
         self.caps = list(caps)
         self.target = target
@@ -202,6 +205,7 @@ class CapsTable:
         self.rank = {c.kernel: i for i, c in enumerate(self.caps)}
         self.unfused_ctas = unfused_ctas
         self.unfused_launches = dict(unfused_launches or {})
+        self.prefer_rank = prefer_rank
 
     def ops(self) -> set[str]:
         return set().union(*(c.ops() for c in self.caps)) if self.caps else set()
