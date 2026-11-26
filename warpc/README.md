@@ -71,6 +71,7 @@ format and the backend (default `CudaBackend()`); `help(warpc.compile)` document
 | `model.py` | `compile()` and `Model` |
 | `speculate.py`, `memory.py` | MTP `Speculator`; the pre-flight device-memory estimate |
 | `prefix.py`, `windows.py`, `windowrt.py`, `pinned.py` | prefix cache, prefill segmentation, window prefill plan, exact-size pinned host memory |
+| `bench/` | the benchmark and regression harness, `python -m warpc.bench --help`: paired A/B visits, one result schema, gates with exit codes |
 
 `warpc/tools/`: measurement and gating scripts, each with `--help`: `bench.py` (decode speed of warpc, llama.cpp, vLLM
 and the hand engine), `matrix.py` and `fetch.py` (the model matrix of `models.toml`), `check.py` (accuracy against
@@ -82,6 +83,9 @@ helper that locates the legacy checkout. For example:
 uv run --package warpc python warpc/tools/bench.py --help
 ```
 
+`warpc.bench` is run the same way (`uv run --package warpc python -m warpc.bench --help`); it replaces the tools above one
+suite at a time.
+
 ## Tests
 
 Each `warpc/tests/test_*.py` is a plain script run from the repository root; a test whose prerequisite (GPU, variable
@@ -92,9 +96,9 @@ uv run --package warpc python warpc/tests/test_compiler.py   # CPU
 uv run --package warpc python warpc/tests/test_cuda.py       # GPU and nvcc
 ```
 
-CPU only: `test_sources`, `test_frontend`, `test_compiler`, `test_composite`, `test_prefix`, `test_windows`. The rest
-need a GPU; the kernel-family tests (`test_hybrid`, `test_w4`, `test_deltanet`, `test_attn_gated`, `test_head_refine`,
-`test_inkling_*`, `test_gemma4_*`) compare each kernel with its reference or with the hand kernel.
+CPU only: `test_sources`, `test_frontend`, `test_compiler`, `test_composite`, `test_prefix`, `test_windows`, `test_bench`.
+The rest need a GPU; the kernel-family tests (`test_hybrid`, `test_w4`, `test_deltanet`, `test_attn_gated`,
+`test_head_refine`, `test_inkling_*`, `test_gemma4_*`) compare each kernel with its reference or with the hand kernel.
 
 | Variable | Effect |
 |---|---|
@@ -109,7 +113,7 @@ need a GPU; the kernel-family tests (`test_hybrid`, `test_w4`, `test_deltanet`, 
 | `WARPC_TEST_INKLING` | the Inkling-2-Mini W4G128 directory (with the `config.json` that `tools/inkling_w4_config.py` writes) |
 | `WARPC_INKLING_REF_PYTHON` | python (or venv) with transformers' official `inkling2_loop`: the tiny-model oracle `tests/oracle/inkling_hf.py` |
 | `WARPC_INKLING_QUALITY`, `WARPC_DN_TRACE`, `WARPC_W4_SPEED`, `WARPC_ATTN_SPEED`, `WARPC_HEAD_SPEED` | optional extras of single tests; see the test's docstring |
-| `WARPC_MODELS`, `LLAMA_SERVER` | tools: the model directory of `matrix.py` / `fetch.py`; the `llama-server` binary when not on `PATH` |
+| `WARPC_MODELS`, `LLAMA_SERVER` | tools and `warpc.bench`: the model directory of `matrix.py` / `fetch.py` / `speed --model NAME`; the `llama-server` binary when not on `PATH` |
 
 ### The legacy checkout
 
