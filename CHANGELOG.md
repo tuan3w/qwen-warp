@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `warpc`: `python -m warpc.bench`, the benchmark and regression harness ([warpc/README.md](warpc/README.md)). Its first suite, `speed`, measures decode tok/s, cold TTFT and device memory of a dense checkpoint; `ab` compares two arms (engine specs, or a commit in a temporary worktree) in one interleaved session: a discarded warm-up pair, then `A B | B A | ...` visits of one process each, the median of the pair ratios with a 95% bootstrap interval from 9 pairs and an exact sign test from 5; a 2% change fails, 1% is reported, and an incomplete result (a skipped required cell, too few pairs) exits 3, never 0. The tools in `warpc/tools/` stay until the suites that replace them land. Measured 2026-11-26 on one RTX 3090 (350 W power limit, driver 580.178.04, torch 2.14.0+cu130, CUDA 13.0), A/A with the same tree on both arms: `ab speed --model Qwen3-0.6B --fmt Q4_0 --a warpc:cuda --b warpc:cuda --pairs 9` five times and with `--fmt bf16` twice, each at `ctx_max` 512 and 4,096 (14 cells of 9 pairs). All `inside_noise`; session medians of the pair ratio 0.9984 to 1.0016, the standard deviation of a pair's ratio 0.23% (Q4_0) and 0.19% (bf16); 936 tok/s (Q4_0) and 579 tok/s (bf16) at `ctx_max` 512 against 938 and 585 in the README table. The median SM clocks of the two visits of a pair differed by at most 1.65% (one or two 15 MHz steps), which sets the same-engine pair filter's bound to 2.5%. Not measured: other models, any engine but warpc, the 27B, a baseline file; a single pair's TTFT ratio spans 0.96 to 1.04 at 2.5 to 4 ms, so TTFT is judged on the median of the pairs.
+
 ## 0.13.0 - 2026-11-25
 
 ### Added
